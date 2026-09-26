@@ -541,6 +541,29 @@ def test_tool_workers_size_the_executor(s):
     assert names and server_mod._executor._max_workers == s.tool_workers == 8
 
 
+def test_a_busy_mac_lane_does_not_hold_up_mail(s, monkeypatch):
+    """The Mac helper does one job at a time; tools that wait on it run on their own pool, so a burst of them leaves the main
+    workers free for mail, calendar and contacts."""
+    import time
+
+    import icloud_mcp.server as server_mod
+
+    monkeypatch.setattr(MailService, "list_folders", lambda self: [{"name": "INBOX"}])
+
+    async def go():
+        mcp, _ = server_mod.create_server(dataclasses.replace(s, enable_reminders=True, bridge_token="t" * 40))
+        mcp._icloud_bridge.call = lambda op, a=None: time.sleep(1.5) or []
+        busy = [asyncio.ensure_future(mcp.call_tool("reminders_list_lists", {})) for _ in range(12)]
+        await asyncio.sleep(0.2)                                   # the Mac lane is full, with more queued behind it
+        start = time.monotonic()
+        await mcp.call_tool("mail_list_folders", {})
+        took = time.monotonic() - start
+        await asyncio.gather(*busy)
+        return took
+    assert asyncio.run(go()) < 1.0
+    assert server_mod._mac_executor._max_workers == 6 and server_mod._executor._max_workers == 8
+
+
 def test_large_base64_passes_through_and_text_is_still_cleaned():
     big = "QUJD" * 100_000
     assert clean_deep({"data": big})["data"] is big

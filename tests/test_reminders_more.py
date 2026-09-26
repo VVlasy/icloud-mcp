@@ -98,3 +98,39 @@ def test_list_tools_are_write_tools(s):
     assert on["reminders_delete_list"].annotations.destructive_hint is True
     ro = asyncio.run(names(dataclasses.replace(s, read_only=True)))
     assert not {"reminders_create_list", "reminders_update_list", "reminders_delete_list"} & set(ro)
+
+
+def test_reminder_lists_leave_empty_fields_out_and_name_a_shared_list_once(s):
+    def item(i, list_id="L1", **kw):
+        return {"id": f"r{i}", "title": f"T{i}", "notes": "", "completed": False, "due": None, "priority": 0, "list": "Home",
+                "list_id": list_id, "account": "iCloud", **kw}
+    out, _ = run(s, "reminders_list_reminders", {}, {"reminders": [item(1), item(2, priority=5, notes="n")]})
+    assert (out["list"], out["list_id"], out["account"]) == ("Home", "L1", "iCloud")                # one list: said once, at the top
+    assert out["reminders"] == [{"id": "r1", "title": "T1"}, {"id": "r2", "title": "T2", "notes": "n", "priority": 5}]
+    out, _ = run(s, "reminders_list_reminders", {"completed": "all"},
+                 {"reminders": [item(1), item(2, list_id="L2", completed=True, completed_at="2026-09-20T10:00:00Z")]})
+    assert "list_id" not in out and [r["list_id"] for r in out["reminders"]] == ["L1", "L2"]         # mixed lists: kept per item
+    assert out["reminders"][1]["completed"] is True and out["reminders"][1]["completed_at"] and "completed" not in out["reminders"][0]
+    out, _ = run(s, "reminders_list_reminders", {}, {"reminders": [item(1, title="")]})
+    assert out["reminders"] == [{"id": "r1", "title": ""}] and out["count"] == 1                      # id and title always kept
+
+
+def test_limits_above_what_the_mac_takes_are_lowered_and_said(s):
+    out, seen = run(dataclasses.replace(s, enable_notes=True, enable_drive=True), "reminders_list_reminders", {"limit": 500},
+                    {"reminders": [{"id": str(i), "title": "x"} for i in range(200)]})
+    assert seen == [("reminders_list", {"limit": 200})] and out["limit_capped"] == 200               # full at the cap: there may be more
+    out, seen = run(s, "reminders_list_reminders", {"limit": 500}, {"reminders": [{"id": "1", "title": "x"}]})
+    assert seen == [("reminders_list", {"limit": 200})] and "limit_capped" not in out
+    out, seen = run(s, "reminders_list_reminders", {"limit": 0}, {"reminders": []})
+    assert seen == [("reminders_list", {"limit": 1})]
+    on = dataclasses.replace(s, enable_notes=True, enable_drive=True)
+    out, seen = run(on, "notes_read_note", {"id": "n1", "max_chars": 10**6}, {"text": "x" * 10, "truncated": True})
+    assert seen == [("note_read", {"id": "n1", "max_chars": 100000})] and out["limit_capped"] == 100000
+    out, seen = run(on, "notes_read_note", {"id": "n1"}, {"text": "x"})
+    assert seen == [("note_read", {"id": "n1"})] and "limit_capped" not in out                      # not given: the helper's default
+    for tool, args, op, arg, cap in (("notes_list_notes", {"limit": 101}, "notes_list", "limit", 100),
+                                     ("drive_list_folder", {"limit": 5000}, "drive_list", "limit", 1000),
+                                     ("drive_search_files", {"query": "a", "limit": 201}, "drive_search", "limit", 200),
+                                     ("drive_read_file", {"path": "a.txt", "max_chars": 300000}, "drive_read", "max_chars", 200000)):
+        _, seen = run(on, tool, args, [] if tool == "notes_list_notes" else {"items": []})
+        assert seen[-1][1][arg] == cap, tool

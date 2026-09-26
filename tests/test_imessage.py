@@ -134,3 +134,24 @@ def test_service_senders_are_hidden_by_default(s):
         m.read_chat("12345")
     m, _ = svc(s, {"imessage_chats": codes}, imessage_hide_short_codes=False)
     assert len(m.list_chats()["chats"]) == 4
+
+
+def test_a_chat_reads_lean_with_replies_pointing_at_rowids(s):
+    msgs = [{"id": "g1", "rowid": 1, "at": "2026-09-24T10:00:00+02:00", "from_me": False, "sender": "anna@example.org", "text": "Lunch?",
+             "service": "iMessage"},
+            {"id": "g2", "rowid": 2, "at": "2026-09-24T10:01:00+02:00", "from_me": True, "sender": None, "text": "Yes", "service": "iMessage",
+             "reply_to": "g1"},
+            {"id": "g3", "rowid": 3, "at": "2026-09-24T10:02:00+02:00", "from_me": False, "sender": "anna@example.org", "text": "",
+             "service": "SMS", "reply_to": "g0", "attachments": [{"name": "a.jpg"}]},
+            {"id": "g4", "rowid": 4, "at": "2026-09-24T10:03:00+02:00", "from_me": False, "sender": "+31612345678", "text": "hi",
+             "service": "iMessage"}]
+    m, _ = svc(s, {"imessage_read": {"chat": {"chat_id": "anna@example.org", "participants": ["anna@example.org"],
+                                              "services": ["SMS", "iMessage"]}, "messages": msgs, "complete": True}})
+    out = m.read_chat("anna@example.org")
+    assert out["chat"]["service"] == "iMessage" and out["chat"]["participants"][0]["name"] == "Anna Example"
+    one, mine, photo, other = out["messages"]
+    assert one == {"rowid": 1, "at": "2026-09-24T10:00:00+02:00", "sender": "anna@example.org", "text": "Lunch?"}
+    assert mine == {"rowid": 2, "at": "2026-09-24T10:01:00+02:00", "from_me": True, "text": "Yes", "reply_to_rowid": 1}
+    assert photo["service"] == "SMS" and photo["reply_to"] == "g0" and "text" not in photo and photo["attachments"]   # target not on the page
+    assert other["sender"] == {"handle": "+31612345678", "name": "Ben Example", "contact_uid": "u-ben", "match": "suffix"}  # not a participant
+    assert not any("id" in x for x in out["messages"])
