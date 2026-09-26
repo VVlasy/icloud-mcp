@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import email
+import functools
 import html as html_lib
 import imaplib
 import json
@@ -619,6 +620,13 @@ def _mail_transport(exc: BaseException | None) -> bool:
     return False
 
 
+@functools.cache
+def _tls_context() -> ssl.SSLContext:
+    """One default TLS context for every IMAP and SMTP connection: building one costs about 24 ms. It is never changed after
+    creation; the host name is still checked per connection. A CA-store update takes effect after a restart."""
+    return ssl.create_default_context()
+
+
 # Read-only calls on a pooled connection that turns out to be dead are retried once on a new one (callctx.retry_once_if_safe).
 _retrying = callctx.retry_once_if_safe(_mail_transport)
 
@@ -645,7 +653,7 @@ class MailService:
     # -- connections ---------------------------------------------------------
     def _login(self) -> IMAPClient:
         s = self.s
-        ctx = ssl.create_default_context()
+        ctx = _tls_context()
         try:
             use_ssl = s.imap_security == "ssl"
             c = IMAPClient(s.imap_host, port=s.imap_port, ssl=use_ssl, **({"ssl_context": ctx} if use_ssl else {}), timeout=30)
@@ -677,13 +685,17 @@ class MailService:
             return c
 
     def _checkin(self, c: IMAPClient) -> None:
-        """Return a connection to the pool with no folder selected. UNSELECT, never CLOSE: CLOSE would permanently expunge every
-        message flagged \\Deleted in the folder, and moves and deletes here only ever expunge the exact messages they handled."""
+        """Return a connection to the pool with no folder open read-write. UNSELECT, never CLOSE: CLOSE would permanently expunge
+        every message flagged \\Deleted in the folder, and moves and deletes here only ever expunge the exact messages they handled.
+        A folder opened read-only (EXAMINE) stays open: nothing can be expunged through it and the next SELECT or EXAMINE replaces
+        it, which saves a round trip on every read. _ensure_unselected covers the commands that need no folder open."""
         try:
-            if getattr(getattr(c, "_imap", None), "state", "SELECTED") == "SELECTED":   # unknown state counts as selected
+            imap = getattr(c, "_imap", None)
+            if getattr(imap, "state", "SELECTED") == "SELECTED":          # unknown state counts as selected read-write
                 if not c.has_capability("UNSELECT"):
                     raise MailError("The server cannot UNSELECT, so this connection is not reused.")
-                c.unselect_folder()
+                if not getattr(imap, "is_readonly", False):
+                    c.unselect_folder()
         except Exception:  # noqa: BLE001 - anything unexpected: do not reuse this session
             self._discard(c)
             return
@@ -723,6 +735,13 @@ class MailService:
                 self._discard(c)
 
     @staticmethod
+    def _ensure_unselected(c: IMAPClient) -> None:
+        """Close a folder a pooled connection left open read-only (UNSELECT, never CLOSE): ENABLE is only legal with no folder
+        open, STATUS should not name the open folder, and RENAME or DELETE of the open folder is server-dependent."""
+        if getattr(getattr(c, "_imap", None), "state", None) == "SELECTED" and c.has_capability("UNSELECT"):
+            c.unselect_folder()
+
+    @staticmethod
     def _discard(c: IMAPClient) -> None:
         with contextlib.suppress(Exception):
             c.logout()
@@ -737,11 +756,12 @@ class MailService:
     def imap(self, fresh: bool = False) -> Iterator[IMAPClient]:
         """A logged-in IMAP connection. It comes from a small pool when possible (IMAP_POOL_SIZE, default 2), which saves a TLS
         handshake and login (about a second against iCloud) on every call. Each connection is used by one call at a time. A call
-        that fails leaves its connection out of the pool, since its state is unknown. fresh=True always logs in anew."""
-        fresh, self._tl.fresh = fresh or self._tl.fresh, False
-        reuse = self.s.imap_pool_size > 0 and not fresh
+        that fails leaves its connection out of the pool, since its state is unknown. fresh=True always logs in anew and logs out
+        after; the new session a read retry opens (callctx) goes back to the pool like any other."""
+        explicit, retry, self._tl.fresh = fresh, self._tl.fresh, False
+        pool_after = self.s.imap_pool_size > 0 and not explicit
         self._last_activity = time.monotonic()
-        c = self._checkout() if reuse else None
+        c = None if explicit or retry or self.s.imap_pool_size == 0 else self._checkout()
         self._tl.reused = c is not None
         if c is None:
             callctx.stage("IMAP sign-in")
@@ -751,7 +771,7 @@ class MailService:
             yield c
             ok = True
         finally:
-            if ok and reuse:
+            if ok and pool_after:
                 self._checkin(c)
             else:
                 self._discard(c)
@@ -777,12 +797,18 @@ class MailService:
         if key in self._folder_cache:
             return self._folder_cache[key]
         flag, fallbacks = _SPECIAL[key]
-        found = None
-        with contextlib.suppress(Exception):
-            found = c.find_special_folder(flag)
+        # The cached LIST first (no round trip once warm): the special-use flag, then the usual names, iCloud's first.
+        # find_special_folder sends its own LIST (and more) and is left for names under a namespace prefix such as INBOX.Sent.
+        folders = self._list(c)
+        want = flag.lower()
+        found = next((f[2] for f in folders
+                      if want in {(bytes(x) if isinstance(x, (bytes, bytearray)) else str(x).encode()).lower() for x in f[0]}), None)
         if not found:
-            existing = {f[2] for f in self._list(c)}
+            existing = {f[2] for f in folders}
             found = next((fb for fb in fallbacks if fb in existing), None)
+        if not found:
+            with contextlib.suppress(Exception):
+                found = c.find_special_folder(flag)
         if not found:
             raise MailError(f"Could not locate the '{name}' folder on the server. Call mail_list_folders for the exact folder names.")
         self._folder_cache[key] = found
@@ -803,6 +829,7 @@ class MailService:
     @_retrying
     def list_folders(self) -> list[dict[str, Any]]:
         with self.imap() as c:
+            self._ensure_unselected(c)
             out = []
             for flags, _delim, name in self._list(c):
                 fl = [f.decode() if isinstance(f, bytes) else str(f) for f in flags]
@@ -997,6 +1024,7 @@ class MailService:
         limit = max(1, min(int(limit), 200))
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
+            self._ensure_unselected(c)                    # ENABLE is refused while a folder is open
             with contextlib.suppress(Exception):          # iCloud applies ENABLE without sending ENABLED back
                 c.enable("CONDSTORE")
             info = c.select_folder(folder, readonly=True) or {}
@@ -1425,7 +1453,7 @@ class MailService:
 
     def _smtp_open(self) -> smtplib.SMTP:
         s = self.s
-        ctx = ssl.create_default_context()
+        ctx = _tls_context()
         server = smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=30) if s.smtp_security == "ssl" else smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=30)
         try:
             server.ehlo()
@@ -1490,7 +1518,25 @@ class MailService:
             "cc": addrs_json(parse_addrs(msg.get_all("Cc", []))),
         }
 
-    def _deliver(self, c: IMAPClient, msg: EmailMessage, *, draft: bool, followup: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _queue_checked(self, msg: EmailMessage, followup: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Queue a message for the owner's approval, after the same gates as a send (ALLOW_SEND, recipient cap, allowlist).
+        Takes no IMAP connection: nothing here reads or writes the mailbox."""
+        if not self.s.allow_send:
+            raise MailError("Sending is disabled on this server (ALLOW_SEND=false). Use draft=true to save a draft instead.")
+        recipients = self._check_recipients(msg)
+        try:
+            q = self.outbox.add(msg.as_bytes(policy=policy.SMTP), recipients, followup)
+        except OutboxFull as e:
+            raise MailError(str(e)) from e
+        return {"status": "queued_for_owner_approval", "sent": False, "outbox_id": q.id, "recipients": recipients,
+                "expires_in_seconds": self.s.outbox_ttl, "approve_at": f"{self.s.public_url}/outbox",
+                "notice": OWNER_APPROVAL_NOTICE, **self._summary_of(msg)}
+
+    def _deliver(self, c: IMAPClient, msg: EmailMessage, *, draft: bool, followup: dict[str, Any] | None = None,
+                 selected: tuple[str, int | None] | None = None) -> dict[str, Any]:
+        """selected: (folder, uidvalidity) the caller just opened read-write on c with the uidvalidity checked, if any."""
+        if not draft and self.s.require_approval and not self.s.local_mode:
+            return self._queue_checked(msg, followup)
         raw = msg.as_bytes(policy=policy.SMTP)
         base = self._summary_of(msg)
         if draft:
@@ -1506,19 +1552,13 @@ class MailService:
             c.append(drafts, raw, flags=[DRAFT, SEEN], msg_time=datetime.now(timezone.utc))
             return {"status": "saved_to_drafts_for_owner_approval", "sent": False, "folder": drafts, "recipients": recipients,
                     "notice": OWNER_DRAFT_NOTICE, **base}
-        if self.s.require_approval:
-            try:
-                q = self.outbox.add(raw, recipients, followup)
-            except OutboxFull as e:
-                raise MailError(str(e)) from e
-            return {"status": "queued_for_owner_approval", "sent": False, "outbox_id": q.id, "recipients": recipients,
-                    "expires_in_seconds": self.s.outbox_ttl, "approve_at": f"{self.s.public_url}/outbox",
-                    "notice": OWNER_APPROVAL_NOTICE, **base}
-        return self._send_and_file(c, msg, raw, recipients, followup, base)
+        return self._send_and_file(c, msg, raw, recipients, followup, base, selected=selected)
 
     def _send_and_file(self, c: IMAPClient, msg: EmailMessage, raw: bytes, recipients: list[str], followup: dict[str, Any] | None,
-                       base: dict[str, Any]) -> dict[str, Any]:
-        """The only place mail actually leaves: SMTP send, Sent copy, and flagging of the original."""
+                       base: dict[str, Any], *, selected: tuple[str, int | None] | None = None) -> dict[str, Any]:
+        """The only place mail actually leaves: SMTP send, Sent copy, and flagging of the original. The original's folder is
+        selected again unless `selected` says this call already opened exactly that folder and uidvalidity read-write on c
+        (the Sent lookup, APPEND and SMTP in between never change the open folder)."""
         refused = self._smtp_send(msg, recipients)
         result: dict[str, Any] = {"status": "sent", "recipients": recipients, **base}
         if refused:
@@ -1530,9 +1570,11 @@ class MailService:
                 result["saved_to"] = sent
             except Exception as e:  # noqa: BLE001
                 result["warning"] = f"Message was sent but could not be copied to the Sent folder: {e}"
+        reselect = bool(followup) and selected != (followup["folder"], followup.get("uidvalidity"))
         if followup and followup.get("action") == "trash":        # a saved draft that was just sent: it goes to Trash
             try:
-                self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
+                if reselect:
+                    self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
                 self._move_messages(c, [followup["uid"]], self.resolve_folder(c, "trash"))
                 result["draft_moved_to_trash"] = True
             except Exception as e:  # noqa: BLE001 - the mail is out; a leftover draft is only untidy
@@ -1540,7 +1582,8 @@ class MailService:
             return result
         if followup:
             try:
-                self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
+                if reselect:
+                    self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
                 c.add_flags([followup["uid"]], [followup["flag"]])
                 if followup["flag"] == ANSWERED:
                     result["original_marked_answered"] = True
@@ -1610,6 +1653,8 @@ class MailService:
             sender=self.sender, to=to_p, cc=cc_p, bcc=bcc_p, subject=subject, text=body, html=body_html,
             signature=self.s.signature, attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
         )
+        if not draft and self.s.allow_send and self.s.require_approval and not self.s.local_mode:
+            return _with_layout(self._queue_checked(msg), body)          # only queued: no mailbox access needed
         with self.imap() as c:
             return _with_layout(self._deliver(c, msg, draft=draft), body)
 
@@ -1625,7 +1670,7 @@ class MailService:
                 attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
             )
             result = self._deliver(c, msg, draft=draft, followup={"folder": folder, "uid": uid, "flag": ANSWERED,
-                                                          "uidvalidity": uv})
+                                                          "uidvalidity": uv}, selected=(folder, uv))
             result["in_reply_to"] = str(msg["In-Reply-To"])
             return _with_layout(result, body)
 
@@ -1644,7 +1689,7 @@ class MailService:
                 max_attachment_bytes=self.s.max_attachment_bytes,
             )
             return _with_layout(self._deliver(c, msg, draft=draft, followup={"folder": folder, "uid": uid, "flag": "$Forwarded",
-                                                                           "uidvalidity": uv}), note)
+                                                                           "uidvalidity": uv}, selected=(folder, uv)), note)
 
     @_retrying
     def awaiting_reply(self, days: int = 21, limit: int = 20) -> dict[str, Any]:
@@ -1795,7 +1840,8 @@ class MailService:
     # -- saved drafts ----------------------------------------------------------------
     def _load_draft(self, c: IMAPClient, folder: str, uid: int, uidvalidity: int | None) -> tuple[str, EmailMessage, int | None]:
         folder = self.resolve_folder(c, folder)
-        raw, flags, _, uv = self._fetch_raw(c, folder, uid, uidvalidity=uidvalidity)
+        # Read-write (still BODY.PEEK, so no flag changes): sending or replacing the draft then moves it without a second SELECT.
+        raw, flags, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
         is_draft = any((f.decode() if isinstance(f, bytes) else str(f)).lower() == "\\draft" for f in flags)
         if folder != self.resolve_folder(c, "drafts") and not is_draft:
             raise MailError(f"Message {uid} in '{folder}' is not a saved draft. Only drafts (folder Drafts) can be sent or changed "
@@ -1817,7 +1863,8 @@ class MailService:
                 msg["Date"] = formatdate(localtime=True)
             if msg["Message-ID"] is None:
                 msg["Message-ID"] = make_msgid(domain=(self.s.email_address.rsplit("@", 1)[-1] or None))
-            return self._deliver(c, msg, draft=False, followup={"folder": folder, "uid": uid, "uidvalidity": uv, "action": "trash"})
+            return self._deliver(c, msg, draft=False, followup={"folder": folder, "uid": uid, "uidvalidity": uv, "action": "trash"},
+                                 selected=(folder, uv))
 
     def update_draft(self, uid: int, *, folder: str = "Drafts", uidvalidity: int | None = None, to=None, cc=None, bcc=None,
                      subject: str | None = None, body: str | None = None, body_html: str | None = None,
@@ -1848,7 +1895,7 @@ class MailService:
             drafts = self.resolve_folder(c, "drafts")
             resp = c.append(drafts, new.as_bytes(policy=policy.SMTP), flags=[DRAFT, SEEN], msg_time=datetime.now(timezone.utc))
             m = re.search(rb"APPENDUID (\d+) (\d+)", resp if isinstance(resp, bytes) else str(resp).encode())
-            self._select(c, folder, readonly=False, expect=uv)
+            # the draft's folder is still open read-write from _load_draft (checked uidvalidity); APPEND does not change that
             self._move_messages(c, [uid], self.resolve_folder(c, "trash"))
         out = {"status": "draft_updated", "folder": drafts, "old_uid": uid, "old_draft": "moved to Trash", **self._summary_of(new)}
         if m:
@@ -1878,6 +1925,19 @@ class MailService:
             raise MailError(f"'{exact}' has subfolders. Move or delete them first.")
         return exact, sep
 
+    def _forget_folder(self, name: str) -> None:
+        """After a rename or delete: the folder LIST, any alias (sent, trash, ...) that pointed at the old name, and pooled
+        sessions that still have a folder open read-only (it may be this one, and servers may drop such a session)."""
+        with self._folders_lock:
+            self._folders = None
+        for alias in [k for k, v in list(self._folder_cache.items()) if v == name]:
+            self._folder_cache.pop(alias, None)
+        with self._pool_lock:
+            stale = [p for p in self._pool if getattr(getattr(p[0], "_imap", None), "state", "SELECTED") == "SELECTED"]
+            self._pool = [p for p in self._pool if p not in stale]
+        for c, _ in stale:
+            self._discard(c)
+
     def update_folder(self, name: str, new_name: str) -> dict[str, Any]:
         new_name = (new_name or "").strip()
         if not new_name:
@@ -1886,12 +1946,12 @@ class MailService:
             exact, _ = self._changeable_folder(c, name)
             if any(f[2].lower() == new_name.lower() for f in self._list(c)) and new_name.lower() != exact.lower():
                 raise MailError(f"A folder called '{new_name}' already exists.")
+            self._ensure_unselected(c)
             try:
                 c.rename_folder(exact, new_name)
             except Exception as e:  # noqa: BLE001
                 raise MailError(f"Could not rename '{exact}': {e}.") from e
-        with self._folders_lock:
-            self._folders = None
+        self._forget_folder(exact)
         return {"renamed": True, "from": exact, "to": new_name}
 
     def delete_folder(self, name: str, *, confirm_token: str | None = None) -> dict[str, Any]:
@@ -1930,10 +1990,10 @@ class MailService:
                 left = int((c.folder_status(exact, [b"MESSAGES"]) or {}).get(b"MESSAGES") or 0)
                 if left:
                     raise MailError(f"{moved} messages went to Trash, but {left} arrived meanwhile; the folder was kept. Call again for a new preview.")
+            self._ensure_unselected(c)
             try:
                 c.delete_folder(exact)
             except Exception as e:  # noqa: BLE001
                 raise MailError(f"Could not delete '{exact}': {e}.") from e
-        with self._folders_lock:
-            self._folders = None
+        self._forget_folder(exact)
         return {"deleted": True, "folder": exact, **({"messages_moved_to_trash": count} if count else {})}

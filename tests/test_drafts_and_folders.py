@@ -167,7 +167,25 @@ def test_updating_a_draft_keeps_what_was_not_changed_and_never_loses_it(env):
     assert imap.folders["Drafts"] == [r["uid"]] and len(imap.folders["Deleted Messages"]) == 1
 
 
-@pytest.mark.parametrize("name", ["INBOX", "inbox", "Drafts", "Deleted Messages", "Sent Messages", "Junk", "Archive", "Notes"])
+def test_the_original_is_opened_read_write_once_per_update_send_or_reply(env, monkeypatch):
+    svc, imap, sent = env
+    opened, real = [], imap.select_folder
+    monkeypatch.setattr(imap, "select_folder", lambda folder, readonly=False: opened.append((folder, readonly)) or real(folder, readonly))
+    uid = imap.add("Drafts", draft_bytes(), (b"\\Draft",))
+    svc.update_draft(uid, uidvalidity=7, subject="Lunch on Friday")
+    assert opened == [("Drafts", False)] and len(imap.folders["Deleted Messages"]) == 1       # no second SELECT after APPEND
+    opened.clear()
+    r = svc.send_draft(imap.folders["Drafts"][0], uidvalidity=7)
+    assert opened == [("Drafts", False)] and r["draft_moved_to_trash"] and not imap.folders["Drafts"] and sent
+    opened.clear()
+    r = svc.reply("INBOX", imap.add("INBOX", draft_bytes(), ()), "Friday works.", uidvalidity=7)
+    assert opened == [("INBOX", False)] and r["original_marked_answered"]
+    imap.uv = 8                                                   # renumbered: the uidvalidity check still refuses
+    with pytest.raises(MailError):
+        svc.update_draft(imap.add("Drafts", draft_bytes(), (b"\\Draft",)), uidvalidity=7, subject="x")
+
+
+@pytest.mark.parametrize("name",["INBOX", "inbox", "Drafts", "Deleted Messages", "Sent Messages", "Junk", "Archive", "Notes"])
 def test_the_mailboxs_own_folders_cannot_be_renamed_or_deleted(env, name):
     svc, imap, _ = env
     with pytest.raises(MailError, match="own folders"):

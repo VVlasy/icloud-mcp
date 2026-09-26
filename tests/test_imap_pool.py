@@ -12,6 +12,7 @@ from icloud_mcp.mail import MailError, MailService
 class FakeImaplib:
     def __init__(self):
         self.state = "AUTH"
+        self.is_readonly = False                         # imaplib records whether the last SELECT was an EXAMINE
 
 
 class FakeClient:
@@ -31,9 +32,9 @@ class FakeClient:
         self.calls.append("logout")
 
     def select_folder(self, name, readonly=False):
-        self.calls.append(f"select {name}")
-        self._imap.state = "SELECTED"
-        return {}
+        self.calls.append(f"{'examine' if readonly else 'select'} {name}")
+        self._imap.state, self._imap.is_readonly = "SELECTED", readonly
+        return {b"UIDVALIDITY": 1, b"UIDNEXT": 2, b"EXISTS": 1, **({b"HIGHESTMODSEQ": 5} if "enable" in self.calls else {})}
 
     def unselect_folder(self):
         self.calls.append("unselect")
@@ -44,6 +45,30 @@ class FakeClient:
 
     def has_capability(self, cap):
         return cap.encode() in self.caps
+
+    def enable(self, *caps):
+        if self._imap.state != "AUTH":                   # like imapclient: ENABLE is illegal with a folder open
+            raise RuntimeError("ENABLE command illegal in state SELECTED")
+        self.calls.append("enable")
+
+    def list_folders(self):
+        self.calls.append("list")
+        if not self.alive:
+            raise OSError("connection reset")
+        return [((b"\\HasNoChildren",), b"/", "INBOX"), ((b"\\HasNoChildren", b"\\sent"), b"/", "Sent Messages"),
+                ((b"\\HasNoChildren",), b"/", "Deleted Messages")]
+
+    def find_special_folder(self, flag):
+        self.calls.append("find_special")
+        return None
+
+    def folder_status(self, name, what):
+        self.calls.append(f"status {name}")
+        return {b"MESSAGES": 1, b"UNSEEN": 0}
+
+    def search(self, crit, charset=None):
+        self.calls.append("search")
+        return []
 
     def noop(self):
         self.calls.append("noop")
@@ -61,9 +86,9 @@ def svc(tmp_path, monkeypatch):
     return MailService(Settings.from_env())
 
 
-def use(svc, **kw):
+def use(svc, readonly=False, **kw):
     with svc.imap(**kw) as c:
-        c.select_folder("INBOX")
+        c.select_folder("INBOX", readonly=readonly)
         return c
 
 
@@ -72,6 +97,54 @@ def test_a_connection_is_reused_and_left_with_no_folder_selected(svc):
     second = use(svc)
     assert first is second and len(FakeClient.made) == 1
     assert first.calls.count("login") == 1 and first.calls.count("unselect") == 2 and "logout" not in first.calls
+
+
+def test_a_folder_opened_read_only_is_left_open_but_a_read_write_one_is_unselected(svc):
+    c = use(svc, readonly=True)
+    assert "unselect" not in c.calls and svc._pool[0][0] is c              # EXAMINE: nothing to expunge, no round trip
+    assert use(svc) is c and c.calls.count("unselect") == 1                 # SELECT: unselected before it goes back
+
+
+def test_changes_on_a_connection_left_in_examine_still_enables_condstore(svc):
+    c = use(svc, readonly=True)
+    assert svc.changes("INBOX")["first_call"]                              # the fake reports HIGHESTMODSEQ only once enabled
+    assert c.calls[2:] == ["unselect", "enable", "examine INBOX", "search"]   # UNSELECT only where ENABLE needs it
+    svc.list_folders()
+    assert c.calls[6:9] == ["unselect", "list", "status INBOX"]            # STATUS never names the open folder
+
+
+def test_a_retried_read_pools_the_new_session_and_logs_out_the_dead_one(svc):
+    dead = use(svc)
+    dead.alive = False                                                      # died while idle, noticed only by the next command
+    assert [f["name"] for f in svc.list_folders()] == ["INBOX", "Sent Messages", "Deleted Messages"]
+    new = FakeClient.made[-1]
+    assert new is not dead and "logout" in dead.calls and "logout" not in new.calls and [p[0] for p in svc._pool] == [new]
+
+
+def test_special_folders_come_from_the_cached_list_at_no_extra_cost(svc):
+    with svc.imap() as c:
+        svc._list(c)
+        before = list(c.calls)
+        assert svc.resolve_folder(c, "sent") == "Sent Messages"             # by its special-use flag (any case)
+        assert svc.resolve_folder(c, "trash") == "Deleted Messages"         # by name: no flag on this server
+        assert c.calls == before                                            # no LIST, no find_special_folder
+        with pytest.raises(MailError, match="Could not locate"):
+            svc.resolve_folder(c, "archive")
+        assert c.calls == before + ["find_special"]                         # only a miss asks the server itself
+    svc._folder_cache["trash"] = "Old"
+    svc._forget_folder("Old")
+    assert "trash" not in svc._folder_cache and svc._folder_cache["sent"] == "Sent Messages"
+
+
+def test_a_queued_send_borrows_no_connection_and_keeps_every_gate(svc, monkeypatch):
+    monkeypatch.setattr(MailService, "imap", lambda self, **kw: pytest.fail("a queued send opened IMAP"))
+    svc.s = dataclasses.replace(svc.s, send_allowlist=("@example.org",), max_recipients=2)
+    with pytest.raises(MailError, match="SEND_ALLOWLIST"):
+        svc.send(to="someone@example.com", subject="Hi", body="Hello")
+    with pytest.raises(MailError, match="Too many recipients"):
+        svc.send(to=["a@example.org", "b@example.org", "c@example.org"], subject="Hi", body="Hello")
+    r = svc.send(to="a@example.org", subject="Hi", body="Hello")
+    assert r["status"] == "queued_for_owner_approval" and not r["sent"] and len(svc.outbox.pending()) == 1 and not FakeClient.made
 
 
 def test_a_failed_call_never_returns_its_connection_to_the_pool(svc):
