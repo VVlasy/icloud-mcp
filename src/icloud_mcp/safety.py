@@ -22,7 +22,7 @@ import subprocess as _subprocess
 import threading as _threading
 import time as _time
 from collections import Counter
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger("icloud_mcp.safety")
 
@@ -35,30 +35,46 @@ _INVISIBLE = re.compile(
     "[­᠎​‪-‮⁠-⁤⁦-⁩﻿\U000e0000-\U000e007f]"
 )
 
-_WARNINGS: list[tuple[re.Pattern[str], str]] = [
+def _has(*groups: tuple[str, ...]) -> Callable[[str], bool]:
+    """A gate for one pattern: true when the lowercased text holds a keyword from every group. Each group lists literals the
+    pattern cannot match without, so a false gate proves no match and the regex (which has no literal prefix) is skipped."""
+    return lambda low: all(any(k in low for k in g) for g in groups)
+
+
+# (pattern, warning, gate): the gate sits beside its pattern so the two cannot drift apart; a new pattern needs a gate.
+_WARNINGS: list[tuple[re.Pattern[str], str, Callable[[str], bool]]] = [
     (re.compile(r"\b(ignore|disregard|forget|override)\b.{0,40}\b(previous|prior|above|earlier|all|any|your)\b.{0,25}"
                 r"\b(instructions?|prompts?|rules|guidelines)\b", re.I | re.S),
-     "It contains text telling an AI to ignore its instructions."),
-    (re.compile(r"(\bsystem prompt\b|\byou are now\b|\bnew instructions\b|\bdeveloper mode\b|^\s*(system|assistant)\s*:)",
+     "It contains text telling an AI to ignore its instructions.",
+     _has(("ignore", "disregard", "forget", "override"), ("instruction", "prompt", "rules", "guidelines"))),
+    # [^\S\n]*, not \s*: with re.M a \s* that crosses newlines rescans every blank line after each line start (quadratic).
+    (re.compile(r"(\bsystem prompt\b|\byou are now\b|\bnew instructions\b|\bdeveloper mode\b|^[^\S\n]*(system|assistant)\s*:)",
                 re.I | re.M),
-     "It contains text addressed to an AI assistant rather than to a person."),
+     "It contains text addressed to an AI assistant rather than to a person.",
+     _has(("system", "assistant", "you are now", "new instructions", "developer mode"))),
     (re.compile(r"\b(send|forward|email|mail|share|reveal|give)\b.{0,60}\b(passwords?|credentials|api keys?|tokens?|"
                 r"verification codes?|2fa codes?|one[- ]time codes?|all (?:your|the|his|her) (?:emails|messages|contacts))\b",
                 re.I | re.S),
-     "It asks for passwords, codes or bulk data to be sent somewhere."),
+     "It asks for passwords, codes or bulk data to be sent somewhere.",
+     _has(("send", "forward", "mail", "share", "reveal", "give"), ("password", "credentials", "api key", "token", "code", "all "))),
     (re.compile(r"\b(new|updated|changed|different|correct)\b.{0,40}\b(bank(?:ing)? (?:account|details)|account number|iban|"
                 r"payment details|wire instructions)\b", re.I | re.S),
-     "It says bank or payment details have changed. That is the classic invoice-fraud pattern: confirm by phone first."),
+     "It says bank or payment details have changed. That is the classic invoice-fraud pattern: confirm by phone first.",
+     _has(("new", "updated", "changed", "different", "correct"),
+          ("bank", "account number", "iban", "payment details", "wire instructions"))),
     (re.compile(r"(\b(nieuwe?|gewijzigde?|andere?|juiste)\b.{0,40}\b(rekeningnummer|bankrekening(?:nummer)?|iban|bankgegevens)\b"
                 r"|\b(rekeningnummer|bankrekening(?:nummer)?|iban|bankgegevens)\b.{0,40}\b(gewijzigd|veranderd|aangepast|nieuw)\b)",
                 re.I | re.S),
-     "It says bank or payment details have changed (Dutch). That is the classic invoice-fraud pattern: confirm by phone first."),
+     "It says bank or payment details have changed (Dutch). That is the classic invoice-fraud pattern: confirm by phone first.",
+     _has(("rekeningnummer", "bankrekening", "iban", "bankgegevens"))),
 ]
+# re.I also folds these non-ASCII letters onto ASCII ones (the Kelvin sign too, which lower() already maps): the gates see them folded.
+_GATE_FOLD = {0x130: "i", 0x131: "i", 0x17F: "s"}
 
 
 def clean(value: str) -> str:
-    """The text with invisible steering characters removed."""
-    return _INVISIBLE.sub("", value)
+    """The text with invisible steering characters removed. ASCII text cannot hold one (isascii() is O(1) in CPython)."""
+    return value if value.isascii() else _INVISIBLE.sub("", value)
 
 
 # ------------------------------------------------------------------------------------------- text a human reader cannot see
@@ -151,13 +167,17 @@ class _HiddenStripper(_HTMLParser):
 # Outlook and most mail builders put conditional comments (<!--[if mso]>), style blocks inside comments and empty hidden spacers
 # in every message. They carry no words, so they are removed without a warning; a warning for every Outlook mail teaches agents
 # and the owner to ignore it (Zhiar, 26 Sep 2026: a colleague's ordinary mail was flagged, as was all her earlier mail).
-_FORMATTING_COMMENT = re.compile(r"^\s*(?:\[if\b|\[endif\]|<!\[endif\]|/\*|[^{}]*\{[^{}]*:[^{}]*\})", re.S)
+# Linear on hostile input: the leading whitespace is possessive and the colon search cannot backtrack over earlier colons.
+_FORMATTING_COMMENT = re.compile(r"^\s*+(?:\[if\b|\[endif\]|<!\[endif\]|/\*|[^{}]*\{[^{}:]*:[^{}]*\})", re.S)
 _WORD = re.compile(r"[^\W\d_]{2,}")
+# Style rules. Tried only at the start or just after a brace: from any later start in a brace-free run the outcome is the same,
+# and trying every position made a long run without a closing brace quadratic.
+_STYLE_RULE = re.compile(r"(?:\A|(?<=[{}]))[^{}]*\{[^{}]*\}")
 
 
 def _meaningful(text: str) -> str:
     """Hidden text worth a warning: at least two words, after collapsing whitespace. Style rules and spacers do not count."""
-    text = re.sub(r"[^{}]*\{[^{}]*\}", " ", text)          # style rules (Outlook hides a <style> block with display:none)
+    text = _STYLE_RULE.sub(" ", text)                       # style rules (Outlook hides a <style> block with display:none)
     text = re.sub(r"\s+", " ", text).strip()
     return text if len(_WORD.findall(text)) >= 2 else ""
 
@@ -246,16 +266,10 @@ def stats() -> dict[str, int]:
         return dict(STATS)
 
 
-_BASE64 = re.compile(r"[A-Za-z0-9+/=\r\n]*")
-_BIG = 256 * 1024
-
-
 def clean_deep(value: Any) -> Any:
-    """clean() applied to every string inside a tool result (dicts, lists, tuples). A very large string that is pure base64
-    (an attachment or a file) is passed through as is: it cannot carry invisible characters, and walking it costs time."""
+    """clean() applied to every string inside a tool result (dicts, lists, tuples). ASCII strings (base64 attachments and files
+    among them) are passed through as is by clean(): they cannot carry invisible characters."""
     if isinstance(value, str):
-        if len(value) > _BIG and _BASE64.fullmatch(value):
-            return value
         return clean(value)
     if isinstance(value, dict):
         return {k: clean_deep(v) for k, v in value.items()}
@@ -278,12 +292,14 @@ def warnings_for(*texts: str | None) -> list[str]:
     if not joined:
         return []
     out = []
-    if _INVISIBLE.search(joined):
+    ascii_only = joined.isascii()
+    if not ascii_only and _INVISIBLE.search(joined):
         out.append("It contained hidden characters (removed), which is how instructions are smuggled past a reader.")
         _count("invisible_characters")
-    visible = clean(joined)
-    for i, (pattern, msg) in enumerate(_WARNINGS):
-        if pattern.search(visible):
+    visible = joined if ascii_only else clean(joined)
+    low = visible.translate(_GATE_FOLD).lower()          # the same text the patterns see, folded as re.I folds it
+    for i, (pattern, msg, gate) in enumerate(_WARNINGS):
+        if gate(low) and pattern.search(visible):
             out.append(msg)
             _count(f"pattern_{i}")
     if (screened := _run_screen(visible)) is not None:
