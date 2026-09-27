@@ -24,8 +24,8 @@ import httpx
 
 from . import agentlog, callctx
 from .config import Settings
-from .safety import warnings_for
-from .matching import fuzzy_match_all, norm as _norm_shared
+from .safety import compact, warnings_for
+from .matching import fuzzy_match_keyed, keyed, norm as _norm_shared
 
 log = logging.getLogger(__name__)
 
@@ -43,10 +43,11 @@ _CACHE_SECONDS = 120        # re-check freshness (cheap ctag request) at most th
 # download against 0.77 s for the two requests change detection needs).
 _CHANGES_FROM_CARDS = 300
 _MAX_LIMIT = 50
+_RAW_MAX = 64 * 1024        # a card's raw vCard is kept for updates only up to this size (photos are inline base64); larger: GET it
 
 
 class ContactsError(Exception):
-    pass
+    transport = False       # the connection failed (timeout, dead socket), not the request: no rediscovery, no full download
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +205,7 @@ def _indexed(c: dict[str, Any]) -> dict[str, Any]:
             "phones": [_digits(p["number"]) for p in c["phones"]],
             "all_words": _name_words(c),
         }
+        n["all_keyed"] = [keyed(w) for w in n["all_words"]]     # normalised + sound-alike key, worked out once per card
     return n
 
 
@@ -269,7 +271,19 @@ def next_birthday(month: int, day: int, today: date) -> date:
 
 
 def _brief(c: dict[str, Any]) -> dict[str, Any]:
-    return {k: c[k] for k in ("uid", "name", "nickname", "organization", "job_title", "emails", "phones", "has_email")}
+    """A search row without its empty fields. New dicts throughout: the cached card and its email/phone dicts are shared."""
+    return compact({**{k: c[k] for k in ("uid", "name", "nickname", "organization", "job_title")},
+                    "emails": [compact(e) for e in c["emails"]], "phones": [compact(p) for p in c["phones"]],
+                    "has_email": c["has_email"]}, keep=("uid", "name", "has_email"))
+
+
+def _full(c: dict[str, Any]) -> dict[str, Any]:
+    """The whole card for get(), without internal ('_') or empty fields and with empty address parts and labels left out."""
+    d = {k: v for k, v in c.items() if not k.startswith("_")}
+    d["emails"] = [compact(e) for e in c["emails"]]
+    d["phones"] = [compact(p) for p in c["phones"]]
+    d["addresses"] = [compact(a) for a in c["addresses"]]
+    return compact(d, keep=("uid", "name", "has_email"))
 
 
 def _card_warnings(c: dict[str, Any]) -> list[str]:
@@ -493,8 +507,11 @@ class ContactsService:
         next call builds a new one."""
         with self._http_lock:
             if self._http is None:
-                self._http = httpx.Client(auth=(self.s.carddav_username, self.s.app_password), timeout=30, transport=self._transport,
-                                          headers={"User-Agent": "icloud-mcp"})
+                # 25 s read (per chunk, so a large REPORT is fine) and 8 s connect keep a dead network under the 60 s tool timeout.
+                # Idle connections are kept 15 s (httpx default 5 s), below iCloud's observed 20-40 s idle close.
+                self._http = httpx.Client(auth=(self.s.carddav_username, self.s.app_password), timeout=httpx.Timeout(25, connect=8),
+                                          limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=15.0),
+                                          transport=self._transport, headers={"User-Agent": "icloud-mcp"})
             client = self._http
         try:
             yield client
@@ -512,7 +529,9 @@ class ContactsService:
         try:
             r = client.request(method, url, content=body.encode(), headers={"Depth": depth, "Content-Type": "application/xml; charset=utf-8"})
         except httpx.HTTPError as e:
-            raise ContactsError(f"CardDAV request failed: {e}. Run icloud_check_health to see which service is failing.") from e
+            err = ContactsError(f"CardDAV request failed: {e}. Run icloud_check_health to see which service is failing.")
+            err.transport = isinstance(e, httpx.TransportError)
+            raise err from e
         if r.status_code == 401:
             raise ContactsError("CardDAV authentication failed. Check ICLOUD_USERNAME and the app-specific password (or set CARDDAV_USERNAME). Run icloud_check_health to see which service is failing.")
         if r.status_code >= 400:
@@ -543,10 +562,18 @@ class ContactsService:
                 if (stored.status_code == 200 and (requested := parse_vcard(data))
                         and (card := parse_vcard(stored.text)) and card["uid"] == requested["uid"]):
                     return r
+            self._expire()
             raise ContactsError("This contact changed since it was read. Search it again, review the latest version, then retry.")
+        if r.status_code in (404, 410):
+            self._expire()          # changed or gone elsewhere: the next read checks the ctag and refetches (the write is not retried)
         if r.status_code >= 400:
             raise ContactsError(f"CardDAV {method} failed with HTTP {r.status_code}. Run icloud_check_health to see which service is failing.")
         return r
+
+    def _expire(self) -> None:
+        """Make the next read check the server for changes. Callers hold self._lock."""
+        if self._cache is not None:
+            self._cache = (float("-inf"), *self._cache[1:])         # older than any cache lifetime; the contents stay usable
 
     @staticmethod
     def _xml(r: httpx.Response) -> ET.Element:
@@ -581,7 +608,9 @@ class ContactsService:
             r = self._dav(client, "PROPFIND", book, '<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><cs:getctag/></d:prop></d:propfind>', "0")
             tag = self._xml(r).find(".//cs:getctag", _NS)
             return tag.text if tag is not None and tag.text else None
-        except ContactsError:
+        except ContactsError as e:
+            if e.transport:
+                raise                                                # a dead network: do not download the book as if it changed
             return None                                              # freshness check is best-effort
 
     def _cards(self, r: httpx.Response, book: str) -> list[dict[str, Any]]:
@@ -599,6 +628,8 @@ class ContactsService:
                 card["_href"] = urljoin(str(r.url), resp.findtext("d:href", "", _NS))
                 card["_etag"] = resp.findtext(".//d:getetag", None, _NS)
                 card["_book"] = book
+                if len(data.text) <= _RAW_MAX:
+                    card["_raw"] = data.text.strip()                 # the server's own copy, so an update needs no GET first
                 _indexed(card)
                 out.append(card)
         return out
@@ -646,36 +677,50 @@ class ContactsService:
             now = time.monotonic()
             if self._cache and now - self._cache[0] < _CACHE_SECONDS:
                 return self._cache[2]
-            with self._client() as client:
-                for attempt in (0, 1):
-                    fresh_discovery = not self._books
-                    try:
-                        if fresh_discovery:
-                            self._books = self._discover(client)
-                        ctags = tuple(self._ctag(client, b) for b in self._books)
-                        if self._cache and all(ctags) and ctags == self._cache[1]:
-                            self._cache = (now, ctags, self._cache[2])        # unchanged on the server: reuse
-                            return self._cache[2]
-                        if self._cache and len(self._cache[1]) == len(ctags) and len(self._cache[2]) >= _CHANGES_FROM_CARDS:
-                            cached = self._cache[2]
-                            try:                                              # only the books that changed, only their changed cards
-                                cards: list[dict[str, Any]] = []
-                                for book, new, old in zip(self._books, ctags, self._cache[1]):
-                                    mine = [c for c in cached if c.get("_book") == book]
-                                    cards += mine if (new and new == old) else self._changed(client, book, mine)
-                                contacts = self._sorted(cards)
-                                self._cache = (now, ctags, contacts)
-                                return contacts
-                            except ContactsError:
-                                log.info("Contacts change detection failed; downloading the address book")
-                        contacts = self._fetch(client, self._books)
-                        self._cache = (now, ctags, contacts)
-                        return contacts
-                    except ContactsError:
-                        if fresh_discovery or attempt == 1:
-                            raise
-                        self._books = []                                      # stale address-book URL: discover again once
-            raise ContactsError("Could not load contacts. Run icloud_check_health to see which service is failing.")                    # pragma: no cover
+            reused = self._http is not None
+            try:
+                return self._refresh(now)
+            except ContactsError as e:
+                # A kept-alive connection the server has closed fails on its next request: read once more on a new client (the
+                # failed one was dropped). Not on a timeout (fail fast), not on a brand-new client, and never for a write.
+                if not (e.transport and reused and not isinstance(e.__cause__, httpx.TimeoutException)):
+                    raise
+                callctx.stage("retrying on a new connection")
+                return self._refresh(now)
+
+    def _refresh(self, now: float) -> list[dict[str, Any]]:
+        with self._client() as client:
+            for attempt in (0, 1):
+                fresh_discovery = not self._books
+                try:
+                    if fresh_discovery:
+                        self._books = self._discover(client)
+                    ctags = tuple(self._ctag(client, b) for b in self._books)
+                    if self._cache and all(ctags) and ctags == self._cache[1]:
+                        self._cache = (now, ctags, self._cache[2])        # unchanged on the server: reuse
+                        return self._cache[2]
+                    if self._cache and len(self._cache[1]) == len(ctags) and len(self._cache[2]) >= _CHANGES_FROM_CARDS:
+                        cached = self._cache[2]
+                        try:                                              # only the books that changed, only their changed cards
+                            cards: list[dict[str, Any]] = []
+                            for book, new, old in zip(self._books, ctags, self._cache[1]):
+                                mine = [c for c in cached if c.get("_book") == book]
+                                cards += mine if (new and new == old) else self._changed(client, book, mine)
+                            contacts = self._sorted(cards)
+                            self._cache = (now, ctags, contacts)
+                            return contacts
+                        except ContactsError as e:
+                            if e.transport:
+                                raise                                     # the network, not the server: a download would fail too
+                            log.info("Contacts change detection failed; downloading the address book")
+                    contacts = self._fetch(client, self._books)
+                    self._cache = (now, ctags, contacts)
+                    return contacts
+                except ContactsError as e:
+                    if fresh_discovery or attempt == 1 or e.transport:
+                        raise
+                    self._books = []                                      # stale address-book URL (an HTTP error): discover again once
+        raise ContactsError("Could not load contacts. Run icloud_check_health to see which service is failing.")                    # pragma: no cover
 
     def _people(self) -> list[dict[str, Any]]:
         """Contacts only: group cards live in the same address book but are not people."""
@@ -683,6 +728,12 @@ class ContactsService:
 
     def _groups(self) -> list[dict[str, Any]]:
         return [c for c in self._all() if c.get("kind") == "group"]
+
+    def _cached_view(self) -> list[dict[str, Any]]:
+        """For a write's lookups: the address book as last read, whatever its age (loaded if there is none). The write is sent
+        with If-Match on the version read, so a stale copy can only cost a 412, which expires the cache (see _mutate)."""
+        cache = self._cache
+        return cache[2] if cache is not None else self._all()
 
     def _membership(self) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
@@ -717,7 +768,8 @@ class ContactsService:
         limit = max(1, min(int(limit), _MAX_LIMIT))
         offset = max(0, int(offset))
         groups = self._membership()
-        page = [{**_brief(c), **({"groups": groups[c["uid"]]} if c["uid"] in groups else {}), **self._marks(c)}
+        added = agentlog.agent_added_map(self.s.data_dir)
+        page = [{**_brief(c), **({"groups": groups[c["uid"]]} if c["uid"] in groups else {}), **self._marks(c, added)}
                 for c in hits[offset:offset + limit]]
         out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "total_matches": len(hits), "offset": offset, "returned": len(page), "contacts": page,
                                "complete": True}                    # the whole address book was read
@@ -740,10 +792,11 @@ class ContactsService:
     def _similar(contacts: list[dict[str, Any]], tokens: list[str], with_email: bool, limit: int = 5) -> list[dict[str, Any]]:
         """Contacts whose names merely SOUND like the query (misspellings, variant spellings). Never treated as a real match."""
         scored = []
+        query = [keyed(t) for t in tokens]                           # normalised and keyed once, not once per card
         for c in contacts:
             if with_email and not c["has_email"]:
                 continue
-            sim = fuzzy_match_all(tokens, _indexed(c)["all_words"])
+            sim = fuzzy_match_keyed(query, _indexed(c)["all_keyed"])
             if sim > 0:
                 scored.append((sim, c))
         scored.sort(key=lambda x: (-x[0], _indexed(x[1])["name"]))
@@ -770,39 +823,50 @@ class ContactsService:
     def get(self, uid: str) -> dict[str, Any]:
         for c in self._people():
             if c["uid"] == uid:
-                d = {k: v for k, v in c.items() if not k.startswith("_")}
+                d = _full(c)
                 if groups := self._membership().get(uid):
                     d["groups"] = groups
-                d.update(self._marks(c))
+                d.update(self._marks(c, agentlog.agent_added_map(self.s.data_dir)))
                 d["notice"] = UNTRUSTED_NOTICE
                 return d
         raise ContactsError(f"No contact with uid '{uid}'. Use contacts_search_contacts to find the uid.")
 
-    def _marks(self, c: dict[str, Any]) -> dict[str, Any]:
-        """Per-card provenance an agent should see: warnings in the card's text, and addresses an agent itself added."""
+    @staticmethod
+    def _marks(c: dict[str, Any], agent_added: dict[str, list[str]]) -> dict[str, Any]:
+        """Per-card provenance an agent should see: warnings in the card's text, and addresses an agent itself added (from the
+        journal, read once per call by the caller)."""
         out: dict[str, Any] = {}
         if w := _card_warnings(c):
             out["safety_warnings"] = w
-        if added := agentlog.agent_added(self.s.data_dir, c["uid"]):
+        if added := agent_added.get(c["uid"]):
             out["agent_added"] = added
             out["agent_added_note"] = "An agent added these addresses recently; confirm with the owner before mailing them."
         return out
 
+    def _find(self, uid: str, group: bool, cached: bool) -> dict[str, Any] | None:
+        """The card (a person, or a group) with this uid. cached: look in the cached view first (for writes), and read the
+        address book only when the uid is not there (made elsewhere since)."""
+        for view in ((self._cached_view, self._all) if cached else (self._all,)):
+            for c in view():
+                if c["uid"] == uid and (c.get("kind") == "group") == group:
+                    return c
+        return None
+
     def _record(self, uid: str) -> dict[str, Any]:
-        for c in self._people():
-            if c["uid"] == uid:
-                return c
+        if c := self._find(uid, False, cached=True):
+            return c
         raise ContactsError(f"No contact with uid '{uid}'. Use contacts_search_contacts to find the uid.")
 
     # -- groups -----------------------------------------------------------------------------
-    def _group(self, uid: str) -> dict[str, Any]:
-        for g in self._groups():
-            if g["uid"] == uid:
-                return g
+    def _group(self, uid: str, cached: bool = False) -> dict[str, Any]:
+        if g := self._find(uid, True, cached):
+            return g
         raise ContactsError(f"No group with uid '{uid}'. Use contacts_list_groups to find it.")
 
-    def _check_members(self, members: list[str]) -> list[str]:
-        people = {c["uid"] for c in self._people()}
+    def _check_members(self, members: list[str], cached: bool = False) -> list[str]:
+        people = {c["uid"] for c in (self._cached_view() if cached else self._all()) if c.get("kind") != "group"}
+        if cached and any(m not in people for m in members):                 # perhaps added elsewhere since the last read
+            people = {c["uid"] for c in self._people()}
         unknown = [m for m in members if m not in people]
         if unknown:
             raise ContactsError(f"Not contacts in this address book: {', '.join(unknown)}. Members are contact uids from contacts_search_contacts.")
@@ -848,18 +912,20 @@ class ContactsService:
     def update_group(self, uid: str, *, name: str | None = None, add_members: list[str] | None = None,
                      remove_members: list[str] | None = None) -> dict[str, Any]:
         with self._lock:
-            g = self._group(uid)
+            g = self._group(uid, cached=True)
             new_name = self._group_name(name) if name is not None else g["name"]
-            if name is not None and _norm(new_name) != _norm(g["name"]) and any(_norm(x["name"]) == _norm(new_name) for x in self._groups()):
+            if name is not None and _norm(new_name) != _norm(g["name"]) and any(
+                    x.get("kind") == "group" and _norm(x["name"]) == _norm(new_name) for x in self._cached_view()):
                 raise ContactsError(f"There is already a group called '{new_name}'.")
             current = list(g.get("members", []))
-            added = [m for m in self._check_members(add_members or []) if m not in current]
+            added = [m for m in self._check_members(add_members or [], cached=True) if m not in current]
             gone = set(remove_members or [])
             members = [m for m in current if m not in gone] + added
             if new_name == g["name"] and members == current:
                 return {"updated": False, "uid": uid, "name": g["name"], "note": "Nothing to change."}
             with self._client() as client:
-                raw = self._mutate(client, "GET", g["_href"]).text
+                # The raw card from the listing when it is the version the etag names; else GET it (a card we wrote, or a large one)
+                raw = g["_raw"] if g.get("_raw") and g.get("_etag") else self._mutate(client, "GET", g["_href"]).text
                 new_raw = _rewrite_group(raw, name=new_name, members=members)
                 response = self._mutate(client, "PUT", g["_href"], data=new_raw, etag=g.get("_etag"))
                 card = parse_vcard(new_raw)
@@ -871,7 +937,7 @@ class ContactsService:
     def delete_group(self, uid: str, name: str) -> dict[str, Any]:
         """Delete a group card. Its members stay: only the grouping goes. The name must match, as a check on the uid."""
         with self._lock:
-            g = self._group(uid)
+            g = self._group(uid, cached=True)
             if _norm(name or "") != _norm(g["name"]):
                 raise ContactsError(f"That uid is the group '{g['name']}', not '{name}'. Nothing was deleted.")
             with self._client() as client:
@@ -928,12 +994,16 @@ class ContactsService:
         with self._lock:
             record = self._record(uid)
             with self._client() as client:
-                r = self._mutate(client, "GET", record["_href"])
-                raw = r.text
-                # Condition on the version the agent last READ (from the cache), not on the fresh copy fetched just now:
+                # Condition on the version the agent last READ (from the cache), not on a fresh copy fetched just now:
                 # otherwise an edit made elsewhere in between would be silently overwritten. iCloud reports the same ETag in
-                # the address-book listing and in a GET (verified), so the cached value is valid here.
-                etag = record.get("_etag") or r.headers.get("etag")
+                # the address-book listing and in a GET (verified), so the cached value is valid here. The listing's raw card
+                # is that same version, so no GET is needed; a card we wrote ourselves (no raw) or one without an etag is read.
+                if record.get("_raw") and record.get("_etag"):
+                    raw, etag = record["_raw"], record["_etag"]
+                else:
+                    r = self._mutate(client, "GET", record["_href"])
+                    raw = r.text
+                    etag = record.get("_etag") or r.headers.get("etag")
                 added: list[str] = []
                 new_raw = raw
                 if add_emails or add_phones:

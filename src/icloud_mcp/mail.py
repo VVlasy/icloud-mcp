@@ -39,7 +39,7 @@ from imapclient import IMAPClient
 from . import callctx
 from .config import Settings
 from .keepalive import TICKER
-from .matching import fuzzy_match_all, norm, similar_enough
+from .matching import fuzzy_match_all, keyed, norm, similar_keyed
 from .safety import HIDDEN_NOTICE, HIDDEN_TEXT_WARNING, compact, confirm_problem, hidden_text, strip_hidden_html, warnings_for
 from .safety import confirm_token as make_confirm_token
 from .mailbulk import bulk_view, uid_chunks, uid_set
@@ -1544,6 +1544,12 @@ class MailService:
                                     p["names"][name] += 1
                                 if isinstance(when, datetime) and (p["last"] is None or when > p["last"]):
                                     p["last"] = when
+        # What find_correspondents compares a query with, worked out once per scan (so it expires with this cache entry)
+        for addr, p in people.items():
+            local, _, domain = addr.partition("@")
+            words = [w for name in p["names"] for w in norm(name).split()] + re.split(r"[._+\-]+", norm(local)) + [w for w in norm(domain).split(".")]
+            p["_words"], p["_word_set"], p["_norm_addr"] = words, set(words), norm(addr)
+            p["_keyed"] = [keyed(w) for w in words if w]
         return people, scanned
 
     @_retrying
@@ -1559,20 +1565,20 @@ class MailService:
                 hit = self._people_cache[search_all_history] = (time.monotonic(), people, scanned)
         _, people, scanned = hit
         found = []
+        query = [keyed(t) for t in tokens]                                   # normalised and keyed once per call
         for addr, p in people.items():
-            local, _, domain = addr.partition("@")
-            words = [w for name in p["names"] for w in norm(name).split()] + re.split(r"[._+\-]+", norm(local)) + [w for w in norm(domain).split(".")]
+            words = p["_words"]
             exact_scores, approximate = [], False
-            for tok in tokens:
+            for tok, tok_keyed in zip(tokens, query):
                 best = 0.0
-                if any(w == tok for w in words):
+                if tok in p["_word_set"]:
                     best = 1.0
-                elif any(len(tok) >= 3 and w.startswith(tok) for w in words):
+                elif len(tok) >= 3 and any(w.startswith(tok) for w in words):
                     best = 0.9
-                elif len(tok) >= 3 and tok in norm(addr):
+                elif len(tok) >= 3 and tok in p["_norm_addr"]:
                     best = 0.8
                 else:
-                    fuzzy = max((similar_enough(tok, w) for w in words), default=0.0)
+                    fuzzy = max((similar_keyed(tok_keyed, w) for w in p["_keyed"]), default=0.0)
                     if fuzzy:
                         best, approximate = fuzzy, True
                 if best == 0.0:

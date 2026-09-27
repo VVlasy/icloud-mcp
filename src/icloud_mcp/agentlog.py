@@ -61,3 +61,10 @@ def agent_added_addresses(data_dir: str) -> set[str]:
     with _lock:
         data = _load(data_dir)
     return {a for items in data.values() for a in items}
+
+
+def agent_added_map(data_dir: str) -> dict[str, list[str]]:
+    """agent_added for every contact at once ({uid: addresses, oldest first}): one read of the journal for a whole result page."""
+    with _lock:
+        data = _load(data_dir)
+    return {uid: [a for a, _ in sorted(items.items(), key=lambda kv: kv[1])] for uid, items in data.items() if items}
