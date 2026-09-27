@@ -327,3 +327,43 @@ structuredContent back for a client that needs it). Tool descriptions lose their
 answers each request with a plain JSON body instead of an event stream (`MCP_JSON_RESPONSE`, default true; the tool timeout is
 then capped at 90 s, below Cloudflare's 100 s). With every area on (`dev/tool_surface.py`): description characters 23,662 to
 21,682, the `tools/list` result 93,182 to 82,035 bytes. Bench figures follow.
+
+## 0.13 speed pass: before and after
+
+Same harness (`dev/bench.py --local --latency-ms 40`, 3 runs), 0.12.1 against this branch. `bytes` is the text the model reads, `wire bytes` the whole tool result as sent.
+
+#### before (0.12.1)
+
+| scenario | median s | p90 s | bytes | wire bytes | notice chars | tcp connects | imap commands | imap kb in | caldav requests | carddav requests |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mail_search_messages 20 | 0.150 | 0.200 | 9958 | 17432 | 85 | 0 | 3 | 12 | 0 | 0 |
+| mail_search_messages 20 + get_messages 10 | 0.392 | 0.417 | 30576 | 58065 | 249 | 0 | 7 | 55 | 0 | 0 |
+| mail_search_messages all_folders | 0.367 | 0.544 | 10903 | 19213 | 85 | 0 | 19 | 33 | 0 | 0 |
+| mail_get_attachment (300 KB pdf) | 0.338 | 0.351 | 419779 | 837211 | 170 | 0 | 7 | 424 | 0 | 0 |
+| calendar_list_calendars (cold) | 1.737 | 2.033 | 491 | 1247 | 0 | 9 | 0 | 0 | 9 | 0 |
+| calendar_list_calendars (warm) | 0.001 | 0.171 | 491 | 1247 | 0 | 0 | 0 | 0 | 0 | 0 |
+| calendar_list_events 7 days | 0.247 | 0.248 | 7691 | 14638 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days | 0.328 | 0.340 | 12442 | 23571 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days, fields=summary | 0.329 | 0.364 | 13266 | 25008 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_find_free_time 14 days | 0.265 | 0.285 | 2498 | 4841 | 85 | 5 | 0 | 0 | 5 | 0 |
+| contacts_search_contacts (cold) | 0.586 | 0.591 | 8559 | 14866 | 72 | 5 | 0 | 0 | 0 | 5 |
+| contacts_search_contacts (warm) | 0.002 | 0.003 | 8559 | 14866 | 72 | 0 | 0 | 0 | 0 | 0 |
+| calendar create + update + delete | 0.849 | 0.851 | 1454 | 3226 | 0 | 12 | 0 | 0 | 12 | 0 |
+
+#### after
+
+| scenario | median s | p90 s | bytes | wire bytes | notice chars | tcp connects | imap commands | imap kb in | caldav requests | carddav requests |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mail_search_messages 20 | 0.090 | 0.133 | 4652 | 5409 | 85 | 0 | 2 | 12 | 0 | 0 |
+| mail_search_messages 20 + get_messages 10 | 0.272 | 0.275 | 20714 | 22977 | 249 | 0 | 5 | 55 | 0 | 0 |
+| mail_search_messages all_folders | 0.229 | 0.231 | 5555 | 6446 | 85 | 0 | 12 | 33 | 0 | 0 |
+| mail_get_attachment (300 KB pdf) | 0.232 | 0.235 | 414452 | 415340 | 170 | 0 | 5 | 424 | 0 | 0 |
+| calendar_list_calendars (cold) | 0.257 | 0.258 | 312 | 465 | 0 | 3 | 0 | 0 | 3 | 0 |
+| calendar_list_calendars (warm) | 0.001 | 0.001 | 312 | 465 | 0 | 0 | 0 | 0 | 0 | 0 |
+| calendar_list_events 7 days | 0.230 | 0.241 | 5078 | 5835 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days | 0.253 | 0.270 | 8244 | 9407 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days, fields=summary | 0.259 | 0.338 | 8244 | 9407 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_find_free_time 14 days | 0.234 | 0.243 | 2016 | 2323 | 85 | 5 | 0 | 0 | 5 | 0 |
+| contacts_search_contacts (cold) | 0.592 | 0.605 | 3331 | 3978 | 72 | 5 | 0 | 0 | 0 | 5 |
+| contacts_search_contacts (warm) | 0.002 | 0.002 | 3331 | 3978 | 72 | 0 | 0 | 0 | 0 | 0 |
+| calendar create + update + delete | 0.674 | 0.679 | 1185 | 1656 | 0 | 10 | 0 | 0 | 10 | 0 |
