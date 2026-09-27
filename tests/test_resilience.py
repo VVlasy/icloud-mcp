@@ -46,7 +46,8 @@ async def rpc(app, token, payload, session=None):
     async with T.client_for(app) as c:
         r = await c.post("/mcp", json=payload, headers=headers)
     body = r.text
-    data = json.loads(body.split("data:", 1)[1].strip()) if "data:" in body else (r.json() if body.strip().startswith("{") else {})
+    sse = body.lstrip().startswith(("event:", "data:"))          # an SSE stream; a JSON body may contain "data:" in its text
+    data = json.loads(body.split("data:", 1)[1].strip()) if sse else (r.json() if body.strip().startswith("{") else {})
     return r, data
 
 
