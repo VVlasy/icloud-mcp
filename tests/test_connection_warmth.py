@@ -456,6 +456,28 @@ def test_folder_list_is_cached_for_a_minute_and_cleared_by_create(mail, monkeypa
     assert FakeIMAP.made[0].calls.count("list") == 3
 
 
+def test_mail_prewarm_logs_in_the_pool_without_status(mail, monkeypatch):
+    statuses, logins, lock = [], [], threading.Lock()
+    monkeypatch.setattr(FakeIMAP, "folder_status", lambda self, name, what: statuses.append(name) or {})
+
+    def login(self, *a):
+        with lock:
+            logins.append(self)
+            if len(logins) == 2:                                    # one spare is refused: ignored, the rest are kept
+                raise OSError("refused")
+        self.calls.append("login")
+    monkeypatch.setattr(FakeIMAP, "login", login)
+    mail.prewarm()
+    assert statuses == [] and sum(c.calls.count("list") for c in FakeIMAP.made) == 1
+    assert len(logins) == mail.s.imap_pool_size and len(mail._pool) == mail.s.imap_pool_size - 1
+    assert mail._folder_cache == {"sent": "Sent Messages"}         # the missing special folders are not remembered as missing
+    opened = []
+    orig = MailService.imap
+    monkeypatch.setattr(MailService, "imap", lambda self, fresh=False: opened.append(1) or orig(self, fresh))
+    mail._search_everywhere(["ALL"], None, 10, 0)
+    assert len(opened) == 2 and len(logins) == mail.s.imap_pool_size   # one connection per folder, none just for the names
+
+
 # ------------------------------------------------------------------------------------------------ SMTP
 class FakeSocket:
     def __init__(self):
@@ -596,7 +618,7 @@ def test_warmup_runs_every_area_and_never_raises(s, caplog):
         _icloud_warmups = {"mail": lambda: ran.append("mail"), "calendar": lambda: 1 / 0, "contacts": lambda: ran.append("contacts")}
     t = start_warmup(M(), s)
     t.join(5)
-    assert ran == ["mail", "contacts"] and "calendar failed (ZeroDivisionError)" in caplog.text
+    assert set(ran) == {"mail", "contacts"} and "calendar failed (ZeroDivisionError)" in caplog.text   # areas run at once
     assert start_warmup(M(), dataclasses.replace(s, warmup_on_start=False)) is None
 
 

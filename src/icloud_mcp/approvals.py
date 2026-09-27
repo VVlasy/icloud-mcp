@@ -127,7 +127,9 @@ def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Set
                 f'<button class="no" type="submit">Discard all {len(qs)} {label}</button></form>')
 
     def _queue_page(note: str = "") -> Response:
+        """Blocking (the queue file, IMAP for the originals): the routes run it in a worker thread, off the event loop."""
         items = [(k, q) for k, o in outboxes.items() for q in o.pending()]
+        contexts = mail.approval_contexts([q for k, q in items if k == "mail"], prune=True) if mail is not None else {}
         exp = int(time.time()) + _TOKEN_TTL
         recent = sum(1 for _, q in items if time.time() - q.created_at < 3600)
         parts = [f'<div class="card"><h1>Outgoing messages waiting for your approval</h1>{note}'
@@ -145,7 +147,7 @@ def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Set
 {_row('Conversation', d['chat_id'] or '')}</table>{group}
 <pre>{html.escape(d['text'])}</pre><p class="muted">Sent from your Mac once you approve. Expires in about {mins} min. Approve only if you asked your agent to send this.</p>{_buttons(kind, q, exp, "Approve and send")}</div>""")
                 continue
-            d = mail.describe_queued(q)
+            d = mail.describe_queued(q, contexts.get(q.id))
             atts = "".join(f"<li>{html.escape(str(a.get('filename')))} ({html.escape(str(a.get('content_type')))}, {a.get('size')} bytes)</li>"
                            for a in d["attachments"]) or ""
             body = d["body"] if len(d["body"]) <= _BODY_PREVIEW else d["body"][:_BODY_PREVIEW] + "\n\n[... preview truncated; the full message is sent]"
@@ -174,7 +176,7 @@ def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Set
             provider.record_failure()
             log.warning("Failed owner-password attempt on /outbox")
             return _login_form("Incorrect password.", 401)
-        return _queue_page()
+        return await asyncio.to_thread(_queue_page)
 
     @mcp.custom_route("/outbox/act", methods=["POST"])
     async def outbox_act(request: Request) -> Response:
@@ -196,10 +198,12 @@ def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Set
                 log.warning("Rejected /outbox/act discard_all with an invalid token")
                 return _page("Outgoing message approval", '<div class="card"><p class="err">Invalid request. Re-enter the owner password.</p>'
                              '<p><a href="/outbox">Back</a></p></div>', 403)
-            for x in shown:
-                box.claim(x.id)
+            def claim_all() -> None:
+                for x in shown:
+                    box.claim(x.id)
+            await asyncio.to_thread(claim_all)
             log.info("Owner discarded all %d queued %s messages", len(shown), kind)
-            return _queue_page(f'<p class="ok-note">Discarded {len(shown)}.</p>')
+            return await asyncio.to_thread(_queue_page, f'<p class="ok-note">Discarded {len(shown)}.</p>')
         q = next((x for x in box.pending() if x.id == item_id), None) if box is not None else None
         if action not in ("approve", "discard") or exp < time.time() or q is None:
             return _page("Outgoing message approval", '<div class="card"><p class="err">That request has expired or the message is no longer waiting.</p>'
@@ -209,26 +213,26 @@ def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Set
             return _page("Outgoing message approval", '<div class="card"><p class="err">Invalid request. Re-enter the owner password.</p>'
                          '<p><a href="/outbox">Back</a></p></div>', 403)
         if action == "discard":
-            box.claim(q.id)
+            await asyncio.to_thread(box.claim, q.id)
             log.info("Owner discarded queued message %s", q.id)
-            return _queue_page('<p class="ok-note">Discarded.</p>')
+            return await asyncio.to_thread(_queue_page, '<p class="ok-note">Discarded.</p>')
         if kind == "mail" and str(form.get("override", "")) != "1":
-            d = await asyncio.to_thread(mail.describe_queued, q)
+            d = await asyncio.to_thread(mail.describe_queued, q)          # the page's own source: the memo, else a fresh read
             if _flagged(d):
                 log.info("Approval of %s refused without the override: the original carried safety warnings", q.id)
-                return _queue_page('<p class="err">Not sent: this message answers one that looked like an attempt to steer the agent. '
-                                   'Tick the box under it if you still want it sent.</p>')
+                return await asyncio.to_thread(_queue_page, '<p class="err">Not sent: this message answers one that looked like an '
+                                               'attempt to steer the agent. Tick the box under it if you still want it sent.</p>')
         try:
             result = (await asyncio.to_thread(imessage.release, box, q.id) if kind == "imessage"
                       else await asyncio.to_thread(mail.release, q.id))
         except Exception as e:  # noqa: BLE001  -- release() re-queues on any failure, so the owner can retry or discard
             log.warning("Release of %s failed: %s", q.id, e)
-            return _queue_page(f'<p class="err">Not sent (still queued): {html.escape(str(e))}</p>')
+            return await asyncio.to_thread(_queue_page, f'<p class="err">Not sent (still queued): {html.escape(str(e))}</p>')
         log.info("Owner approved queued %s %s", kind, q.id)
         if kind == "imessage":
             status = result.get("status")
             word = {"sent": "Sent", "failed": "Not delivered", "unconfirmed": "Handed to Messages (not yet confirmed)"}.get(status, str(status))
-            return _queue_page(f'<p><b>{html.escape(word)}</b>: iMessage to {html.escape(result.get("to", ""))}. '
-                               f'{html.escape(result.get("note", ""))}</p>')
+            note = f'<p><b>{html.escape(word)}</b>: iMessage to {html.escape(result.get("to", ""))}. {html.escape(result.get("note", ""))}</p>'
+            return await asyncio.to_thread(_queue_page, note)
         extra = f" {html.escape(result['warning'])}" if result.get("warning") else ""
-        return _queue_page(f'<p><b>Sent</b> to {html.escape(", ".join(result.get("recipients", [])))}.{extra}</p>')
+        return await asyncio.to_thread(_queue_page, f'<p><b>Sent</b> to {html.escape(", ".join(result.get("recipients", [])))}.{extra}</p>')

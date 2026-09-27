@@ -24,6 +24,11 @@ def begin(holder: dict[str, Any]) -> None:
     _call.holder = holder
 
 
+def current() -> dict[str, Any] | None:
+    """The holder of the call running on this thread, to hand to helper threads it starts (begin() there)."""
+    return getattr(_call, "holder", None)
+
+
 def stage(text: str) -> None:
     holder = getattr(_call, "holder", None)
     if holder is not None:

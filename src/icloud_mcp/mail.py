@@ -749,6 +749,8 @@ class MailService:
         self._status_modseq = True          # False once STATUS left HIGHESTMODSEQ out with CONDSTORE enabled: EXAMINE instead
         self._smtp_lock = threading.Lock()
         self._smtp: tuple[smtplib.SMTP, float] | None = None                     # (logged-in connection, last used)
+        self._contexts_lock = threading.Lock()
+        self._contexts: dict[tuple[str, str, Any], dict[str, Any]] = {}  # (id, sha256, uidvalidity) -> a queued item's original, memory only
 
     # -- connections ---------------------------------------------------------
     def _login(self) -> IMAPClient:
@@ -925,13 +927,37 @@ class MailService:
         """The folder LIST, kept for a minute: folders rarely change, and every all-folders search and folder lookup needs it.
         Creating a folder here clears it; one made in the Mail app appears within the minute."""
         now = time.monotonic()
-        with self._folders_lock:
-            if self._folders and now - self._folders[0] < _FOLDERS_SECONDS:
-                return self._folders[1]
+        if (kept := self._cached_list()) is not None:
+            return kept
         folders = list(c.list_folders())
         with self._folders_lock:
             self._folders = (now, folders)
         return folders
+
+    def _cached_list(self) -> list[tuple[Any, Any, str]] | None:
+        """The kept folder LIST while it is fresh, without a connection; None when it has to be read again."""
+        with self._folders_lock:
+            if self._folders and time.monotonic() - self._folders[0] < _FOLDERS_SECONDS:
+                return self._folders[1]
+        return None
+
+    def prewarm(self) -> None:
+        """Warm-up: one pooled login, the folder LIST and the special folders' names (no STATUS: the counts would be thrown
+        away), then the rest of the pool logged in at once, so a first all-folders search finds its connections ready. At most
+        IMAP_POOL_SIZE sessions in all; a spare that fails to log in is left out, and the first call that needs it logs in."""
+        with self.imap() as c:
+            self._list(c)
+            for alias in ("sent", "drafts", "trash", "junk", "archive"):
+                with contextlib.suppress(MailError):           # not there: nothing is kept, the call that names it looks again
+                    self.resolve_folder(c, alias)
+        spare = max(0, self.s.imap_pool_size - 1)
+        if not spare:
+            return
+        with ThreadPoolExecutor(max_workers=spare, thread_name_prefix="imap-prewarm") as pool:
+            opened = [pool.submit(self._login) for _ in range(spare)]
+        for f in opened:
+            with contextlib.suppress(Exception):
+                self._checkin(f.result())
 
     def resolve_folder(self, c: IMAPClient, name: str) -> str:
         key = (name or "INBOX").strip().lower()
@@ -1288,9 +1314,12 @@ class MailService:
         found: list[dict[str, Any]] = []
         per_folder: dict[str, int] = {}
         skipped: list[str] = []
-        with self.imap() as c:
-            names = [name for flags, _delim, name in self._list(c)
-                     if not {"\\Noselect", "\\NonExistent"} & {f.decode() if isinstance(f, bytes) else str(f) for f in flags}]
+        listed = self._cached_list()                        # fresh: no connection checked out just for the names
+        if listed is None:
+            with self.imap() as c:
+                listed = self._list(c)
+        names = [name for flags, _delim, name in listed
+                 if not {"\\Noselect", "\\NonExistent"} & {f.decode() if isinstance(f, bytes) else str(f) for f in flags}]
 
         def one(name: str) -> tuple[str, int, list[dict[str, Any]]] | None:
             for attempt in (0, 1):
@@ -1851,8 +1880,9 @@ class MailService:
                 pass
         return result
 
-    def describe_queued(self, q: QueuedMessage) -> dict[str, Any]:
-        """What the owner reviews before approving: exactly the stored message, envelope included."""
+    def describe_queued(self, q: QueuedMessage, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """What the owner reviews before approving: exactly the stored message, envelope included. context: this item's entry
+        from approval_contexts when the caller already has it (the page reads every item's at once)."""
         msg = email.message_from_bytes(q.raw, policy=policy.default)
         text, htm = extract_bodies(msg)
         body = text if text is not None else (html_to_text(htm) if htm else "")
@@ -1861,35 +1891,106 @@ class MailService:
             "from": str(msg["From"]), "to": str(msg["To"] or ""), "cc": str(msg["Cc"] or ""), "bcc": str(msg["Bcc"] or ""),
             "envelope_recipients": q.recipients, "subject": str(msg["Subject"] or ""), "body": body,
             "attachments": list_attachments(msg), "is_reply": bool(msg["In-Reply-To"]),
-            **self._approval_context(q),
+            **(context if context is not None else self._approval_context(q)),
         }
 
     def _approval_context(self, q: QueuedMessage) -> dict[str, Any]:
-        """What the owner needs to judge an injected message: the message this one answers or forwards (its sender, subject and
-        the warnings its text carried) and any recipient whose address an agent added to a contact card. Best effort: a
-        failure to read the original never hides the queued item."""
-        out: dict[str, Any] = {}
-        fu = q.followup or {}
-        if fu.get("folder") and fu.get("uid"):
-            try:
-                with self.imap() as c:
-                    folder = self.resolve_folder(c, str(fu["folder"]))
-                    raw, flags, internal, uv, skeleton = self._fetch_readable(c, folder, int(fu["uid"]), uidvalidity=fu.get("uidvalidity"))
-                view = self._message_view(folder, int(fu["uid"]), raw, flags, internal, body_chars=2000, uidvalidity=uv, skeleton=skeleton)
-                out["original"] = {k: view.get(k) for k in ("from", "subject", "date", "safety_warnings", "bulk") if view.get(k)}
-            except Exception as e:  # noqa: BLE001
-                out["original"] = {"unavailable": f"{type(e).__name__}"}
+        return self.approval_contexts([q])[q.id]
+
+    def approval_contexts(self, qs: list[QueuedMessage], *, prune: bool = False) -> dict[str, dict[str, Any]]:
+        """What the owner needs to judge an injected message, per queued item id: the message it answers or forwards (its
+        sender, subject, whether it is bulk mail and the warnings its text carried) and any recipient whose address an agent
+        added to a contact card. Best effort: a failure to read an original never hides the queued item. The originals come
+        from a memory-only memo (the approve check reads the same one as the page); prune=True, given the whole queue, forgets
+        items no longer waiting. Agent-added recipients are worked out afresh every time: an agent may add one at any moment."""
         from .agentlog import agent_added_addresses
-        flagged = [r for r in q.recipients if r.lower() in agent_added_addresses(self.s.data_dir)]
-        if flagged:
-            out["agent_added_recipients"] = flagged
+
+        originals = self._originals(qs)
+        if prune:
+            live = {k for q in qs if (k := self._context_key(q)) is not None}
+            with self._contexts_lock:
+                for k in [k for k in self._contexts if k not in live]:
+                    del self._contexts[k]
+        added = agent_added_addresses(self.s.data_dir)           # one read per page, not one per item
+        out: dict[str, dict[str, Any]] = {}
+        for q in qs:
+            ctx: dict[str, Any] = {}
+            if q.id in originals:
+                ctx["original"] = originals[q.id]
+            if flagged := [r for r in q.recipients if r.lower() in added]:
+                ctx["agent_added_recipients"] = flagged
+            out[q.id] = ctx
         return out
+
+    @staticmethod
+    def _context_key(q: QueuedMessage) -> tuple[str, str, Any] | None:
+        fu = q.followup or {}
+        return (q.id, q.sha256, fu.get("uidvalidity")) if fu.get("folder") and fu.get("uid") else None
+
+    def _originals(self, qs: list[QueuedMessage]) -> dict[str, dict[str, Any]]:
+        """The original's fields per item id: from the memo, else read folder by folder on one pooled connection (one SELECT
+        per folder, one FETCH of the whole messages, the same view as mail_get_message, so the warnings are the same)."""
+        out: dict[str, dict[str, Any]] = {}
+        todo: dict[str, list[QueuedMessage]] = {}
+        with self._contexts_lock:
+            for q in qs:
+                if (key := self._context_key(q)) is None:
+                    continue
+                if key in self._contexts:
+                    out[q.id] = self._contexts[key]
+                else:
+                    todo.setdefault(str(q.followup["folder"]), []).append(q)
+        if not todo:
+            return out
+        try:
+            with self.imap() as c:
+                for folder, group in todo.items():
+                    try:
+                        self._read_originals(c, folder, group, out)
+                    except Exception as e:  # noqa: BLE001 - this folder only; a dead connection ends the whole read
+                        if _mail_transport(e):
+                            raise
+                        for q in group:
+                            out.setdefault(q.id, {"unavailable": type(e).__name__})
+        except Exception as e:  # noqa: BLE001
+            for group in todo.values():
+                for q in group:
+                    out.setdefault(q.id, {"unavailable": type(e).__name__})    # not kept: the next page tries again
+        return out
+
+    def _read_originals(self, c: IMAPClient, folder: str, group: list[QueuedMessage], out: dict[str, dict[str, Any]]) -> None:
+        folder = self.resolve_folder(c, folder)
+        uv = self._select(c, folder)
+        wanted: dict[int, list[QueuedMessage]] = {}
+        for q in group:
+            expect = q.followup.get("uidvalidity")
+            if expect is not None and (uv is None or int(expect) != uv):
+                out[q.id] = {"unavailable": "MailError"}           # renumbered: the uid may name another message now
+            else:
+                wanted.setdefault(int(q.followup["uid"]), []).append(q)
+        data = c.fetch(list(wanted), ["BODY.PEEK[]", "FLAGS", "INTERNALDATE"]) if wanted else {}
+        for uid, items in wanted.items():
+            d = data.get(uid)
+            if not d:
+                for q in items:
+                    out[q.id] = {"unavailable": "MailError"}        # moved or deleted meanwhile
+                continue
+            raw = d.get(b"BODY[]") or b""
+            view = self._message_view(folder, uid, raw, d.get(b"FLAGS", ()), d.get(b"INTERNALDATE"), body_chars=2000, uidvalidity=uv)
+            orig = {k: view[k] for k in ("from", "subject", "date", "safety_warnings") if view.get(k)}
+            if bulk_view(_Headers(raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0])).get("bulk"):
+                orig["bulk"] = True
+            with self._contexts_lock:
+                for q in items:
+                    out[q.id] = self._contexts[self._context_key(q)] = orig
 
     def release(self, item_id: str) -> dict[str, Any]:
         """Send a queued message. Called only from the password-protected approval page, never from an MCP tool."""
         q = self.outbox.claim(item_id)
         if q is None:
             raise MailError("That message is no longer waiting (already released, discarded or expired).")
+        with self._contexts_lock:
+            self._contexts.pop(self._context_key(q), None)
         try:
             if not self.s.allow_send:
                 raise MailError("Sending is disabled on this server (ALLOW_SEND=false).")

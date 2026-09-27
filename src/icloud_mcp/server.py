@@ -575,7 +575,7 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
     if s.enable_mail:
         mail = MailService(s)
         health["mail"] = mail.health
-        warm["mail"] = lambda: mail.list_folders() and None       # one pooled login plus the folder list
+        warm["mail"] = mail.prewarm                               # the pooled logins, the folder list and the special folders
         pools["mail"] = lambda: {"warm": bool(mail._pool), "imap_kept": len(mail._pool), "imap_pool_size": s.imap_pool_size,
                                  "smtp_connected": mail._smtp is not None}
         if s.allow_send and writable and s.require_approval and provider is not None:
@@ -1808,7 +1808,17 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
         secrets = (s.app_password, s.owner_password, s.bridge_token, s.username, s.email_address,
                    s.imap_username, s.smtp_username, s.caldav_username, s.carddav_username)
         before = {area: view() for area, view in pools.items()}          # read first: the checks below warm things up
-        results = {area: _timed(check, secrets) for area, check in health.items()}
+        holder = callctx.current()
+
+        def one(check: Any) -> dict[str, Any]:
+            callctx.begin(holder)                   # stage names reach the caller's timeout message from these threads too
+            return _timed(check, secrets)
+
+        # The areas are checked at once, so the report takes as long as the slowest one. Its own short-lived threads, never
+        # the tool pool: this runs inside a tool call (or the admin API), and a nested submit there could wait on itself.
+        with ThreadPoolExecutor(max_workers=max(1, len(health)), thread_name_prefix="icloud-health") as pool:
+            futures = {area: pool.submit(one, check) for area, check in health.items()}
+            results = {area: f.result() for area, f in futures.items()}
         for area, view in before.items():
             if area in results:
                 results[area]["connections"] = view
@@ -1968,14 +1978,22 @@ def start_warmup(mcp: MCPServer, s: Settings) -> threading.Thread | None:
     if not s.warmup_on_start or not jobs:
         return None
 
+    def one(area: str, job: Any) -> None:
+        t0 = time.monotonic()
+        try:
+            job()
+            log.info("Warm-up: %s ready in %.1f s", area, time.monotonic() - t0)
+        except Exception as e:  # noqa: BLE001 - warm-up is best effort
+            log.warning("Warm-up: %s failed (%s); the first call will connect instead", area, type(e).__name__)
+
     def run() -> None:
-        for area, job in jobs.items():
-            t0 = time.monotonic()
-            try:
-                job()
-                log.info("Warm-up: %s ready in %.1f s", area, time.monotonic() - t0)
-            except Exception as e:  # noqa: BLE001 - warm-up is best effort
-                log.warning("Warm-up: %s failed (%s); the first call will connect instead", area, type(e).__name__)
+        # The areas are independent: warm them at once, so every one is ready when the slowest is. Own threads, never the tool
+        # pool, which the first calls need.
+        threads = [threading.Thread(target=one, args=(area, job), name=f"icloud-warmup-{area}", daemon=True) for area, job in jobs.items()]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
     t = threading.Thread(target=run, name="icloud-warmup", daemon=True)
     t.start()
     return t
