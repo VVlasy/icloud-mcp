@@ -604,6 +604,8 @@ def _flag_view(flags: tuple[Any, ...]) -> dict[str, Any]:
     }
 
 
+_CHANGED_KEYS = ("uid", "subject", "from", "date", "unread", "flagged", "answered", "safety_warnings")   # a 'changed' item
+
 _IMAP_PING_SECONDS = 300.0    # keep-alive: NOOP a pooled IMAP session idle this long
 _FOLDERS_SECONDS = 60.0       # the folder LIST
 _SMTP_IDLE_SECONDS = 60.0     # a logged-in SMTP connection unused for longer is closed rather than reused
@@ -715,6 +717,7 @@ class MailService:
         self._folders: tuple[float, list[tuple[Any, Any, str]]] | None = None   # (read at, LIST result)
         self._structures: OrderedDict[tuple[str, int, int], Any] = OrderedDict()   # (folder, uidvalidity, uid) -> mailparts.Node
         self._structures_lock = threading.Lock()
+        self._status_modseq = True          # False once STATUS left HIGHESTMODSEQ out with CONDSTORE enabled: EXAMINE instead
         self._smtp_lock = threading.Lock()
         self._smtp: tuple[smtplib.SMTP, float] | None = None                     # (logged-in connection, last used)
 
@@ -1092,26 +1095,78 @@ class MailService:
         charset = None if all(isinstance(x, (date,)) or str(x).isascii() for x in crit) else "UTF-8"
         return crit, charset
 
+    @staticmethod
+    def _enable_condstore(c: IMAPClient) -> None:
+        """ENABLE CONDSTORE once per connection: iCloud leaves HIGHESTMODSEQ out of EXAMINE without it, and rejects SELECT
+        (CONDSTORE). The mark goes on the connection only once ENABLE was sent with no folder open, the one state it is legal in."""
+        if getattr(c, "_condstore_enabled", False):
+            return
+        MailService._ensure_unselected(c)
+        if getattr(getattr(c, "_imap", None), "state", "AUTH") != "AUTH":
+            return
+        with contextlib.suppress(Exception):          # iCloud applies ENABLE without sending ENABLED back
+            c.enable("CONDSTORE")
+            c._condstore_enabled = True
+
+    def _change_state(self, c: IMAPClient, folder: str) -> tuple[Any, Any, Any, Any, Any] | None:
+        """(uidvalidity, highestmodseq, uidnext, messages, unseen) from one STATUS, with no folder opened; None when the server
+        leaves HIGHESTMODSEQ out (the caller then EXAMINEs). A server that leaves it out even with CONDSTORE enabled is not asked
+        again, so its polls pay no extra round trip."""
+        if not self._status_modseq:
+            return None
+        self._ensure_unselected(c)                        # STATUS on the open folder may answer from a stale view
+        callctx.stage(f"IMAP STATUS {folder}")
+        try:
+            st = c.folder_status(folder, ["MESSAGES", "UNSEEN", "UIDVALIDITY", "UIDNEXT", "HIGHESTMODSEQ"]) or {}
+        except Exception as e:  # noqa: BLE001 - a refused STATUS (missing folder, unknown item) is left to EXAMINE to explain
+            if _mail_transport(e):
+                raise
+            return None
+        state = (st.get(b"UIDVALIDITY"), st.get(b"HIGHESTMODSEQ"), st.get(b"UIDNEXT"), st.get(b"MESSAGES"), st.get(b"UNSEEN"))
+        if None in state[:3]:
+            if state[1] is None and getattr(c, "_condstore_enabled", False):
+                self._status_modseq = False
+            return None
+        return state
+
+    def _examine_state(self, c: IMAPClient, folder: str) -> tuple[Any, Any, Any, Any, Any]:
+        """The same counters from EXAMINE (read-only, so the pooled connection may keep it open); the unread count is not in it."""
+        self._enable_condstore(c)
+        callctx.stage(f"IMAP EXAMINE {folder}")
+        info = c.select_folder(folder, readonly=True) or {}
+        return info.get(b"UIDVALIDITY"), info.get(b"HIGHESTMODSEQ"), info.get(b"UIDNEXT"), info.get(b"EXISTS"), None
+
     @_retrying
     def changes(self, folder: str = "INBOX", since: str | None = None, *, limit: int = 50) -> dict[str, Any]:
         """What changed in a folder since a token from the previous call: new messages, and messages whose flags (read, flagged,
         answered) changed. Uses IMAP CONDSTORE (a per-message change counter), so nothing is re-read. The token carries the
-        folder's uidvalidity; if the server renumbered the folder, the answer says to start over instead of guessing."""
+        folder's uidvalidity; if the server renumbered the folder, the answer says to start over instead of guessing.
+        One STATUS answers the first call and a poll with nothing new; only a poll with changes opens the folder, and then runs
+        one SEARCH and one FETCH."""
         limit = max(1, min(int(limit), 200))
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            self._ensure_unselected(c)                    # ENABLE is refused while a folder is open
-            with contextlib.suppress(Exception):          # iCloud applies ENABLE without sending ENABLED back
-                c.enable("CONDSTORE")
-            info = c.select_folder(folder, readonly=True) or {}
-            uv, modseq, uidnext = (info.get(b"UIDVALIDITY"), info.get(b"HIGHESTMODSEQ"), info.get(b"UIDNEXT"))
+            state = self._change_state(c, folder)
+            examined = state is None
+            if examined:
+                state = self._examine_state(c, folder)
+            uv, modseq, uidnext, messages, unseen = state
             if modseq is None or uv is None or uidnext is None:
                 raise MailError("This mail server does not report changes (no CONDSTORE); use mail_search_messages with since instead.")
-            token = f"v2:{folder}:{int(uv)}:{int(modseq)}:{int(uidnext)}"
-            base = {"notice": UNTRUSTED_NOTICE, "folder": folder, "uidvalidity": int(uv), "token": token}
+
+            def base_of(uv: Any, modseq: Any, uidnext: Any) -> dict[str, Any]:
+                return {"notice": UNTRUSTED_NOTICE, "folder": folder, "uidvalidity": int(uv),
+                        "token": f"v2:{folder}:{int(uv)}:{int(modseq)}:{int(uidnext)}"}
+
+            def start_over(base: dict[str, Any]) -> dict[str, Any]:
+                return {**base, "start_over": True, "note": "The server renumbered this folder since that token, so changes cannot be "
+                                                            "listed. Use this new token from now on and search the folder normally."}
+
+            base = base_of(uv, modseq, uidnext)
             if not since:
-                unread = len(c.search(["UNSEEN"]))
-                return {**base, "first_call": True, "messages": info.get(b"EXISTS"), "unread": unread,
+                if unseen is None:
+                    unseen = len(c.search(["UNSEEN"]))
+                return {**base, "first_call": True, "messages": messages, "unread": unseen,
                         "note": "Keep this token and pass it as 'since' next time to get only what changed."}
             try:
                 version, rest = since.split(":", 1)
@@ -1124,15 +1179,30 @@ class MailService:
             if old_folder != folder:
                 raise MailError(f"That token belongs to the folder '{old_folder}', not '{folder}'. Use each folder's own token.")
             if old_uv != int(uv):
-                return {**base, "start_over": True, "note": "The server renumbered this folder since that token, so changes cannot be "
-                                                            "listed. Use this new token from now on and search the folder normally."}
-            new = sorted((u for u in c.search(["UID", f"{old_next}:*"]) if u >= old_next), reverse=True)
-            changed = sorted((u for u in c.search(["MODSEQ", str(old_modseq + 1)]) if u < old_next), reverse=True) \
-                if int(modseq) > old_modseq else []
+                return start_over(base)
+            if int(modseq) == old_modseq and int(uidnext) == old_next:     # no flag changed and no uid handed out: nothing to list
+                return {**base, "new_count": 0, "changed_count": 0, "new": [], "changed": []}
+            if not examined:
+                uv2, modseq2, uidnext2, _, _ = self._examine_state(c, folder)
+                if None not in (uv2, modseq2, uidnext2):                   # the newer counters: the SEARCH below starts from them
+                    uv, modseq, uidnext, base = uv2, modseq2, uidnext2, base_of(uv2, modseq2, uidnext2)
+                if uv2 is not None and int(uv2) != old_uv:                 # renumbered between STATUS and EXAMINE
+                    return start_over(base)
+            since_mod = ["MODSEQ", str(old_modseq + 1)]
+            if int(uidnext) == old_next:                   # no uid handed out: flag changes only, and no "n:*" quirk to filter
+                hits = c.search(since_mod)
+            else:                                          # new uids by UID, so new mail is found whatever modseq it was given
+                hits = c.search(["OR", "UID", f"{old_next}:*", *since_mod])
+                if hits and max(hits) < old_next:          # the new mail is gone again: "n:*" then names the top uid, changed or not
+                    hits = c.search(since_mod) if int(modseq) > old_modseq else []
+            new = sorted((u for u in hits if u >= old_next), reverse=True)
+            changed = sorted((u for u in hits if u < old_next), reverse=True)
+            rows = {m["uid"]: m for m in self._listed(
+                self._summaries(c, folder, new[:limit] + changed[:limit], int(uv), per_message_uidvalidity=False))}
             out = {**base, "new_count": len(new), "changed_count": len(changed),
-                   "new": self._listed(self._summaries(c, folder, new[:limit], int(uv), per_message_uidvalidity=False)),
-                   "changed": [{k: m.get(k) for k in ("uid", "subject", "from", "date", "unread", "flagged", "answered")}
-                               for m in self._summaries(c, folder, changed[:limit], int(uv), per_message_uidvalidity=False)]}
+                   "new": [rows[u] for u in new[:limit] if u in rows],
+                   "changed": [{k: v for k, v in rows[u].items() if k in _CHANGED_KEYS and v is not None}   # warnings kept, no nulls
+                               for u in changed[:limit] if u in rows]}
             if len(new) > limit or len(changed) > limit:
                 out["note"] = f"Only the newest {limit} of each are listed; use mail_search_messages for the rest."
             return out

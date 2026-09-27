@@ -108,9 +108,9 @@ def test_a_folder_opened_read_only_is_left_open_but_a_read_write_one_is_unselect
 def test_changes_on_a_connection_left_in_examine_still_enables_condstore(svc):
     c = use(svc, readonly=True)
     assert svc.changes("INBOX")["first_call"]                              # the fake reports HIGHESTMODSEQ only once enabled
-    assert c.calls[2:] == ["unselect", "enable", "examine INBOX", "search"]   # UNSELECT only where ENABLE needs it
+    assert c.calls[2:] == ["unselect", "status INBOX", "enable", "examine INBOX", "search"]   # no HIGHESTMODSEQ in STATUS: EXAMINE
     svc.list_folders()
-    assert c.calls[6:9] == ["unselect", "list", "status INBOX"]            # STATUS never names the open folder
+    assert c.calls[7:10] == ["unselect", "list", "status INBOX"]           # STATUS never names the open folder
 
 
 def test_a_retried_read_pools_the_new_session_and_logs_out_the_dead_one(svc):
