@@ -170,6 +170,24 @@ def test_a_queued_send_borrows_no_connection_and_keeps_every_gate(svc, monkeypat
     assert r["status"] == "queued_for_owner_approval" and not r["sent"] and len(svc.outbox.pending()) == 1 and not FakeClient.made
 
 
+def test_a_direct_send_without_approval_keeps_every_gate(svc, monkeypatch):
+    """With approval off the send skips the outbox, never the gates: ALLOW_SEND, the allowlist and the recipient cap."""
+    sent = []
+    monkeypatch.setattr(MailService, "_smtp_send", lambda self, msg, recipients: sent.append(recipients) or {})
+    svc.s = dataclasses.replace(svc.s, require_approval=False, save_sent_copy=False, send_allowlist=("@example.org",), max_recipients=2)
+    with pytest.raises(MailError, match="SEND_ALLOWLIST"):
+        svc.send(to="someone@example.com", subject="Hi", body="Hello")
+    with pytest.raises(MailError, match="Too many recipients"):
+        svc.send(to=["a@example.org", "b@example.org", "c@example.org"], subject="Hi", body="Hello")
+    assert sent == []
+    r = svc.send(to="a@example.org", subject="Hi", body="Hello")
+    assert r["status"] == "sent" and sent == [["a@example.org"]]
+    svc.s = dataclasses.replace(svc.s, allow_send=False)
+    with pytest.raises(MailError, match="ALLOW_SEND=false"):
+        svc.send(to="a@example.org", subject="Hi", body="Hello")
+    assert len(sent) == 1
+
+
 def test_a_failed_call_never_returns_its_connection_to_the_pool(svc):
     with pytest.raises(RuntimeError):
         with svc.imap() as c:

@@ -367,3 +367,22 @@ Same harness (`dev/bench.py --local --latency-ms 40`, 3 runs), 0.12.1 against th
 | contacts_search_contacts (cold) | 0.592 | 0.605 | 3331 | 3978 | 72 | 5 | 0 | 0 | 0 | 5 |
 | contacts_search_contacts (warm) | 0.002 | 0.002 | 3331 | 3978 | 72 | 0 | 0 | 0 | 0 | 0 |
 | calendar create + update + delete | 0.674 | 0.679 | 1185 | 1656 | 0 | 10 | 0 | 0 | 10 | 0 |
+
+### Live check (27 September 2026)
+
+`dev/bench.py --live` against a real iCloud account from the Netherlands, read-only, 5 runs each, 0.12.1 against this branch
+(run from a separate copy; nothing deployed):
+
+| | 0.12.1 | this branch |
+|---|---|---|
+| `calendar_list_calendars`, cold | 3.09 s, 11 requests | 1.42 s, 5 requests |
+| `mail_search_messages` 20 | 0.92 s, 3 IMAP commands | 0.74 s, 2 |
+| search + `mail_get_messages` 10 | 2.20 s, 7 commands | 1.94 s, 5 |
+| `mail_search_messages all_folders` | 1.85 s, 17 commands | 1.51 s, 11 |
+| 10 calendar reads over 3 minutes, p90 | 5.1 s | 2.8 s |
+| mail search result sent to the client | 20.7 KB | 7.9 KB (-62 %) |
+| `contacts_search_contacts`, cold | 1.76 s | 1.75 s, result less than half the size |
+
+iCloud answers `STATUS (... HIGHESTMODSEQ)`, so a quiet `mail_list_changes` poll is one command (0.17 s). The one-PROPFIND
+calendar list with Basic credentials sent up front works on iCloud. The local stack's request counts differ from iCloud's
+(Radicale needs no principal discovery round trips); compare live numbers with live numbers.
