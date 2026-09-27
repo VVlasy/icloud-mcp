@@ -23,7 +23,7 @@ from xml.etree import ElementTree as ET
 import httpx
 
 from . import agentlog, callctx
-from .config import Settings
+from .config import CONNECT_TIMEOUT, READ_TIMEOUT, Settings
 from .safety import compact, warnings_for
 from .matching import fuzzy_match_keyed, keyed, norm as _norm_shared
 
@@ -507,9 +507,10 @@ class ContactsService:
         next call builds a new one."""
         with self._http_lock:
             if self._http is None:
-                # 25 s read (per chunk, so a large REPORT is fine) and 8 s connect keep a dead network under the 60 s tool timeout.
-                # Idle connections are kept 15 s (httpx default 5 s), below iCloud's observed 20-40 s idle close.
-                self._http = httpx.Client(auth=(self.s.carddav_username, self.s.app_password), timeout=httpx.Timeout(25, connect=8),
+                # The shared read (per chunk, so a large REPORT is fine) and connect timeouts keep a dead network under the tool
+                # timeout. Idle connections are kept 15 s (httpx default 5 s), below iCloud's observed 20-40 s idle close.
+                self._http = httpx.Client(auth=(self.s.carddav_username, self.s.app_password),
+                                          timeout=httpx.Timeout(READ_TIMEOUT, connect=CONNECT_TIMEOUT),
                                           limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=15.0),
                                           transport=self._transport, headers={"User-Agent": "icloud-mcp"})
             client = self._http

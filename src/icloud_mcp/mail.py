@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import email
+import errno
 import functools
 import html as html_lib
 import imaplib
@@ -34,10 +35,10 @@ from email.utils import formataddr, formatdate, getaddresses, make_msgid, parsed
 from typing import Any, Iterator
 
 import html2text
-from imapclient import IMAPClient
+from imapclient import IMAPClient, SocketTimeout
 
 from . import callctx
-from .config import Settings
+from .config import CONNECT_TIMEOUT, LOGOUT_TIMEOUT, PROBE_TIMEOUT, READ_TIMEOUT, Settings
 from .keepalive import TICKER
 from .matching import fuzzy_match_all, keyed, norm, similar_keyed
 from .safety import HIDDEN_NOTICE, HIDDEN_TEXT_WARNING, compact, confirm_problem, hidden_text, strip_hidden_html, warnings_for
@@ -690,6 +691,34 @@ def _mail_transport(exc: BaseException | None) -> bool:
     return False
 
 
+_PATH_ERRNOS = {errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH}
+
+
+def _path_dead(exc: BaseException | None) -> bool:
+    """True when the network path failed (a timeout, host or network unreachable), so every idle session over it is dead too.
+    EOF, BYE or a reset is one session's end (usually its expiry) and says nothing about the others."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, TimeoutError) or (isinstance(exc, OSError) and exc.errno in _PATH_ERRNOS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _set_smtp_timeout(server: smtplib.SMTP, seconds: float) -> None:
+    sock = getattr(server, "sock", None)                     # None in test fakes
+    if sock is not None:
+        sock.settimeout(seconds)
+
+
+def _set_timeout(c: IMAPClient, seconds: float) -> None:
+    """The socket timeout for this session's next reads and writes (test fakes have no socket)."""
+    sock = getattr(c, "socket", None)
+    if sock is not None:
+        sock().settimeout(seconds)
+
+
 @functools.cache
 def _tls_context() -> ssl.SSLContext:
     """One default TLS context for every IMAP and SMTP connection: building one costs about 24 ms. It is never changed after
@@ -727,7 +756,8 @@ class MailService:
         ctx = _tls_context()
         try:
             use_ssl = s.imap_security == "ssl"
-            c = IMAPClient(s.imap_host, port=s.imap_port, ssl=use_ssl, **({"ssl_context": ctx} if use_ssl else {}), timeout=30)
+            c = IMAPClient(s.imap_host, port=s.imap_port, ssl=use_ssl, **({"ssl_context": ctx} if use_ssl else {}),
+                           timeout=SocketTimeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT))
             if s.imap_security == "starttls":
                 c.starttls(ctx)
             c.login(s.imap_username, s.app_password)
@@ -737,7 +767,8 @@ class MailService:
 
     def _checkout(self) -> IMAPClient | None:
         """A pooled connection that still answers, or None. Connections idle too long are closed; ones idle for more than
-        30 seconds are checked with a NOOP first (iCloud drops idle sessions without telling us)."""
+        30 seconds are checked with a short NOOP first (iCloud drops idle sessions without telling us). A probe that timed out
+        means the network path is gone: every idle session is closed and the call logs in afresh, instead of waiting on each."""
         while True:
             with self._pool_lock:
                 if not self._pool:
@@ -748,12 +779,32 @@ class MailService:
                 self._discard(c)
                 continue
             if idle > 30:
-                try:
-                    c.noop()
-                except Exception:  # noqa: BLE001 - a dead session is simply replaced
-                    self._discard(c)
+                failure = self._probe(c)
+                if failure is not None:                  # a session whose probe failed is never reused
+                    self._kill(c)
+                    if _path_dead(failure):
+                        self._flush()
+                        return None
                     continue
             return c
+
+    @staticmethod
+    def _probe(c: IMAPClient) -> Exception | None:
+        """NOOP with PROBE_TIMEOUT, then the normal read timeout again. None when the session answered, else the failure."""
+        try:
+            _set_timeout(c, PROBE_TIMEOUT)
+            c.noop()
+            _set_timeout(c, READ_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 - the caller decides between this session and the whole path
+            return e
+        return None
+
+    def _flush(self) -> None:
+        """Close every idle pooled session without LOGOUT: the path they share is dead. Sessions in use are not touched."""
+        with self._pool_lock:
+            dead, self._pool = self._pool, []
+        for c, _ in dead:
+            self._kill(c)
 
     def _checkin(self, c: IMAPClient) -> None:
         """Return a connection to the pool with no folder open read-write. UNSELECT, never CLOSE: CLOSE would permanently expunge
@@ -767,8 +818,11 @@ class MailService:
                     raise MailError("The server cannot UNSELECT, so this connection is not reused.")
                 if not getattr(imap, "is_readonly", False):
                     c.unselect_folder()
-        except Exception:  # noqa: BLE001 - anything unexpected: do not reuse this session
-            self._discard(c)
+        except Exception as e:  # noqa: BLE001 - anything unexpected: do not reuse this session
+            if _mail_transport(e):
+                self._kill(c)
+            else:
+                self._discard(c)
             return
         with self._pool_lock:
             if len(self._pool) < self.s.imap_pool_size:
@@ -792,11 +846,15 @@ class MailService:
                 self._pool = [(c, t) for c, t in self._pool if now - t < _IMAP_PING_SECONDS]
         for c, _ in stale:
             self._discard(c)
-        for c, _ in due:
-            try:
-                c.noop()
-            except Exception:  # noqa: BLE001 - a dead session is simply not put back
-                self._discard(c)
+        for i, (c, _) in enumerate(due):
+            failure = self._probe(c)
+            if failure is not None:                      # a dead session is simply not put back
+                self._kill(c)
+                if _path_dead(failure):                  # nor is any other: the path is gone, so no one waits on them
+                    for other, _ in due[i + 1:]:
+                        self._kill(other)
+                    self._flush()
+                    return
                 continue
             with self._pool_lock:
                 keep = len(self._pool) < self.s.imap_pool_size
@@ -814,8 +872,19 @@ class MailService:
 
     @staticmethod
     def _discard(c: IMAPClient) -> None:
-        with contextlib.suppress(Exception):
+        """LOGOUT a session being closed, waiting at most LOGOUT_TIMEOUT for the answer."""
+        try:
+            _set_timeout(c, LOGOUT_TIMEOUT)
             c.logout()
+        except Exception:  # noqa: BLE001 - imaplib leaves the socket open when LOGOUT fails
+            MailService._kill(c)
+
+    @staticmethod
+    def _kill(c: IMAPClient) -> None:
+        """Close a session without LOGOUT, by shutting its socket down (never IMAP CLOSE): after a timeout or reset a LOGOUT
+        would only wait for an answer that is not coming."""
+        with contextlib.suppress(Exception):
+            c.shutdown()
 
     def close_pool(self) -> None:
         with self._pool_lock:
@@ -837,13 +906,18 @@ class MailService:
         if c is None:
             callctx.stage("IMAP sign-in")
             c = self._login()
-        ok = False
+        ok = dead = False
         try:
             yield c
             ok = True
+        except BaseException as e:
+            dead = _mail_transport(e)
+            raise
         finally:
             if ok and pool_after:
                 self._checkin(c)
+            elif dead:
+                self._kill(c)
             else:
                 self._discard(c)
 
@@ -1629,8 +1703,10 @@ class MailService:
     def _smtp_open(self) -> smtplib.SMTP:
         s = self.s
         ctx = _tls_context()
-        server = smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=30) if s.smtp_security == "ssl" else smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=30)
+        server = (smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=CONNECT_TIMEOUT) if s.smtp_security == "ssl"
+                  else smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=CONNECT_TIMEOUT))
         try:
+            _set_smtp_timeout(server, READ_TIMEOUT)     # the connect timeout covered the handshake and greeting; now reads
             server.ehlo()
             if s.smtp_security == "starttls":
                 server.starttls(context=ctx)
@@ -1642,11 +1718,14 @@ class MailService:
             raise
         return server
 
-    def _smtp_drop(self) -> None:
+    def _smtp_drop(self, quit: bool = True) -> None:
+        """Close the kept connection. quit=False closes it at once: on an idle, dead or failed connection QUIT would only wait
+        for a reply (a round trip at best, the read timeout at worst)."""
         conn, self._smtp = self._smtp, None
         if conn is not None:
-            with contextlib.suppress(Exception):
-                conn[0].quit()
+            if quit:
+                with contextlib.suppress(Exception):
+                    conn[0].quit()
             with contextlib.suppress(Exception):
                 conn[0].close()
 
@@ -1663,9 +1742,11 @@ class MailService:
                     alive = False
                     if time.monotonic() - last <= _SMTP_IDLE_SECONDS:
                         with contextlib.suppress(Exception):
+                            _set_smtp_timeout(conn, PROBE_TIMEOUT)
                             alive = conn.noop()[0] == 250
+                            _set_smtp_timeout(conn, READ_TIMEOUT)
                     if not alive:
-                        self._smtp_drop()
+                        self._smtp_drop(quit=False)
                 if self._smtp is None:
                     self._smtp = (self._smtp_open(), time.monotonic())
                 conn = self._smtp[0]
@@ -1682,7 +1763,7 @@ class MailService:
                 self._smtp_drop()
                 raise MailError(f"Sender address refused ({e.smtp_code}): the From address must be your iCloud address or one of its aliases.") from e
             except (smtplib.SMTPException, OSError) as e:
-                self._smtp_drop()
+                self._smtp_drop(quit=False)                  # a dead or broken connection: QUIT would only wait
                 raise MailError(f"SMTP send failed: {e}. Check Sent before trying again: the message may have gone out. Run icloud_check_health to see which service is failing.") from e
 
     def _summary_of(self, msg: EmailMessage) -> dict[str, Any]:

@@ -22,7 +22,7 @@ import icalendar
 import recurring_ical_events
 
 from . import callctx
-from .config import Settings
+from .config import CONNECT_TIMEOUT, DAV_PING_TIMEOUT, READ_TIMEOUT, Settings
 from .keepalive import TICKER
 from .safety import compact, confirm_problem, warnings_for
 from .safety import confirm_token as make_confirm_token
@@ -903,8 +903,10 @@ class CalendarService:
     def _open(self) -> _Conn:
         s = self.s
         callctx.stage("CalDAV sign-in")
+        # An explicit (connect, read) timeout: without one niquests waits 30 s per read, and 120 s on a PUT or DELETE, longer
+        # than the tool timeout. Never rate_limit_handle: it sleeps and replays requests, PUTs included.
         client = caldav.DAVClient(url=s.caldav_url, username=s.caldav_username, password=s.app_password, require_tls=s.caldav_require_tls,
-                                  auth_type=_auth_type(s))
+                                  auth_type=_auth_type(s), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), rate_limit_handle=False)
         try:
             return _Conn(client, self._sign_in(client), time.monotonic())
         except Exception:
@@ -1010,7 +1012,11 @@ class CalendarService:
                     self._close(conn)
                     conn = self._open()
                 else:
+                    # A short timeout, so one dead connection does not hold up the ticker's other jobs. Set only on this
+                    # popped connection, which nothing else holds, and restored before it goes back.
+                    conn.client.timeout = DAV_PING_TIMEOUT
                     conn.client.propfind(self._warm_url(conn), depth=0)
+                    conn.client.timeout = (CONNECT_TIMEOUT, READ_TIMEOUT)
             except Exception:  # noqa: BLE001 - a dead connection is simply not put back
                 self._close(conn)
                 continue

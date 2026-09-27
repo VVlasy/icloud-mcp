@@ -1,10 +1,13 @@
 """Reusing logged-in IMAP connections: fewer logins, never CLOSE, and nothing reused whose state is unknown."""
 import dataclasses
+import errno
+import imaplib
 import threading
 
 import pytest
 
 import icloud_mcp.mail as mail_mod
+from icloud_mcp import config
 from icloud_mcp.config import Settings
 from icloud_mcp.mail import MailError, MailService
 
@@ -15,21 +18,38 @@ class FakeImaplib:
         self.is_readonly = False                         # imaplib records whether the last SELECT was an EXAMINE
 
 
+class FakeSocket:
+    def __init__(self):
+        self.timeouts = []
+
+    def settimeout(self, seconds):
+        self.timeouts.append(seconds)
+
+
 class FakeClient:
     made = []
 
     def __init__(self, *a, **kw):
         self._imap = FakeImaplib()
+        self.kw = kw
         self.calls = []
         self.alive = True
+        self.noop_error = None                           # raised by NOOP: a timeout (dead path) or an EOF (one dead session)
         self.caps = {b"UNSELECT"}
+        self.sock = FakeSocket()
         FakeClient.made.append(self)
+
+    def socket(self):
+        return self.sock
 
     def login(self, *a):
         self.calls.append("login")
 
     def logout(self):
         self.calls.append("logout")
+
+    def shutdown(self):                                  # closes the socket: no LOGOUT, and never CLOSE
+        self.calls.append("shutdown")
 
     def select_folder(self, name, readonly=False):
         self.calls.append(f"{'examine' if readonly else 'select'} {name}")
@@ -72,6 +92,8 @@ class FakeClient:
 
     def noop(self):
         self.calls.append("noop")
+        if self.noop_error is not None:
+            raise self.noop_error
         if not self.alive:
             raise OSError("connection reset")
 
@@ -113,12 +135,13 @@ def test_changes_on_a_connection_left_in_examine_still_enables_condstore(svc):
     assert c.calls[7:10] == ["unselect", "list", "status INBOX"]           # STATUS never names the open folder
 
 
-def test_a_retried_read_pools_the_new_session_and_logs_out_the_dead_one(svc):
+def test_a_retried_read_pools_the_new_session_and_closes_the_dead_one(svc):
     dead = use(svc)
     dead.alive = False                                                      # died while idle, noticed only by the next command
     assert [f["name"] for f in svc.list_folders()] == ["INBOX", "Sent Messages", "Deleted Messages"]
     new = FakeClient.made[-1]
-    assert new is not dead and "logout" in dead.calls and "logout" not in new.calls and [p[0] for p in svc._pool] == [new]
+    assert new is not dead and "logout" not in new.calls and [p[0] for p in svc._pool] == [new]
+    assert "shutdown" in dead.calls and "logout" not in dead.calls          # a dead socket gets no LOGOUT to wait on
 
 
 def test_special_folders_come_from_the_cached_list_at_no_extra_cost(svc):
@@ -163,7 +186,7 @@ def test_a_session_that_died_while_idle_is_replaced(svc, monkeypatch):
     monkeypatch.setattr(mail_mod.time, "monotonic", lambda: clock[0])
     svc._pool = [(c, 1000.0 - 45)]                          # idle for 45 s: checked with NOOP, which fails
     fresh = use(svc)
-    assert fresh is not c and "noop" in c.calls and "logout" in c.calls
+    assert fresh is not c and "noop" in c.calls and "shutdown" in c.calls and "logout" not in c.calls
 
 
 def test_connections_idle_too_long_are_closed_not_reused(svc, monkeypatch):
@@ -226,3 +249,70 @@ def test_settings_are_read_and_bounded(monkeypatch, svc):
     monkeypatch.setenv("IMAP_IDLE_SECONDS", "5")
     s = Settings.from_env()
     assert s.imap_pool_size == 8 and s.imap_idle_seconds == 30
+
+
+# ------------------------------------------------------------------------------------------------ dead networks fail fast
+def pooled(svc, n, idle, monkeypatch):
+    """n logged-in sessions in the pool, each idle for `idle` seconds (the clock stands still at 1000)."""
+    svc._ticking = True                                     # the tests drive the keep-alive themselves
+    monkeypatch.setattr(mail_mod.time, "monotonic", lambda: 1000.0)
+    clients = [FakeClient() for _ in range(n)]
+    svc._pool = [(c, 1000.0 - idle) for c in clients]
+    return clients
+
+
+def test_timeouts_are_split_and_a_retried_read_fits_in_the_default_tool_timeout(svc, monkeypatch):
+    monkeypatch.delenv("TOOL_TIMEOUT_SECONDS", raising=False)
+    budget = Settings.from_env().tool_timeout
+    connect, read, probe = config.CONNECT_TIMEOUT, config.READ_TIMEOUT, config.PROBE_TIMEOUT
+    use(svc)
+    assert FakeClient.made[0].kw["timeout"] == mail_mod.SocketTimeout(connect=connect, read=read)
+    assert read >= 25                                       # per read, not per request: a large fetch is not cut short
+    assert connect + read < budget                          # a call on a new connection (never retried)
+    assert read + connect + read < budget                   # a dead pooled connection, then the one retry on a new login
+    assert probe + connect + read < budget                  # a probe that times out, then a new login
+
+
+@pytest.mark.parametrize("error", [TimeoutError("timed out"), OSError(errno.EHOSTUNREACH, "No route to host")])
+def test_a_probe_that_times_out_closes_every_idle_session_without_logout(svc, monkeypatch, error):
+    a, b, c = pooled(svc, 3, 45, monkeypatch)
+    c.noop_error = error                                    # the network path is gone, not just this session
+    fresh = use(svc)
+    assert fresh not in (a, b, c) and fresh.calls[0] == "login" and [p[0] for p in svc._pool] == [fresh]
+    assert all("shutdown" in x.calls and "logout" not in x.calls for x in (a, b, c))
+    assert "noop" not in a.calls + b.calls                  # no one waits on the others' probes as well
+
+
+def test_an_eof_on_a_probe_discards_only_that_session_and_the_read_timeout_is_restored(svc, monkeypatch):
+    a, b = pooled(svc, 2, 45, monkeypatch)
+    b.noop_error = imaplib.IMAP4.abort("socket error: EOF")  # this session expired; the path is fine
+    assert use(svc) is a
+    assert "shutdown" in b.calls and "logout" not in b.calls
+    assert a.calls[0] == "noop" and "shutdown" not in a.calls and svc._pool[0][0] is a
+    assert a.sock.timeouts == [config.PROBE_TIMEOUT, config.READ_TIMEOUT]    # a short probe, then the normal read timeout
+
+
+def test_the_keepalive_probe_is_short_and_a_timeout_closes_the_whole_idle_pool(svc, monkeypatch):
+    due = mail_mod._IMAP_PING_SECONDS + 1
+    a, b, c = pooled(svc, 3, due, monkeypatch)
+    svc._last_activity = 1000.0
+    svc._keepalive(1000.0)
+    assert [p[0] for p in svc._pool] == [a, b, c]
+    assert all(x.sock.timeouts == [config.PROBE_TIMEOUT, config.READ_TIMEOUT] for x in (a, b, c))
+    svc._pool = [(x, 1000.0 - due) for x in (a, b, c)]
+    a.noop_error = TimeoutError("timed out")
+    svc._keepalive(1000.0)
+    assert svc._pool == [] and all("shutdown" in x.calls and "logout" not in x.calls for x in (a, b, c))
+    assert b.calls.count("noop") == c.calls.count("noop") == 1        # not probed again after the path died
+
+
+def test_a_healthy_session_closed_for_age_is_logged_out_with_a_short_timeout(svc, monkeypatch):
+    a, b = pooled(svc, 2, svc.s.imap_idle_seconds + 1, monkeypatch)
+
+    def stuck():
+        raise TimeoutError("timed out")
+    a.logout = stuck
+    fresh = use(svc)
+    assert fresh not in (a, b)
+    assert b.calls == ["logout"] and b.sock.timeouts == [config.LOGOUT_TIMEOUT]
+    assert a.calls == ["shutdown"] and a.sock.timeouts == [config.LOGOUT_TIMEOUT]   # imaplib leaves the socket open otherwise

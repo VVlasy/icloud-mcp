@@ -12,6 +12,7 @@ import pytest
 import caldav_fakes
 import icloud_mcp.cal as cal_mod
 import icloud_mcp.mail as mail_mod
+from icloud_mcp import config
 from icloud_mcp.cal import CalendarError, CalendarService
 from icloud_mcp.config import Settings
 from icloud_mcp.contacts import ContactsService
@@ -296,6 +297,45 @@ def dav(s, monkeypatch):
     return CalendarService(dataclasses.replace(s, default_timezone="Europe/Berlin")), server
 
 
+def test_caldav_requests_carry_the_split_timeout_and_never_sleep_on_rate_limits(s, monkeypatch):
+    import niquests
+    made, seen = [], []
+
+    class Client(cal_mod.caldav.DAVClient):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            made.append(self)
+
+    def send(self, request, **kw):                          # what niquests would hand to its adapter
+        seen.append((request.method, kw["timeout"]))
+        raise ConnectionResetError("stop here")
+    monkeypatch.setattr(cal_mod.caldav, "DAVClient", Client)
+    monkeypatch.setattr(niquests.Session, "send", send)
+    with pytest.raises(CalendarError):
+        CalendarService(s).list_calendars()
+    with pytest.raises(ConnectionResetError):
+        made[0].request("https://caldav.icloud.com/123/calendars/work/x.ics", "PUT", "BEGIN:VCALENDAR")
+    split = (config.CONNECT_TIMEOUT, config.READ_TIMEOUT)
+    assert seen == [("PROPFIND", split), ("PUT", split)]   # not niquests' implicit 30 s, or 120 s for a write
+    assert made[0].rate_limit_handle is False               # it would sleep and replay requests, PUTs included
+
+
+def test_the_caldav_keepalive_ping_uses_a_short_timeout_on_its_own_connection_and_restores_it(dav, monkeypatch):
+    svc, server = dav
+    seen, real = [], caldav_fakes.Server.__call__
+    monkeypatch.setattr(caldav_fakes.Server, "__call__", lambda self, method, url, **kw: seen.append((method, kw.get("timeout")))
+                        or real(self, method, url, **kw))
+    clock = Clock()
+    monkeypatch.setattr(cal_mod.time, "monotonic", clock)
+    svc.list_calendars()
+    split = (config.CONNECT_TIMEOUT, config.READ_TIMEOUT)
+    assert seen and all(t == split for _, t in seen)
+    conn, seen[:] = svc._pool[0], []
+    clock.t += cal_mod._PING_AFTER_SECONDS
+    svc._keepalive(clock.t)
+    assert seen == [("PROPFIND", config.DAV_PING_TIMEOUT)] and svc._pool == [conn] and conn.client.timeout == split
+
+
 def test_request_counts_per_calendar_operation(dav):
     svc, server = dav
     assert svc.list_calendars() == [{"name": "Calendar", "id": "home"}, {"name": "Work", "id": "work"}]
@@ -417,15 +457,24 @@ def test_folder_list_is_cached_for_a_minute_and_cleared_by_create(mail, monkeypa
 
 
 # ------------------------------------------------------------------------------------------------ SMTP
+class FakeSocket:
+    def __init__(self):
+        self.timeouts = []
+
+    def settimeout(self, seconds):
+        self.timeouts.append(seconds)
+
+
 class FakeSMTP:
     made = []
 
     def __init__(self, *a, **kw):
-        self.calls, self.alive, self.refuse = [], True, False
+        self.calls, self.alive, self.refuse, self.kw, self.sock = [], True, False, kw, FakeSocket()
         FakeSMTP.made.append(self)
 
     def ehlo(self):
         self.calls.append("ehlo")
+        self.timeouts_at_ehlo = list(self.sock.timeouts)
 
     def starttls(self, context=None):
         self.calls.append("starttls")
@@ -484,6 +533,25 @@ def test_a_dead_or_idle_smtp_connection_is_replaced_and_a_failed_send_is_not_ret
     with pytest.raises(MailError, match="SMTP send failed"):
         mail._smtp_send(message(), ["anna@example.org"])
     assert FakeSMTP.made[2].calls.count("send") == 2 and mail._smtp is None   # one attempt, then the connection is dropped
+
+
+def test_smtp_connects_and_probes_with_short_timeouts_and_never_waits_for_quit_on_a_stale_connection(mail, monkeypatch):
+    FakeSMTP.made = []
+    monkeypatch.setattr(mail_mod.smtplib, "SMTP", FakeSMTP)
+    clock = Clock()
+    monkeypatch.setattr(mail_mod.time, "monotonic", clock)
+    mail._smtp_send(message(), ["anna@example.org"])
+    first = FakeSMTP.made[0]
+    assert first.kw["timeout"] == config.CONNECT_TIMEOUT and first.timeouts_at_ehlo == [config.READ_TIMEOUT]   # read timeout before EHLO
+    mail._smtp_send(message(), ["anna@example.org"])
+    assert first.sock.timeouts == [config.READ_TIMEOUT, config.PROBE_TIMEOUT, config.READ_TIMEOUT]   # a short NOOP, then restored
+    clock.t += mail_mod._SMTP_IDLE_SECONDS + 1
+    mail._smtp_send(message(), ["anna@example.org"])
+    assert len(FakeSMTP.made) == 2 and "quit" not in first.calls and first.calls[-1] == "close"      # idle: closed at once
+    FakeSMTP.made[1].alive = False
+    mail._smtp_send(message(), ["anna@example.org"])
+    assert len(FakeSMTP.made) == 3 and "quit" not in FakeSMTP.made[1].calls                         # failed probe: no QUIT either
+    assert [m.calls.count("send") for m in FakeSMTP.made] == [2, 1, 1]                                 # every message sent once
 
 
 def test_read_only_never_opens_smtp(mail, monkeypatch):

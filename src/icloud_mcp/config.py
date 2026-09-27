@@ -11,6 +11,16 @@ from urllib.parse import urlparse
 # and local clients such as Codex CLI (127.0.0.1, localhost). Every sign-in still needs the owner password.
 DEFAULT_REDIRECT_HOSTS = "claude.ai,claude.com,chatgpt.com,chat.openai.com,localhost,127.0.0.1"
 
+# Network timeouts in seconds, shared by IMAP, SMTP, CalDAV and CardDAV. The read timeout bounds each read (inactivity), not a
+# whole request, so a large REPORT or mailbox fetch is not cut short. A read retried after a dead pooled connection (callctx) costs
+# at most READ + CONNECT + READ, which has to stay under the default TOOL_TIMEOUT_SECONDS (tests/test_imap_pool.py checks it).
+CONNECT_TIMEOUT = 8.0            # TCP connect and TLS handshake (for IMAP and SMTP also the greeting)
+READ_TIMEOUT = 25.0
+PROBE_TIMEOUT = 3.0              # a NOOP on a pooled IMAP or SMTP connection: one round trip, or the path is dead
+DAV_PING_TIMEOUT = (3.0, 5.0)    # (connect, read) of the CalDAV keep-alive PROPFIND
+LOGOUT_TIMEOUT = 2.0             # the courtesy LOGOUT of a healthy IMAP session being closed
+
+
 def _str(name: str, default: str = "") -> str:
     v = os.environ.get(name)
     return default if v is None or v.strip() == "" else v.strip()

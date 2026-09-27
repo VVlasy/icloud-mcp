@@ -9,8 +9,6 @@ Reads the same environment variables as the server (ICLOUD_USERNAME, ICLOUD_APP_
 from __future__ import annotations
 
 import argparse
-import smtplib
-import ssl
 import sys
 import time
 
@@ -50,14 +48,8 @@ def main() -> None:
             return f"{len(names)} folders, INBOX has {inbox[b'EXISTS']} messages, special folders: {special}"
 
     def smtp_check() -> str:
-        ctx = ssl.create_default_context()
-        server = smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=30) if s.smtp_security == "ssl" else smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=30)
-        with server:
-            server.ehlo()
-            if s.smtp_security == "starttls":
-                server.starttls(context=ctx)
-                server.ehlo()
-            server.login(s.smtp_username, s.app_password)
+        with mail._smtp_open():                   # the server's own connect path and timeouts: TLS, EHLO, LOGIN, then QUIT
+            pass
         return f"logged in to {s.smtp_host}:{s.smtp_port} as {s.smtp_username} (nothing sent)"
 
     def cal_check() -> str:
