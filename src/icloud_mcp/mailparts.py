@@ -37,6 +37,7 @@ class Node:
     size: int = 0                 # encoded size in octets (leaves)
     encoding: str = ""
     children: list["Node"] = field(default_factory=list)
+    filename: str = ""            # leaves: the file name parameters as sent (RFC 2231 pieces joined, not decoded)
 
     def walk(self) -> Iterator["Node"]:
         yield self
@@ -58,7 +59,24 @@ def tree(bs: Any, section: str = "") -> Node:
         kids = [tree(ch, f"{section}.{i}" if section else str(i)) for i, ch in enumerate(bs[0], 1)]
         return Node(section, True, "multipart/" + _s(bs[1]).lower(), children=kids)
     size = bs[6] if len(bs) > 6 and isinstance(bs[6], int) else 0
-    return Node(section or "1", False, f"{_s(bs[0])}/{_s(bs[1])}".lower(), size, _s(bs[5]).lower())
+    return Node(section or "1", False, f"{_s(bs[0])}/{_s(bs[1])}".lower(), size, _s(bs[5]).lower(), filename=_filename(bs))
+
+
+def _params(ps: Any, prefix: str) -> str:
+    if not isinstance(ps, (list, tuple)):
+        return ""
+    return "".join(_s(v) for k, v in zip(ps[::2], ps[1::2]) if _s(k).lower().startswith(prefix))
+
+
+def _filename(bs: Any) -> str:
+    """Content-Disposition's filename, else Content-Type's name. The disposition's place after the size depends on the type
+    (text and message/rfc822 carry extra fields), so it is the first (type, parameters) pair there."""
+    for x in list(bs)[7:]:
+        if isinstance(x, (list, tuple)) and len(x) == 2 and isinstance(x[0], bytes) and isinstance(x[1], (list, tuple)):
+            if name := _params(x[1], "filename"):
+                return name
+            break
+    return _params(bs[2] if len(bs) > 2 else None, "name")
 
 
 def skeleton_items(root: Node, want_body: Callable[[Node], bool]) -> list[str]:
@@ -76,6 +94,11 @@ def skeleton_items(root: Node, want_body: Callable[[Node], bool]) -> list[str]:
 def _header_block(raw: bytes) -> bytes:
     head = raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
     return head.rstrip(b"\r\n") + b"\r\n"
+
+
+def top_header(raw: bytes) -> bytes:
+    """A message's own header block, byte for byte the same whether raw is the whole message or a skeleton of it."""
+    return _OURS.sub(b"", _header_block(raw))
 
 
 def _get(data: dict, key: str) -> bytes | None:

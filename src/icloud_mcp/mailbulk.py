@@ -58,12 +58,14 @@ def parse_unsubscribe(value: str | None, post: str | None = None) -> dict[str, A
     return {"https": https, "mailto": mailto, "one_click": one_click}
 
 
-def bulk_view(hdr: email.message.Message) -> dict[str, Any]:
-    """Extra summary fields for a message that looks like bulk mail; {} for mail that looks written by a person."""
+def bulk_view(hdr: Any, sender: str | None = None) -> dict[str, Any]:
+    """Extra summary fields for a message that looks like bulk mail; {} for mail that looks written by a person. hdr is a parsed
+    header block (anything with .get); sender is the From address when the caller already parsed it."""
     unsub = parse_unsubscribe(hdr.get("List-Unsubscribe"), hdr.get("List-Unsubscribe-Post"))
     precedence = str(hdr.get("Precedence") or "").strip().lower()
     auto = str(hdr.get("Auto-Submitted") or "").strip().lower()
-    sender = email.utils.parseaddr(str(hdr.get("From") or ""))[1]
+    if sender is None:
+        sender = email.utils.parseaddr(str(hdr.get("From") or ""))[1]
     bulk = bool(unsub or hdr.get("List-Id") or precedence in ("bulk", "list", "junk")
                 or (auto and auto != "no") or _NOREPLY.match(sender or ""))
     if not bulk:

@@ -552,8 +552,8 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
         ) -> dict[str, Any]:
             """Search a folder, newest first. All filters are optional and combined with AND.
             'text' searches headers and body. since/before are dates (YYYY-MM-DD, before is exclusive).
-            Returns summaries (uid, subject, from/to, date, unread/flagged/answered, has_attachments; empty fields left out)
-            plus total_matches; page with offset. Use mail_get_message to read a message body."""
+            Returns summaries (uid, subject, from, to unless only the owner, date, unread/flagged/answered, has_attachments;
+            empty fields left out) plus total_matches; page with offset. Use mail_get_message to read a message body."""
             return mail.search(
                 folder, from_=from_address, to=to_address, subject=subject, text=text, since=since, before=before,
                 unread=True if unread_only else None, flagged=True if flagged_only else None, limit=limit, offset=offset,

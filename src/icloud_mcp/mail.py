@@ -27,6 +27,8 @@ from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email import policy
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parsedate_to_datetime
 from typing import Any, Iterator
@@ -146,6 +148,60 @@ def _hdr(msg: email.message.Message, name: str) -> str | None:
         return None if v is None else " ".join(str(v).split())
     except Exception:  # malformed header
         return None
+
+
+_ENCODED_RUN = re.compile(r"=\?[!-~]+?\?[bBqQ]\?[!-~]*?\?=(?:\s+=\?[!-~]+?\?[bBqQ]\?[!-~]*?\?=)*")
+
+
+def _decode_words(value: str) -> str:
+    """RFC 2047 encoded words decoded; the raw value when they do not decode (unknown charset, bad bytes, malformed)."""
+    if "=?" not in value:
+        return value
+    if not value.isascii():             # raw UTF-8 around encoded words, which decode_header cannot take: each run by itself
+        return _ENCODED_RUN.sub(lambda m: _decode_words(m.group()), value)
+    try:
+        return str(make_header(decode_header(value)))
+    except (LookupError, HeaderParseError, ValueError):       # ValueError: UnicodeDecodeError inside an encoded word
+        return value
+
+
+class _Headers:
+    """A fetched header block (summaries, people, awaiting replies), parsed once. compat32 on the block decoded as UTF-8 costs
+    about an eighth of policy.default and reads raw 8-bit (UTF-8) headers the same way; parsed as bytes they would turn into
+    U+FFFD. Values are unfolded. Addresses are split on the raw value before anything is decoded, so an encoded comma cannot
+    split one, and only display names and Subject are RFC 2047-decoded. Each address header and Subject is worked out once."""
+
+    __slots__ = ("_msg", "_memo")
+
+    def __init__(self, block: bytes | None):
+        self._msg = email.message_from_string((block or b"").decode("utf-8", "replace"), policy=policy.compat32)
+        self._memo: dict[str, Any] = {}
+
+    def get(self, name: str, default: Any = None) -> Any:
+        v = self._msg.get(name)
+        return default if v is None else "".join(str(v).splitlines())
+
+    def __getitem__(self, name: str) -> str | None:
+        return self.get(name)
+
+    def text(self, name: str) -> str | None:
+        """Like _hdr: whitespace collapsed; Subject decoded."""
+        if name not in self._memo:
+            v = self.get(name)
+            self._memo[name] = None if v is None else " ".join((_decode_words(v) if name == "Subject" else v).split())
+        return self._memo[name]
+
+    def addrs(self, name: str) -> list[tuple[str, str]]:
+        """Like parse_addrs(msg.get_all(name)): (display name, address) pairs."""
+        key = "addrs " + name
+        if key not in self._memo:
+            raw = ["".join(str(v).splitlines()) for v in self._msg.get_all(name) or []]
+            self._memo[key] = [(_decode_words(n).strip(), a.strip()) for n, a in getaddresses(raw) if a and "@" in a]
+        return self._memo[key]
+
+    def names(self) -> str:
+        """As _names: the display names in From, Reply-To and To."""
+        return " ".join(n for h in ("From", "Reply-To", "To") for n, _ in self.addrs(h) if n)
 
 
 def _iso_date(msg: email.message.Message, fallback: datetime | None = None) -> str | None:
@@ -556,6 +612,13 @@ _STRUCTURES_KEPT = 5000       # message structures remembered from searches (the
 _FILTER_SCAN = 500            # people_only / since_hours check at most this many of the newest candidates
 
 
+def _booking_body(n: Any) -> bool:
+    """The leaves mail_extract_bookings reads (extract.py): text bodies, calendar data and .ics files (a name may be split over
+    RFC 2231 continuations or RFC 2047-encoded, hence 'contains'), and attached messages, which it looks inside."""
+    return (n.ctype in (*mailparts.BODY_TEXT, "text/calendar", "application/ics", "message/rfc822")
+            or ".ics" in n.filename.lower())
+
+
 def _instant(iso: str | None) -> datetime | None:
     """An ISO date-time as an aware instant (a missing offset read as UTC), so dates from different zones compare correctly."""
     try:
@@ -563,6 +626,11 @@ def _instant(iso: str | None) -> datetime | None:
     except ValueError:
         return None
     return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _sent_at(m: dict[str, Any]) -> datetime:
+    """Sort key for summaries by the instant they were sent; ISO strings with different offsets do not sort as text."""
+    return _instant(m.get("date")) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _keeper(people_only: bool, cutoff: datetime | None) -> Any:
@@ -897,7 +965,8 @@ class MailService:
             if not d:
                 continue
             hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-            hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
+            hdr = _Headers(d.get(hkey))
+            frm = hdr.addrs("From")
             has_att = "attachment" in repr(d.get(b"BODYSTRUCTURE", "")).lower()
             self._remember(folder, uidvalidity, uid, d.get(b"BODYSTRUCTURE"))
             out.append(compact(
@@ -905,19 +974,26 @@ class MailService:
                     "uid": uid,
                     **({"folder": folder} if per_message_uidvalidity else {}),        # a one-folder result names it once, above
                     **({"uidvalidity": uidvalidity} if uidvalidity is not None and per_message_uidvalidity else {}),
-                    "message_id": _hdr(hdr, "Message-ID"),
-                    "subject": _hdr(hdr, "Subject") or "(no subject)",
-                    "from": addrs_json(parse_addrs(hdr.get_all("From", []))),
-                    "to": addrs_json(parse_addrs(hdr.get_all("To", []))),
-                    "cc": addrs_json(parse_addrs(hdr.get_all("Cc", []))),
+                    "message_id": hdr.text("Message-ID"),
+                    "subject": hdr.text("Subject") or "(no subject)",
+                    "from": addrs_json(frm),
+                    "to": addrs_json(hdr.addrs("To")),
+                    "cc": addrs_json(hdr.addrs("Cc")),
                     "date": _iso_date(hdr, d.get(b"INTERNALDATE")),
                     "size": d.get(b"RFC822.SIZE"),
                     "has_attachments": has_att,
                     **_flag_view(d.get(b"FLAGS", ())),
-                    **bulk_view(hdr),
-                    "safety_warnings": warnings_for(_hdr(hdr, "Subject"), _names(hdr)),   # a subject or display name can carry it too
+                    **bulk_view(hdr, sender=frm[0][1] if frm else None),
+                    "safety_warnings": warnings_for(hdr.text("Subject"), hdr.names()),   # a subject or display name can carry it too
                 }, keep=("uid", "folder", "subject", "from", "date", "unread", "flagged")))   # empty fields left out
         return out
+
+    def _listed(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Summaries as search and list_changes return them: without 'size', which nothing reads, and without 'to' when every
+        recipient is the owner (most received mail), about a quarter of the bytes. _summaries keeps both for its other callers."""
+        own = self.s.own_addresses
+        return [{k: v for k, v in m.items() if k != "size" and not (k == "to" and all(r["email"].lower() in own for r in v))}
+                for m in rows]
 
     def _floor_since(self, since: str | None) -> str | None:
         """MAIL_MAX_AGE_DAYS: a search never reaches further back than the owner allows (the task-scoped access the guidance asks
@@ -969,13 +1045,13 @@ class MailService:
             out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "folder": folder, **({"uidvalidity": uv} if uv is not None else {})}
             if keep is None:
                 page = uids[offset : offset + limit]
-                return {**out, "total_matches": len(uids), "offset": offset, "returned": len(page),
-                        "messages": self._summaries(c, folder, page, uv, per_message_uidvalidity=False),   # uidvalidity once, above
+                rows = self._summaries(c, folder, page, uv, per_message_uidvalidity=False)      # uidvalidity once, above
+                return {**out, "total_matches": len(uids), "offset": offset, "returned": len(page), "messages": self._listed(rows),
                         "complete": True}
             # people_only / since_hours look at each message's summary: the newest _FILTER_SCAN candidates are checked
             found = [m for m in self._summaries(c, folder, uids[:_FILTER_SCAN], uv, per_message_uidvalidity=False) if keep(m)]
             page = found[offset : offset + limit]
-            return {**out, "total_matches": len(found), "offset": offset, "returned": len(page), "messages": page,
+            return {**out, "total_matches": len(found), "offset": offset, "returned": len(page), "messages": self._listed(page),
                     "complete": len(uids) <= _FILTER_SCAN,
                     **({"note": f"Only the newest {_FILTER_SCAN} candidates were checked; narrow the search to see older ones."}
                        if len(uids) > _FILTER_SCAN else {})}
@@ -1054,7 +1130,7 @@ class MailService:
             changed = sorted((u for u in c.search(["MODSEQ", str(old_modseq + 1)]) if u < old_next), reverse=True) \
                 if int(modseq) > old_modseq else []
             out = {**base, "new_count": len(new), "changed_count": len(changed),
-                   "new": self._summaries(c, folder, new[:limit], int(uv), per_message_uidvalidity=False),
+                   "new": self._listed(self._summaries(c, folder, new[:limit], int(uv), per_message_uidvalidity=False)),
                    "changed": [{k: m.get(k) for k in ("uid", "subject", "from", "date", "unread", "flagged", "answered")}
                                for m in self._summaries(c, folder, changed[:limit], int(uv), per_message_uidvalidity=False)]}
             if len(new) > limit or len(changed) > limit:
@@ -1096,8 +1172,8 @@ class MailService:
                     if hits or keep is None:
                         per_folder[name] = got[1] if keep is None else len(hits)
                     found += hits
-        found.sort(key=lambda m: m.get("date") or "", reverse=True)
-        page = found[offset : offset + limit]
+        found.sort(key=_sent_at, reverse=True)          # by instant: dates carry their senders' own offsets
+        page = self._listed(found[offset : offset + limit])
         out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "folder": "(all folders)", "total_matches": sum(per_folder.values()),
                                "matches_per_folder": per_folder, "offset": offset, "returned": len(page), "messages": page}
         out["complete"] = not skipped
@@ -1117,18 +1193,33 @@ class MailService:
         raw = d.get(b"BODY[]") or b""
         return raw, d.get(b"FLAGS", ()), d.get(b"INTERNALDATE"), uv
 
+    def _fetch_readable(self, c: IMAPClient, folder: str, uid: int, *, readonly: bool = True, uidvalidity: int | None = None,
+                        want_body: Any = None) -> tuple[bytes, tuple[Any, ...], datetime | None, int | None, bool]:
+        """(message bytes, flags, internal date, uidvalidity, is_skeleton) of one message to read or quote. When a search
+        remembered its structure under the uidvalidity the caller passed (so no extra round trip), _fetch_lean fetches a message
+        with large attachments as a skeleton (want_body: which leaves keep their bodies). Otherwise one whole fetch, as before."""
+        if uidvalidity is None or self._recall(folder, uidvalidity, uid) is None:
+            return (*self._fetch_raw(c, folder, uid, readonly=readonly, uidvalidity=uidvalidity), False)
+        uv = self._select(c, folder, readonly=readonly, expect=uidvalidity)
+        got = self._fetch_lean(c, folder, uv, [uid], want_body).get(uid)
+        if got is None:                                   # gone meanwhile: the plain path gives the usual answer
+            return (*self._fetch_raw(c, folder, uid, readonly=readonly, uidvalidity=uidvalidity), False)
+        raw, flags, internal, skeleton = got
+        return raw, flags, internal, uv, skeleton
+
     @_retrying
     def get_message(self, folder: str, uid: int, *, include_html: bool = False, mark_read: bool = False,
                     uidvalidity: int | None = None, show_hidden: bool = False) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, flags, internal, uv = self._fetch_raw(c, folder, uid, readonly=not mark_read, uidvalidity=uidvalidity)
+            raw, flags, internal, uv, skeleton = self._fetch_readable(c, folder, uid, readonly=not mark_read, uidvalidity=uidvalidity)
             if mark_read:
                 self._tl.mutated = True
                 c.add_flags([uid], [SEEN])
                 flags = tuple(flags) + (SEEN.encode(),)
         return {"notice": UNTRUSTED_NOTICE, **self._message_view(folder, uid, raw, flags, internal, body_chars=self.s.max_body_chars,
-                                                                 include_html=include_html, uidvalidity=uv, show_hidden=show_hidden)}
+                                                                 include_html=include_html, uidvalidity=uv, show_hidden=show_hidden,
+                                                                 skeleton=skeleton)}
 
     @_retrying
     def get_messages(self, folder: str, uids: list[int], *, body_chars: int | None = None, uidvalidity: int | None = None) -> dict[str, Any]:
@@ -1150,17 +1241,18 @@ class MailService:
                 missing.append(uid)
                 continue
             raw, flags, internal, skeleton = d
-            messages.append(self._message_view(folder, uid, raw, flags, internal, body_chars=limit, skeleton=skeleton))
+            messages.append(self._message_view(folder, uid, raw, flags, internal, body_chars=limit, skeleton=skeleton, name_folder=False))
         out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "folder": folder, **({"uidvalidity": uv} if uv is not None else {}),
                                "returned": len(messages), "messages": messages}
         out["complete"] = not missing
         if missing:
             out["missing_uids"] = missing
-        if any(m["text_truncated"] for m in messages):
+        if any(m.get("text_truncated") for m in messages):
             out["hint"] = f"Bodies are cut at {limit} characters each; read one in full with mail_get_message."
         return out
 
-    def _fetch_lean(self, c: IMAPClient, folder: str, uv: int | None, uids: list[int]) -> dict[int, tuple[bytes, tuple[Any, ...], Any, bool]]:
+    def _fetch_lean(self, c: IMAPClient, folder: str, uv: int | None, uids: list[int],
+                    want_body: Any = None) -> dict[int, tuple[bytes, tuple[Any, ...], Any, bool]]:
         """uid -> (message bytes, flags, internal date, is_skeleton) for messages to read. A message carrying more than
         _LEAN_ABOVE bytes of non-text parts (PDFs, images) comes as a skeleton: every header and the text bodies, without the
         attachments' contents (mailparts). Everything else, and any skeleton that does not check out, is fetched whole.
@@ -1174,7 +1266,7 @@ class MailService:
                 if roots[uid] is None and bs:
                     with contextlib.suppress(Exception):              # unusual structure: fetched whole below
                         roots[uid] = mailparts.tree(bs)
-        want_body = lambda n: n.ctype in mailparts.BODY_TEXT                  # noqa: E731
+        want_body = want_body or (lambda n: n.ctype in mailparts.BODY_TEXT)
         plans: dict[tuple[str, ...], list[int]] = {}
         for uid in uids:
             root, items = roots.get(uid), ("BODY.PEEK[]",)
@@ -1202,21 +1294,23 @@ class MailService:
 
     def _message_view(self, folder: str, uid: int, raw: bytes, flags: tuple[Any, ...], internal: datetime | None, *,
                       body_chars: int, include_html: bool = False, uidvalidity: int | None = None,
-                      skeleton: bool = False, show_hidden: bool = False) -> dict[str, Any]:
+                      skeleton: bool = False, show_hidden: bool = False, name_folder: bool = True) -> dict[str, Any]:
+        """One message as read tools return it; empty fields left out. name_folder=False when the result names the folder and
+        its uidvalidity once, above (mail_get_messages)."""
         msg = email.message_from_bytes(raw, policy=policy.default)
         if skeleton:
             msg._icloud_skeleton = True
         text, htm = extract_bodies(msg, html_chars=body_chars * 8)
         truncated = False
-        if text and len(text) > body_chars:
-            text, truncated = text[:body_chars], True
-        out: dict[str, Any] = {
+        if text:
+            text = text.replace("\r\n", "\n")                  # before the cut, so body_chars counts what is returned
+            if len(text) > body_chars:
+                text, truncated = text[:body_chars], True
+        out: dict[str, Any] = compact({
             "uid": uid,
-            "folder": folder,
-            **({"uidvalidity": uidvalidity} if uidvalidity is not None else {}),
+            **({"folder": folder, **({"uidvalidity": uidvalidity} if uidvalidity is not None else {})} if name_folder else {}),
             "message_id": _hdr(msg, "Message-ID"),
-            "in_reply_to": _hdr(msg, "In-Reply-To"),
-            "references": _hdr(msg, "References"),
+            "in_reply_to": _hdr(msg, "In-Reply-To"),                  # References is left out: long on real threads, never needed
             "subject": _hdr(msg, "Subject") or "(no subject)",
             "from": addrs_json(parse_addrs(msg.get_all("From", []))),
             "reply_to": addrs_json(parse_addrs(msg.get_all("Reply-To", []))),
@@ -1228,9 +1322,9 @@ class MailService:
             **({"safety_warnings": w} if (w := warnings_for(_hdr(msg, "Subject"), _names(msg), text if text is not None else
                                                            (html_to_text(htm) if htm else None))
                                           + ([HIDDEN_TEXT_WARNING] if htm and hidden_text(htm)[1] else [])) else {}),
-            "attachments": list_attachments(msg),
+            "attachments": [compact(a, keep=("index", "filename", "content_type", "size")) for a in list_attachments(msg)],
             **_flag_view(flags),
-        }
+        }, keep=("uid", "subject", "from", "date", "text", "unread"))
         if include_html and htm is not None:
             out["html"] = strip_hidden_html(htm)[0][: body_chars * 2]
         if show_hidden:
@@ -1246,7 +1340,7 @@ class MailService:
 
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _flags, _internal, uv = self._fetch_raw(c, folder, uid, uidvalidity=uidvalidity)
+            raw, _flags, _internal, uv, _ = self._fetch_readable(c, folder, uid, uidvalidity=uidvalidity, want_body=_booking_body)
         out = extract(raw)
         found = warnings_for(out.get("subject"), json.dumps(out.get("items"), ensure_ascii=False))
         return {"notice": UNTRUSTED_NOTICE, "folder": folder, "uid": uid, **({"uidvalidity": uv} if uv is not None else {}), **out,
@@ -1314,13 +1408,17 @@ class MailService:
     def get_thread(self, folder: str, uid: int, *, uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _, _, uv = self._fetch_raw(c, folder, uid, uidvalidity=uidvalidity)
-            msg = email.message_from_bytes(raw, policy=policy.default)
-            refs = (_hdr(msg, "References") or "").split()
-            own = _hdr(msg, "Message-ID")
-            root = (refs[0] if refs else None) or _hdr(msg, "In-Reply-To") or own
+            uv = self._select(c, folder, expect=uidvalidity)
+            # Only the three threading headers (BODY.PEEK: nothing is marked read), not the whole message.
+            d = c.fetch([uid], ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]"]).get(uid)
+            if not d:
+                raise MailError(f"No message with uid {uid} in '{folder}'. Run mail_search_messages again: the message may have been "
+                                "moved, or the folder renumbered (its uidvalidity changed).")
+            hdr = _Headers(next((v for k, v in d.items() if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), b""))
+            refs = (hdr.text("References") or "").split()
+            root = (refs[0] if refs else None) or hdr.text("In-Reply-To") or hdr.text("Message-ID")
             if not root:
-                return {"root_message_id": None, "messages": self._summaries(c, folder, [uid], uv)}
+                return {"notice": UNTRUSTED_NOTICE, "root_message_id": None, "messages": self._summaries(c, folder, [uid], uv)}
             folders = [folder]
             for alias in ("INBOX", "sent"):
                 with contextlib.suppress(MailError):
@@ -1329,12 +1427,13 @@ class MailService:
                         folders.append(f)
             found: list[dict[str, Any]] = []
             for f in folders:
-                uv = self._select(c, f)
+                if f != folder:                           # the source folder is still open, its uidvalidity checked above
+                    uv = self._select(c, f)
                 uids = c.search(["OR", ["HEADER", "References", root], ["HEADER", "Message-ID", root]])
                 found += self._summaries(c, f, sorted(uids), uv)
             seen_ids, unique = set(), []
-            for m in sorted(found, key=lambda m: m.get("date") or ""):
-                key = m["message_id"] or (m["folder"], m["uid"])
+            for m in sorted(found, key=_sent_at):
+                key = m.get("message_id") or (m["folder"], m["uid"])
                 if key in seen_ids:
                     continue
                 seen_ids.add(key)
@@ -1362,10 +1461,10 @@ class MailService:
                     data = c.fetch(uids[i:i + 250], ["INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (FROM TO CC)]"])
                     for d in data.values():
                         hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-                        hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
+                        hdr = _Headers(d.get(hkey))
                         when = d.get(b"INTERNALDATE")
                         for header, field in (("From", "from_them"), ("To", "to_them"), ("Cc", "to_them")):
-                            for name, addr in parse_addrs(hdr.get_all(header, [])):
+                            for name, addr in hdr.addrs(header):
                                 a = addr.lower()
                                 if a == me:
                                     continue
@@ -1618,8 +1717,8 @@ class MailService:
             try:
                 with self.imap() as c:
                     folder = self.resolve_folder(c, str(fu["folder"]))
-                    raw, flags, internal, uv = self._fetch_raw(c, folder, int(fu["uid"]), uidvalidity=fu.get("uidvalidity"))
-                view = self._message_view(folder, int(fu["uid"]), raw, flags, internal, body_chars=2000, uidvalidity=uv)
+                    raw, flags, internal, uv, skeleton = self._fetch_readable(c, folder, int(fu["uid"]), uidvalidity=fu.get("uidvalidity"))
+                view = self._message_view(folder, int(fu["uid"]), raw, flags, internal, body_chars=2000, uidvalidity=uv, skeleton=skeleton)
                 out["original"] = {k: view.get(k) for k in ("from", "subject", "date", "safety_warnings", "bulk") if view.get(k)}
             except Exception as e:  # noqa: BLE001
                 out["original"] = {"unavailable": f"{type(e).__name__}"}
@@ -1662,7 +1761,7 @@ class MailService:
               uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
+            raw, _, _, uv, _ = self._fetch_readable(c, folder, uid, readonly=False, uidvalidity=uidvalidity)   # a skeleton quotes the same
             original = email.message_from_bytes(raw, policy=policy.default)
             msg = build_reply(
                 original, sender=self.sender, body=body, body_html=body_html, reply_all=reply_all, quote=quote,
@@ -1678,7 +1777,10 @@ class MailService:
                 uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
+            if include_attachments:                                           # the attachments' bytes go out again
+                raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
+            else:
+                raw, _, _, uv, _ = self._fetch_readable(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
             original = email.message_from_bytes(raw, policy=policy.default)
             to_p = parse_recipients(to, "to")
             if not to_p and not draft:
@@ -1720,13 +1822,13 @@ class MailService:
                 for uid in chunk:
                     d = data.get(uid) or {}
                     hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-                    hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
-                    people = [(n, a) for n, a in parse_addrs(hdr.get_all("To", []) + hdr.get_all("Cc", []))
+                    hdr = _Headers(d.get(hkey))
+                    people = [(n, a) for n, a in hdr.addrs("To") + hdr.addrs("Cc")
                               if a.lower() not in own and not _NOREPLY.match(a)]
                     when = _instant(_iso_date(hdr, d.get(b"INTERNALDATE")))
                     if people and when:
-                        sent.append({"uid": uid, "people": people, "subject": _hdr(hdr, "Subject") or "(no subject)", "at": when,
-                                     "message_id": (_hdr(hdr, "Message-ID") or "").strip()})
+                        sent.append({"uid": uid, "people": people, "subject": hdr.text("Subject") or "(no subject)", "at": when,
+                                     "message_id": (hdr.text("Message-ID") or "").strip()})
             others = [name for flags, _d, name in self._list(c) if name not in skip
                       and not {"\\Noselect", "\\NonExistent"} & {f.decode() if isinstance(f, bytes) else str(f) for f in flags}]
             referenced: set[str] = set()
@@ -1740,10 +1842,10 @@ class MailService:
                         data = c.fetch(uids[i:i + 250], ["INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (FROM DATE IN-REPLY-TO REFERENCES)]"])
                         for d in data.values():
                             hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-                            hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
+                            hdr = _Headers(d.get(hkey))
                             referenced.update(re.findall(r"<[^<>\s]+>", f"{hdr.get('In-Reply-To', '')} {hdr.get('References', '')}"))
                             when = _instant(_iso_date(hdr, d.get(b"INTERNALDATE")))
-                            for _, a in parse_addrs(hdr.get_all("From", [])):
+                            for _, a in hdr.addrs("From"):
                                 if when:
                                     heard.setdefault(a.lower(), []).append(when)
                 except Exception as e:  # noqa: BLE001 - one unreadable folder must not sink the rest

@@ -21,6 +21,8 @@ from typing import Any
 
 import icalendar
 
+from .mailparts import top_header
+
 _LD = re.compile(r"<script[^>]+type\s*=\s*[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", re.I | re.S)
 _KINDS = {
     "FlightReservation": "flight", "LodgingReservation": "hotel", "EventReservation": "event", "TrainReservation": "train",
@@ -242,8 +244,9 @@ def extract(raw: bytes) -> dict[str, Any]:
             seen.add(k)
             unique.append(it)
     # A ready retry key per booking, so search -> extract -> create can never book the same thing twice. The Message-ID is
-    # the sender's text, so only a hash of it goes into the key.
-    source = str(msg.get("Message-ID") or "").strip() or hashlib.sha256(raw).hexdigest()
+    # the sender's text, so only a hash of it goes into the key. Without one, the header block: raw may be a skeleton (mailparts)
+    # or the whole message depending on what this process remembers, and the key must not change with that.
+    source = str(msg.get("Message-ID") or "").strip() or hashlib.sha256(top_header(raw)).hexdigest()
     tag = hashlib.sha256(source.encode("utf-8", "replace")).hexdigest()[:16]
     for n, it in enumerate(unique[:MAX_ITEMS]):
         if isinstance(it.get("calendar_event"), dict):

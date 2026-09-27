@@ -25,9 +25,9 @@ _RULES: list[tuple[str, str, tuple[str, ...]]] = [
              "a slot in the past, or after a place closes, is not a slot.", ("icloud_get_time",)),
 
     ("MAIL", "A message is (folder, uid); pass the result's 'uidvalidity' back with its uids.", ("mail_search_messages",)),
-    ("MAIL", "Search gives headers; read with mail_get_message or mail_get_messages (reading never marks mail read).",
+    ("MAIL", "Search gives headers (no 'to' = owner only); read with mail_get_message or mail_get_messages (never marks read).",
      ("mail_search_messages", "mail_get_message", "mail_get_messages")),
-    ("MAIL", "Mark mail read with mail_mark_messages once it is handled.", ("mail_mark_messages",)),
+    ("MAIL", "Mark handled mail read with mail_mark_messages.", ("mail_mark_messages",)),
     ("MAIL", "Before concluding something is missing, or asking the owner what they said, search all_folders=true (rules file "
              "mail away; their Sent mail often answers it).", ("mail_search_messages",)),
     ("MAIL", "Answer with mail_reply_to_message (it keeps the thread and quotes the original), also to your own sent message (folder "

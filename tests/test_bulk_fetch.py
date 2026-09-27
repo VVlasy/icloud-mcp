@@ -66,11 +66,11 @@ def test_bodies_are_capped_per_message_with_a_hint(mail):
     r = svc.get_messages("INBOX", [1, 2])
     long = r["messages"][1]
     assert long["text_truncated"] is True and len(long["text"]) == 4000 and "mail_get_message" in r["hint"]
-    assert r["messages"][0]["text_truncated"] is False
+    assert "text_truncated" not in r["messages"][0]                                   # false is left out, like every empty field
     short = svc.get_messages("INBOX", [2], body_chars=50)["messages"][0]["text"]
     assert len(short) == 200                                                          # never below a readable minimum
     whole = svc.get_messages("INBOX", [2], body_chars=10**9)["messages"][0]
-    assert whole["text"].strip() == "x" * 9000 and whole["text_truncated"] is False    # a huge body_chars is capped by MAX_BODY_CHARS
+    assert whole["text"].strip() == "x" * 9000 and "text_truncated" not in whole      # a huge body_chars is capped by MAX_BODY_CHARS
     svc2 = MailService(dataclasses.replace(svc.s, max_body_chars=1000))
     assert len(svc2.get_messages("INBOX", [2], body_chars=10**9)["messages"][0]["text"]) == 1000
 
@@ -93,8 +93,10 @@ def test_limits_are_enforced(mail):
 def test_single_message_view_is_unchanged(mail):
     svc, _ = mail
     one = svc.get_message("INBOX", 1)
-    batch = svc.get_messages("INBOX", [1])["messages"][0]
-    assert one["notice"] == UNTRUSTED_NOTICE and {k: v for k, v in one.items() if k != "notice"} == batch
+    r = svc.get_messages("INBOX", [1])
+    batch = r["messages"][0]
+    assert one["notice"] == UNTRUSTED_NOTICE and one["folder"] == r["folder"] == "INBOX"
+    assert {k: v for k, v in one.items() if k not in ("notice", "folder", "uidvalidity")} == batch   # the batch names its folder once
 
 
 def test_tool_is_registered_as_read_only(mail):
