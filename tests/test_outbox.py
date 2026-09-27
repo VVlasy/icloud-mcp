@@ -338,3 +338,14 @@ async def test_discard_all_clears_only_what_the_owner_saw(web):
         assert bad.status_code == 403 and len(mail.outbox.pending()) == 4
         done = await c.post("/outbox/act", data={"kind": "mail", "action": "discard_all", "exp": m[1], "ids": m[2], "tok": m[3]})
         assert "Discarded 3" in done.text and [q.id for q in mail.outbox.pending()] == [late] and sent == []
+
+
+def test_a_keyed_message_is_queued_once_even_when_rebuilt_and_after_a_restart(tmp_path):
+    ob = Outbox(str(tmp_path), ttl=3600, max_items=5)
+    a = ob.add(b"Message-ID: <1@x>\r\n\r\nhi", ["a@b.co"], key="draft:Drafts:7:101")
+    assert ob.add(b"Message-ID: <2@x>\r\n\r\nhi", ["a@b.co"], key="draft:Drafts:7:101").id == a.id   # new bytes, same draft
+    again = Outbox(str(tmp_path), ttl=3600, max_items=5)                                          # the key is kept on disk
+    assert again.add(b"Message-ID: <3@x>\r\n\r\nhi", ["a@b.co"], key="draft:Drafts:7:101").id == a.id
+    assert again.add(b"Message-ID: <4@x>\r\n\r\nhi", ["a@b.co"], key="draft:Drafts:7:102").id != a.id  # another draft
+    assert again.add(b"Message-ID: <5@x>\r\n\r\nhi", ["a@b.co"]).id != a.id                          # no key: bytes decide
+    assert len(again.pending()) == 3

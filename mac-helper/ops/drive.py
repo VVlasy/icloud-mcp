@@ -78,6 +78,17 @@ def rel(full):
     return "" if r == "." else r
 
 
+def folders_above(full, action):
+    """Refuse, naming it, a file (or anything else that is not a folder) standing where a folder above `full` has to be."""
+    at = ROOT
+    for part in rel(full).split(os.sep)[:-1]:
+        at = os.path.join(at, part)
+        if not os.path.lexists(at):
+            return
+        if not os.path.isdir(at):
+            raise DriveError("'%s' is a file, not a folder, so nothing can be %s inside it; nothing was created" % (rel(at), action))
+
+
 def not_root(full, what):
     if full == ROOT:
         raise DriveError("refusing to %s the whole iCloud Drive" % what)
@@ -370,6 +381,7 @@ def op_write(a):
     not_root(full, "overwrite")
     if os.path.splitext(full)[1].lower() in PACKAGES or os.path.splitext(full)[1].lower() in TEXTUTIL | {".pdf"}:
         raise DriveError("only plain text files can be written (for example .txt, .md, .csv, .json)")
+    folders_above(full, "written")
     replaced = False
     if os.path.lexists(full):
         if os.path.isdir(full):
@@ -389,6 +401,7 @@ def op_write(a):
 def op_mkdir(a):
     full = resolve(a.get("path"), must_exist=False)
     not_root(full, "create")
+    folders_above(full, "created")
     if os.path.lexists(full):
         if os.path.isdir(full):
             return dict(describe(full), existed=True)

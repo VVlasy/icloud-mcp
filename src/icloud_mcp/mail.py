@@ -1803,25 +1803,31 @@ class MailService:
             "cc": addrs_json(parse_addrs(msg.get_all("Cc", []))),
         }
 
-    def _queue_checked(self, msg: EmailMessage, followup: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _queue_checked(self, msg: EmailMessage, followup: dict[str, Any] | None = None, key: str | None = None) -> dict[str, Any]:
         """Queue a message for the owner's approval, after the same gates as a send (ALLOW_SEND, recipient cap, allowlist).
+        key: what the message was built from (a saved draft), so a repeat returns the entry already waiting.
         Takes no IMAP connection: nothing here reads or writes the mailbox."""
         if not self.s.allow_send:
             raise MailError("Sending is disabled on this server (ALLOW_SEND=false). Use draft=true to save a draft instead.")
         recipients = self._check_recipients(msg)
+        asked = time.time()
         try:
-            q = self.outbox.add(msg.as_bytes(policy=policy.SMTP), recipients, followup)
+            q = self.outbox.add(msg.as_bytes(policy=policy.SMTP), recipients, followup, key=key)
         except OutboxFull as e:
             raise MailError(str(e)) from e
-        return {"status": "queued_for_owner_approval", "sent": False, "outbox_id": q.id, "recipients": recipients,
-                "expires_in_seconds": self.s.outbox_ttl, "approve_at": f"{self.s.public_url}/outbox",
-                "notice": OWNER_APPROVAL_NOTICE, **self._summary_of(msg)}
+        again = q.created_at < asked             # the entry already waiting: describe what the owner will actually see
+        queued = email.message_from_bytes(q.raw, policy=policy.default) if again else msg
+        return {"status": "queued_for_owner_approval", "sent": False, "outbox_id": q.id, "recipients": q.recipients,
+                "expires_in_seconds": max(0, int(q.expires_at - time.time())) if again else self.s.outbox_ttl,
+                "approve_at": f"{self.s.public_url}/outbox", **({"already_queued": True} if again else {}),
+                "notice": OWNER_APPROVAL_NOTICE, **self._summary_of(queued)}
 
     def _deliver(self, c: IMAPClient, msg: EmailMessage, *, draft: bool, followup: dict[str, Any] | None = None,
-                 selected: tuple[str, int | None] | None = None) -> dict[str, Any]:
-        """selected: (folder, uidvalidity) the caller just opened read-write on c with the uidvalidity checked, if any."""
+                 selected: tuple[str, int | None] | None = None, queue_key: str | None = None) -> dict[str, Any]:
+        """selected: (folder, uidvalidity) the caller just opened read-write on c with the uidvalidity checked, if any.
+        queue_key: see _queue_checked."""
         if not draft and self.s.require_approval and not self.s.local_mode:
-            return self._queue_checked(msg, followup)
+            return self._queue_checked(msg, followup, key=queue_key)
         raw = msg.as_bytes(policy=policy.SMTP)
         base = self._summary_of(msg)
         if draft:
@@ -2238,8 +2244,10 @@ class MailService:
                 msg["Date"] = formatdate(localtime=True)
             if msg["Message-ID"] is None:
                 msg["Message-ID"] = make_msgid(domain=(self.s.email_address.rsplit("@", 1)[-1] or None))
+            # One saved draft is one queue entry: a fresh Date or Message-ID above must not queue a second copy. IMAP never
+            # changes a message in place, so folder, uidvalidity and uid always name these same bytes (mail_update_draft makes a new uid).
             return self._deliver(c, msg, draft=False, followup={"folder": folder, "uid": uid, "uidvalidity": uv, "action": "trash"},
-                                 selected=(folder, uv))
+                                 selected=(folder, uv), queue_key=f"draft:{folder}:{uv}:{uid}")
 
     def update_draft(self, uid: int, *, folder: str = "Drafts", uidvalidity: int | None = None, to=None, cc=None, bcc=None,
                      subject: str | None = None, body: str | None = None, body_html: str | None = None,

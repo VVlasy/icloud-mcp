@@ -32,7 +32,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 OPS_DIR = os.path.join(HERE, "ops")
 DEFAULT_CONFIG = os.path.expanduser("~/.config/icloud-mac-helper/config.json")
@@ -58,7 +58,8 @@ OPS = {
     "reminder_move": {"id": ("str", True, 500), "list": ("str", False, 200), "list_id": ("str", False, 200)},
     "reminder_list_create": {"name": ("str", True, 200), "account": ("str", False, 200)},
     "reminder_list_update": {"list_id": ("str", True, 200), "name": ("str", True, 200)},
-    "reminder_list_delete": {"list_id": ("str", True, 200), "name": ("str", True, 200), "delete_reminders": ("bool", False, 0)},
+    "reminder_list_delete": {"list_id": ("str", True, 200), "name": ("str", True, 200), "delete_reminders": ("bool", False, 0),
+                             "preview": ("bool", False, 0), "expected": ("int", False, 10000000)},
     # Notes
     "note_folders": {},
     "notes_list": {"folder": ("str", False, 200), "query": ("str", False, 200), "search_body": ("bool", False, 0), "limit": ("int", False, 100)},
@@ -602,8 +603,12 @@ def selftest_write():
                      None if ok else e)
             ok, r2, e = run_op("reminder_list_update", {"list_id": lid, "name": stamp + " list renamed"}, 120)
             step("reminder_list_update", ok, None if ok else e)
+            ok, r2, e = run_op("reminder_list_delete", {"list_id": lid, "name": stamp + " list renamed", "preview": True}, 120)
+            step("reminder_list_delete preview counts the completed reminder", ok and r2.get("reminders") == 1, None if ok else e)
             ok, r2, e = run_op("reminder_list_delete", {"list_id": lid, "name": stamp + " list renamed"}, 120)
             step("reminder_list_delete refuses a list that holds reminders", not ok and "holds" in (e or ""), e if ok else None)
+            ok, r2, e = run_op("reminder_list_delete", {"list_id": lid, "name": stamp + " list renamed", "delete_reminders": True, "expected": 2}, 120)
+            step("reminder_list_delete refuses when the count differs from the confirmed one", not ok and "holds" in (e or ""), e if ok else None)
     finally:
         if lid:
             name = stamp + " list renamed"

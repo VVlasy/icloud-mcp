@@ -926,9 +926,10 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 Behavior:
                 - The same gates as mail_send_message: recipient cap, SEND_ALLOWLIST and owner approval (on by default).
                 - Under approval it is queued, NOT sent, and the draft stays in Drafts until the owner approves.
+                - A draft is queued once: sending the same uid again returns the entry already waiting (already_queued=true), never a second copy.
                 - On a local server it returns already_a_draft and the owner sends it from Mail.
                 - Once sent, a copy goes to Sent and the draft moves to Trash. Bcc recipients receive it without being shown to the others.
-                Returns: status sent (recipients, message_id, subject, to, cc, saved_to, draft_moved_to_trash, or draft_left_in_place if the Trash move failed), queued_for_owner_approval (sent=false, outbox_id, approve_at: tell the owner), or already_a_draft. Errors: 'is not a saved draft', 'No message with uid' or out-of-date uids (search Drafts again), and the recipient and SMTP errors of mail_send_message."""
+                Returns: status sent (recipients, message_id, subject, to, cc, saved_to, draft_moved_to_trash, or draft_left_in_place if the Trash move failed), queued_for_owner_approval (sent=false, outbox_id, approve_at: tell the owner; already_queued=true on a repeat), or already_a_draft. Errors: 'is not a saved draft', 'No message with uid' or out-of-date uids (search Drafts again), and the recipient and SMTP errors of mail_send_message."""
                 return mail.send_draft(uid, folder=folder, uidvalidity=uidvalidity)
 
         elif writable:
@@ -2005,23 +2006,25 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                     - An empty list is deleted on the first call.
                     - Otherwise the first call deletes nothing and returns a preview; show it to the owner and call again with the token only on their yes.
                     - The token lasts 10 minutes and is bound to the list and its count: if reminders were added or removed since, it is refused and a new preview is needed.
-                    - The preview counts active reminders plus those done in the last 30 days (up to 200); the delete removes every reminder in the list, older done ones included.
+                    - The preview counts every reminder in the list, done ones of any age included, with no cap; the delete removes exactly that many and is refused if the count changed.
                     - The default list and read-only lists are refused when the delete runs.
                     Returns: preview {deleted: false, list, reminders (count), sample (up to 3 titles), confirm_token, note}; after deleting {deleted: {deleted: true, name, reminders_deleted}}.
                     Errors:
                     - Name mismatch (nothing deleted); default or read-only list.
                     - Expired or stale token: call again without it.
-                    - 'the list holds N reminders' when it holds only older done ones: the owner can delete it in the Reminders app.
+                    - 'the list holds N reminders now, not the M that were confirmed': it changed during the delete; call again without the token.
                     - The Mac helper being offline (the Mac is asleep or disconnected): tell the user instead of retrying."""
-                    items = bridge.call("reminders_list", {"list_id": list_id, "completed": "all", "limit": 200})
-                    items = items.get("reminders", []) if isinstance(items, dict) else items
-                    if items and confirm_token is None:
-                        return {"deleted": False, "list": name, "reminders": len(items), "sample": [r.get("title", "") for r in items[:3]],
-                                "confirm_token": make_confirm_token("reminder-list", list_id, len(items)),
+                    # The Mac counts the list itself (reminders_list would miss reminders done more than 30 days ago, and caps at 200).
+                    preview = bridge.call("reminder_list_delete", {"list_id": list_id, "name": name, "preview": True})
+                    count = int(preview.get("reminders") or 0) if isinstance(preview, dict) else 0
+                    if count and confirm_token is None:
+                        return {"deleted": False, "list": name, "reminders": count, "sample": list(preview.get("sample") or [])[:3],
+                                "confirm_token": make_confirm_token("reminder-list", list_id, count),
                                 "note": "These reminders are deleted for good with the list. To go ahead, call again with this confirm_token."}
-                    if items and (why := confirm_problem(confirm_token, "reminder-list", list_id, len(items))):
+                    if count and (why := confirm_problem(confirm_token, "reminder-list", list_id, count)):
                         raise ToolError(why)
-                    return {"deleted": bridge.call("reminder_list_delete", {"list_id": list_id, "name": name, "delete_reminders": bool(items)})}
+                    return {"deleted": bridge.call("reminder_list_delete", {"list_id": list_id, "name": name, "delete_reminders": bool(count),
+                                                                            "expected": count})}
 
         if s.enable_notes:
 
@@ -2657,6 +2660,7 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                     Errors:
                     - 'already exists': ask the owner, then pass overwrite=true.
                     - too long, or a refused type or path.
+                    - "'<path>' is a file, not a folder": a file stands where a folder on the path should be; nothing is written.
                     - an offline Mac raises an error: check icloud_get_helper_status, do not retry."""
                     _protects_notes(s, path)
                     return {"written": bridge.call("drive_write", _given(path=path, content=content, overwrite=overwrite or None))}
@@ -2673,7 +2677,7 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                     - '' (the root) is refused: 'refusing to create the whole iCloud Drive'.
                     - '..', a link leading out of the Drive and the Drive's trash folder are refused with the reason.
                     Behavior: idempotent: an existing folder comes back with existed=true and nothing changes. Moves and deletes nothing. The folder syncs to the owner's devices.
-                    Returns: {folder: {path, name, type, modified, existed}}; existed=false means it was just created. Errors: 'a file with that name already exists' (pick another name, or check with drive_get_info); an over-long or refused path; an offline Mac raises an error (check icloud_get_helper_status, do not retry)."""
+                    Returns: {folder: {path, name, type, modified, existed}}; existed=false means it was just created. Errors: 'a file with that name already exists' (pick another name, or check with drive_get_info); "'<path>' is a file, not a folder" when a file stands where a folder on the path should be (nothing is created); an over-long or refused path; an offline Mac raises an error (check icloud_get_helper_status, do not retry)."""
                     return {"folder": bridge.call("drive_mkdir", {"path": path})}
 
                 @tool(annotations=_WRITE)

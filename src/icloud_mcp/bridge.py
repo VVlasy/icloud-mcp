@@ -49,6 +49,8 @@ OP_MIN_HELPER: dict[str, str] = {
     "imessage_chats": "0.6.0", "imessage_read": "0.6.0", "imessage_search": "0.6.0", "imessage_send": "0.6.0",
     **{op: "0.7.0" for op in ("health_summary", "health_day", "health_status", "health_refresh")},
     **{op: "0.5.0" for op in ("reminder_list_create", "reminder_list_update", "reminder_list_delete")},
+    # 0.8.0: the list-delete preview counts every reminder in the list itself, and the delete checks that count
+    **{f"reminder_list_delete.{arg}": "0.8.0" for arg in ("preview", "expected")},
     # "op.argument": an argument an older helper would reject as unknown
     **{f"{op}.{arg}": "0.5.0" for op, args in (("reminders_list", ("completed", "completed_since", "completed_before")),
                                                ("reminder_create", ("repeat", "alerts_before", "alerts_at")),
@@ -87,7 +89,8 @@ OPS: dict[str, dict[str, tuple[str, bool, int]]] = {
     "reminder_move": {"id": ("str", True, 500), "list": ("str", False, 200), "list_id": ("str", False, 200)},
     "reminder_list_create": {"name": ("str", True, 200), "account": ("str", False, 200)},
     "reminder_list_update": {"list_id": ("str", True, 200), "name": ("str", True, 200)},
-    "reminder_list_delete": {"list_id": ("str", True, 200), "name": ("str", True, 200), "delete_reminders": ("bool", False, 0)},
+    "reminder_list_delete": {"list_id": ("str", True, 200), "name": ("str", True, 200), "delete_reminders": ("bool", False, 0),
+                             "preview": ("bool", False, 0), "expected": ("int", False, 10000000)},
     # Notes
     "note_folders": {},
     "notes_list": {"folder": ("str", False, 200), "query": ("str", False, 200), "search_body": ("bool", False, 0), "limit": ("int", False, 100)},
