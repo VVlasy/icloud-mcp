@@ -8,6 +8,7 @@ from email import policy
 import caldav
 import pytest
 
+import caldav_fakes
 import icloud_mcp.cal as cal_mod
 import icloud_mcp.mail as mail_mod
 import icloud_mcp.server as server_mod
@@ -84,9 +85,6 @@ class Principal:
     def __init__(self, client):
         self.client, self.url = client, "https://caldav.example/1/principal/"
 
-    def calendars(self):
-        return [Cal(self.client, n) for n in DATA]
-
 
 class DAV:
     made = []
@@ -96,10 +94,16 @@ class DAV:
         DAV.made.append(self)
         self.log = DAV.log
 
-    def principal(self):
+    def principal(self, url=None):
         return Principal(self)
 
-    def calendar(self, url):
+    def propfind(self, url, props=None, depth=0):
+        home = "https://caldav.example/1/calendars/"
+        if depth == 1:
+            return caldav_fakes.calendar_list(home, [Cal(self, n) for n in DATA])
+        return caldav_fakes.home_set(url, home) if props else caldav_fakes.Reply([])
+
+    def calendar(self, url, name=None):
         return Cal(self, next(n for n in DATA if url.endswith(f"/{n.lower()}/")))
 
     def close(self):

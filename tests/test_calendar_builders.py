@@ -96,10 +96,7 @@ class _ICloudLikeCal:
         import caldav
         name = href.rsplit("/", 1)[-1].removesuffix(".ics")
         if name not in self.by_name:
-            class _Missing:
-                def load(self_inner):
-                    raise caldav.error.NotFoundError("404")
-            return _Missing()
+            raise caldav.error.NotFoundError("404")          # as caldav does: event_by_url is the GET (Event(...).load())
         return self.by_name[name]
 
     def events(self):
@@ -133,6 +130,43 @@ def test_find_by_uid_reports_missing_events(monkeypatch):
     from icloud_mcp.cal import CalendarError
     with pytest.raises(CalendarError, match="No event with uid"):
         _svc(monkeypatch, _ICloudLikeCal({}))._find(None, "nope", None)
+
+
+def test_by_href_is_one_get_and_a_miss_is_none():
+    gets = []
+
+    class Cal:
+        url = "https://caldav.icloud.com/1/calendars/ABC/"
+
+        def event_by_url(self, href):
+            import caldav
+            gets.append(href)
+            if "gone" in href:
+                raise caldav.error.NotFoundError("404")
+            return _Obj("abc@icloud-mcp", href)
+    from icloud_mcp.cal import CalendarService
+    assert CalendarService._by_href(Cal(), "abc@icloud-mcp").url.endswith("/ABC/abc@icloud-mcp.ics") and len(gets) == 1
+    assert CalendarService._by_href(Cal(), "gone") is None and len(gets) == 2
+
+
+def test_pick_takes_a_short_id_a_full_url_or_a_name_and_never_guesses(monkeypatch):
+    import os
+    from icloud_mcp.cal import CalendarError, CalendarService
+    from icloud_mcp.config import Settings
+    os.environ.update(ICLOUD_USERNAME="me@icloud.com", ICLOUD_APP_PASSWORD="aaaabbbbccccdddd")
+    svc = CalendarService(Settings.from_env())
+    cal = lambda name, cid: type("C", (), {"name": name, "url": f"https://caldav.icloud.com/1/calendars/{cid}/"})()   # noqa: E731
+    home, work, odd = cal("Home", "home"), cal("Work", "A1B2-C3"), cal("home2", "x-home2")
+    monkeypatch.setattr(svc, "_event_calendars", lambda p: [home, work, odd])
+    assert [svc._cal_id(c) for c in (home, work)] == ["home", "A1B2-C3"]
+    assert svc._pick(None, "a1b2-c3") == [work]                                  # the id from calendar_list_calendars, any case
+    assert svc._pick(None, "https://caldav.icloud.com/1/calendars/A1B2-C3/") == [work]   # an old full-URL id still works
+    assert svc._pick(None, " WORK ") == [work] and svc._pick(None, "home") == [home]     # a name, any case; name and id agree
+    with pytest.raises(CalendarError, match="No calendar named"):
+        svc._pick(None, "C3")                                                    # only a whole segment matches, not a suffix
+    monkeypatch.setattr(svc, "_event_calendars", lambda p: [home, work, cal("Trips", "home2"), odd])
+    with pytest.raises(CalendarError, match="name of one calendar and the id of another"):
+        svc._pick(None, "home2")
 
 
 def test_addr_uses_email_param_when_icloud_rewrites_the_address_to_a_principal_path():

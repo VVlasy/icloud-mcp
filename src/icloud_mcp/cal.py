@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import ipaddress
 import logging
 import re
 import threading
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email.utils import getaddresses
 from typing import Any, Iterator
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urljoin, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import caldav
@@ -738,7 +739,7 @@ _CACHE_SECONDS = 600  # calendar names / event support change rarely; a rename i
 _IDLE_TTL_SECONDS = 15.0
 _MAX_AGE_SECONDS = 240.0      # a connection older than this is replaced (by the keep-alive in the background, when it runs)
 _PING_AFTER_SECONDS = 10.0    # keep-alive: ping a pooled connection idle this long (the ticker runs every 3 s, so before 15 s)
-_CALENDARS_SECONDS = 120.0    # the calendar list per connection; a calendar added in the Calendar app appears within this time
+_CALENDARS_SECONDS = 120.0    # the calendar list (shared by the connections); a calendar added in the Calendar app appears within this time
 _DESCRIPTION_CHARS = 2000     # calendar_list_events cuts descriptions here; calendar_get_event returns the whole text
 # Calendars are read in parallel, each on its own pooled connection (a connection is never shared between threads).
 _READERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="icloud-caldav")
@@ -768,14 +769,39 @@ def _is_transport_error(exc: BaseException | None) -> bool:
 # a write (a PUT or DELETE is never replayed), never on a brand-new connection, and the retry always uses a brand-new one.
 _reconnecting = callctx.retry_once_if_safe(_is_transport_error)
 
+_CALDAV_NS = "{urn:ietf:params:xml:ns:caldav}"
+_LIST_PROPS = ["{DAV:}resourcetype", "{DAV:}displayname", _CALDAV_NS + "supported-calendar-component-set"]
+
+
+def _host(url: Any) -> str:
+    return (urlsplit(str(url)).hostname or "").lower()
+
+
+def _auth_type(s: Settings) -> str | None:
+    """'basic' sends the credentials with the first request instead of waiting for a 401 (one round trip less on every new
+    connection), but only where Basic is known to be right: https to iCloud, a loopback test server, or CALDAV_AUTH=basic.
+    Anything else keeps caldav's negotiation, so Digest servers still work, and plain http to another host never gets
+    credentials unasked. caldav never renegotiates once an auth object is set."""
+    u, host = urlsplit(s.caldav_url), _host(s.caldav_url)
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback:
+        return "basic"
+    if u.scheme == "https" and (host == "icloud.com" or host.endswith(".icloud.com") or s.caldav_auth == "basic"):
+        return "basic"
+    return None
+
 
 class _Conn:
     """One logged-in CalDAV client with its principal, as held in the pool."""
-    __slots__ = ("client", "principal", "created", "last_used", "cals", "cals_at", "cals_gen")
+    __slots__ = ("client", "principal", "created", "last_used", "cals", "ev_cals", "cals_at", "cals_gen")
 
     def __init__(self, client: Any, principal: Any, now: float):
         self.client, self.principal, self.created, self.last_used = client, principal, now, now
         self.cals: list[Any] | None = None
+        self.ev_cals: list[Any] = []
         self.cals_at = 0.0
         self.cals_gen = 0
 
@@ -783,10 +809,16 @@ class _Conn:
 class CalendarService:
     def __init__(self, settings: Settings):
         self.s = settings
-        self._vevent_cache: dict[str, tuple[bool, float]] = {}
+        self._vevent_cache: dict[str, bool] = {}   # only for a calendar whose component set did not parse in the list
         self._name_cache: dict[str, tuple[str, float]] = {}
         self._cals_gen = 0                  # bumped when a calendar is created, renamed or deleted: every cached list is stale then
         self._uid_cache: dict[str, tuple[str, float]] = {}
+        # Discovery, shared by every connection: the principal and calendar-home URLs (kept for the process) and the calendar
+        # list as (href, name, holds events), read_at, gen. Only URLs and names: each connection builds its own calendar
+        # objects from them, since those are bound to the client that made them.
+        self._principal_url: str | None = None
+        self._home_url: str | None = None
+        self._cal_list: tuple[list[tuple[str, str, bool]], float, int] | None = None
         # Opening a CalDAV connection costs a TLS handshake plus the principal PROPFINDs, about 1.3 s against iCloud. Logged-in
         # connections are therefore kept in a small pool. Each is used by ONE call at a time (a requests session is not safe
         # from two threads at once), whichever worker thread runs it, and a connection whose call failed on the transport is
@@ -802,12 +834,48 @@ class CalendarService:
     def _open(self) -> _Conn:
         s = self.s
         callctx.stage("CalDAV sign-in")
-        client = caldav.DAVClient(url=s.caldav_url, username=s.caldav_username, password=s.app_password, require_tls=s.caldav_require_tls)
+        client = caldav.DAVClient(url=s.caldav_url, username=s.caldav_username, password=s.app_password, require_tls=s.caldav_require_tls,
+                                  auth_type=_auth_type(s))
         try:
-            return _Conn(client, client.principal(), time.monotonic())
+            return _Conn(client, self._sign_in(client), time.monotonic())
         except Exception:
             self._close(client)
             raise
+
+    def _sign_in(self, client: Any) -> Any:
+        """The principal of a new connection. Once discovery has run, it is not repeated: one authenticated Depth:0 PROPFIND
+        on the warm-up URL checks the password (a 401 still fails here) and opens the socket the calls will use. A URL that
+        no longer answers (moved, 404, 403) is forgotten and discovery runs again, once."""
+        principal_url, warm = self._principal_url, self._warm_url()
+        if principal_url and warm:
+            try:
+                if client.propfind(warm, depth=0).status in (200, 207):
+                    return client.principal(url=principal_url)
+            except caldav.error.AuthorizationError:
+                pass                              # a 403 from a stale URL; a wrong password fails the discovery below as well
+            self._forget_discovery()
+        principal = client.principal()
+        self._principal_url = str(principal.url)
+        return principal
+
+    def _forget_discovery(self) -> None:
+        self._principal_url = self._home_url = self._cal_list = None
+
+    def _warm_url(self, conn: _Conn | None = None) -> str | None:
+        """Where the warm-up and keep-alive PROPFINDs (Depth:0) go: a URL on the host this connection's calendar and event
+        requests use, since that is the socket worth keeping open. The calendar home when the calendars live on its host.
+        caldav 3 builds calendar objects on the client's own host, so on iCloud (home on pNN-caldav.icloud.com, calendars
+        on caldav.icloud.com) the home host only serves the list refresh, and the principal is pinged instead."""
+        listed = self._cal_list[0] if self._cal_list else []
+        if conn is not None and conn.cals:
+            cal_url = str(conn.cals[0].url)
+        elif listed and "://" in listed[0][0]:
+            cal_url = listed[0][0]
+        else:
+            cal_url = None                        # relative hrefs: the calendars are on the client's host, as is the principal
+        principal = str(conn.principal.url) if conn is not None else self._principal_url
+        events_host = _host(cal_url or principal)
+        return next((u for u in (self._home_url, principal, cal_url) if u and _host(u) == events_host), None)
 
     @staticmethod
     def _close(conn_or_client: Any) -> None:
@@ -873,7 +941,7 @@ class CalendarService:
                     self._close(conn)
                     conn = self._open()
                 else:
-                    conn.client.propfind(str(conn.principal.url), depth=0)
+                    conn.client.propfind(self._warm_url(conn), depth=0)
             except Exception:  # noqa: BLE001 - a dead connection is simply not put back
                 self._close(conn)
                 continue
@@ -911,6 +979,7 @@ class CalendarService:
             else:
                 if isinstance(e, caldav.error.DAVError):
                     conn.cals = None              # the calendar list may be what is wrong
+                    self._forget_discovery()
                 self._checkin(conn)
             raise
         else:
@@ -924,7 +993,7 @@ class CalendarService:
         key, now = str(cal.url), time.monotonic()
         hit = self._name_cache.get(key)
         if hit is None or now - hit[1] > _CACHE_SECONDS:
-            name = getattr(cal, "name", None)  # already filled in by principal.calendars(); avoids one request per calendar
+            name = getattr(cal, "name", None)  # already filled in from the calendar list; avoids one request per calendar
             if not name:
                 try:
                     name = cal.get_display_name()
@@ -933,45 +1002,117 @@ class CalendarService:
             hit = self._name_cache[key] = (name or key.rstrip("/").rsplit("/", 1)[-1], now)
         return hit[0]
 
-    def _calendars(self, principal: Any) -> list[Any]:
-        """principal.calendars(), kept for a while on the connection it was read with (calendar objects are bound to it)."""
+    def _calendar_objects(self, principal: Any) -> tuple[list[Any], list[Any]]:
+        """(every calendar, the ones that hold events) as objects of this principal's client, kept for a while on the
+        connection they were made for. They are built from the service-wide list, so a connection that has not listed
+        calendars yet costs no request."""
         conn = getattr(self._tl, "conn", None)
-        now = time.monotonic()
-        if (conn is not None and conn.principal is principal and conn.cals is not None and now - conn.cals_at < _CALENDARS_SECONDS
+        if conn is not None and conn.principal is not principal:
+            conn = None
+        if (conn is not None and conn.cals is not None and time.monotonic() - conn.cals_at < _CALENDARS_SECONDS
                 and conn.cals_gen == self._cals_gen):
-            return conn.cals
-        cals = principal.calendars()
-        if conn is not None and conn.principal is principal:
-            conn.cals, conn.cals_at, conn.cals_gen = cals, now, self._cals_gen
-        return cals
+            return conn.cals, conn.ev_cals
+        listed, read_at, gen = self._calendar_list(principal)
+        client = principal.client
+        cals = [client.calendar(url=href, name=name) for href, name, _ in listed]
+        events = [c for c, (_, _, holds) in zip(cals, listed) if holds]
+        if conn is not None:
+            conn.cals, conn.ev_cals, conn.cals_at, conn.cals_gen = cals, events, read_at, gen
+        return cals, events
+
+    def _calendars(self, principal: Any) -> list[Any]:
+        return self._calendar_objects(principal)[0]
+
+    def _event_calendars(self, principal: Any) -> list[Any]:
+        return self._calendar_objects(principal)[1]
+
+    def _calendar_list(self, principal: Any) -> tuple[list[tuple[str, str, bool]], float, int]:
+        """The service-wide calendar list, read again after _CALENDARS_SECONDS or after a calendar was created, renamed
+        or deleted (_cals_gen)."""
+        hit = self._cal_list
+        if hit is not None and time.monotonic() - hit[1] < _CALENDARS_SECONDS and hit[2] == self._cals_gen:
+            return hit
+        gen = self._cals_gen                      # taken first: a change while the list is read leaves it stale, not current
+        hit = self._cal_list = (self._read_calendar_list(principal), time.monotonic(), gen)
+        return hit
+
+    def _read_calendar_list(self, principal: Any) -> list[tuple[str, str, bool]]:
+        """One Depth:1 PROPFIND on the calendar home, asking for each collection's type, name and component set, so no
+        calendar needs a request of its own. The home URL is found once (a PROPFIND on the principal) and kept; a kept
+        one that stops answering (moved, 404, 403) is found again, once."""
+        client = principal.client
+        home, kept = self._home_url, self._home_url is not None
+        while True:
+            if home is None:
+                resp = client.propfind(str(principal.url), props=[_CALDAV_NS + "calendar-home-set"], depth=0)
+                href = next((r.properties.get(_CALDAV_NS + "calendar-home-set") for r in resp.results or []
+                             if r.properties.get(_CALDAV_NS + "calendar-home-set")), None)
+                home = urljoin(str(principal.url), href) if href else str(principal.url)   # no home set (GMX): the principal
+                if urlsplit(str(principal.url)).scheme == "https" and urlsplit(home).scheme != "https":
+                    raise CalendarError("The CalDAV server named a calendar home that is not https; not followed.")
+            try:
+                resp = client.propfind(home, props=_LIST_PROPS, depth=1)
+                status = resp.status
+            except caldav.error.AuthorizationError:
+                if not kept:
+                    raise
+                status = 403
+            if status in (200, 207):
+                break
+            if not kept:
+                raise caldav.error.PropfindError(url=home, reason=f"listing calendars failed with HTTP {status}")
+            home, kept = None, False
+        self._home_url = home
+        out = []
+        for r in resp.results or []:
+            kinds = r.properties.get("{DAV:}resourcetype") or []
+            if _CALDAV_NS + "calendar" not in (kinds if isinstance(kinds, list) else [kinds]):
+                continue                          # the home itself, and any other collection that is not a calendar
+            href = quote(unquote(r.href), safe="/@:")
+            name = r.properties.get("{DAV:}displayname") or href.rstrip("/").rsplit("/", 1)[-1]
+            comps = r.properties.get(_CALDAV_NS + "supported-calendar-component-set")
+            out.append((href, str(name), self._holds_events(client, href, comps)))
+        return out
+
+    def _holds_events(self, client: Any, href: str, comps: Any) -> bool:
+        """From the list's component set: a missing one means any component (VEVENT included). One that did not parse is
+        asked of that calendar once, and remembered (a calendar's component set is fixed when it is created)."""
+        if comps is None or comps == []:
+            return True
+        if isinstance(comps, str):
+            comps = [comps]
+        if isinstance(comps, (list, tuple)) and all(isinstance(c, str) for c in comps):
+            return "VEVENT" in {c.upper() for c in comps}
+        if href not in self._vevent_cache:
+            try:
+                found = client.calendar(url=href).get_supported_components()
+            except Exception:  # noqa: BLE001
+                found = ["VEVENT"]
+            self._vevent_cache[href] = not found or "VEVENT" in found
+        return self._vevent_cache[href]
 
     def _calendars_changed(self) -> None:
         self._cals_gen += 1
         self._name_cache.clear()
         self._vevent_cache.clear()
 
-    def _event_calendars(self, principal: Any) -> list[Any]:
-        # Which calendars hold events does not change between calls, so ask iCloud once per calendar, not on every tool call.
-        out = []
-        for cal in self._calendars(principal):
-            key, now = str(cal.url), time.monotonic()
-            hit = self._vevent_cache.get(key)
-            if hit is None or now - hit[1] > _CACHE_SECONDS:
-                try:
-                    comps = cal.get_supported_components()
-                except Exception:  # noqa: BLE001
-                    comps = ["VEVENT"]
-                hit = self._vevent_cache[key] = ((not comps or "VEVENT" in comps), now)
-            if hit[0]:
-                out.append(cal)
-        return out
+    @staticmethod
+    def _cal_id(cal: Any) -> str:
+        return str(cal.url).rstrip("/").rsplit("/", 1)[-1]
 
     def _pick(self, principal: Any, calendar: str | None) -> list[Any]:
+        """The calendars `calendar` names: by name (any case), by the id from calendar_list_calendars (the last segment of
+        its URL, whole) or by its full URL, which older ids were."""
         cals = self._event_calendars(principal)
         if not calendar:
             return cals
-        want = calendar.strip().lower()
-        hit = [c for c in cals if self._cal_name(c).lower() == want or str(c.url).rstrip("/").endswith(want)]
+        w = calendar.strip().rstrip("/").lower()
+        by_name = [c for c in cals if self._cal_name(c).lower() == w]
+        by_id = [c for c in cals if (u := str(c.url).rstrip("/").lower()) == w or u.endswith("/" + w)]
+        if by_name and by_id and {id(c) for c in by_name} != {id(c) for c in by_id}:
+            raise CalendarError(f"'{calendar}' is the name of one calendar and the id of another, so it is not guessed. "
+                                "Use the other calendar's name, or rename one in the Calendar app.")
+        hit = list({id(c): c for c in by_name + by_id}.values())
         if not hit:
             raise CalendarError(f"No calendar named '{calendar}'. Use one of: {', '.join(self._cal_name(c) for c in cals)}.")
         return hit
@@ -979,7 +1120,7 @@ class CalendarService:
     @_reconnecting
     def list_calendars(self) -> list[dict[str, Any]]:
         with self._principal() as p:
-            return [{"name": self._cal_name(c), "id": str(c.url)} for c in self._event_calendars(p)]
+            return [{"name": self._cal_name(c), "id": self._cal_id(c)} for c in self._event_calendars(p)]
 
     # -- managing calendars ---------------------------------------------------------------
     @staticmethod
@@ -998,7 +1139,7 @@ class CalendarService:
             self._tl.mutated = True
             cal = p.make_calendar(name=name, cal_id=str(uuid.uuid4()))
         self._calendars_changed()
-        return {"created": True, "name": name, "id": str(cal.url)}
+        return {"created": True, "name": name, "id": self._cal_id(cal)}
 
     @_reconnecting
     def update_calendar(self, calendar: str, new_name: str) -> dict[str, Any]:
@@ -1306,9 +1447,7 @@ class CalendarService:
         """iCloud answers UID-filtered REPORT queries (caldav's event_by_uid) with 412, so try the resource named
         after the UID first; that is how iCloud and this connector store events."""
         try:
-            obj = cal.event_by_url(f"{str(cal.url).rstrip('/')}/{quote(uid, safe='@')}.ics")
-            obj.load()
-            return obj
+            return cal.event_by_url(f"{str(cal.url).rstrip('/')}/{quote(uid, safe='@')}.ics")   # one GET; its ETag guards the write
         except caldav.error.DAVError:
             return None
 

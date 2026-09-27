@@ -554,6 +554,7 @@ Everything is an environment variable. [`.env.example`](https://github.com/epine
 | `TOOL_TIMEOUT_SECONDS` | 60 | A tool call running longer is abandoned with an error that names the slow step |
 | `IMAP_POOL_SIZE`, `IMAP_IDLE_SECONDS` | 3, 600 | Logged-in mail connections kept for reuse (0 = log in on every call), and how long they are kept warm after the last call |
 | `CALDAV_POOL_SIZE`, `CALDAV_KEEPALIVE_SECONDS` | 4, 600 | Calendar connections kept for reuse, and how long they are kept warm after the last call (0 = no keep-alive) |
+| `CALDAV_AUTH` | auto | `basic` sends Basic credentials with the first request instead of waiting for a 401 (only over https or to this computer); `auto` does that for iCloud and a local server, and negotiates (Basic or Digest) with others |
 | `WARMUP_ON_START` | true | Sign in to mail, calendar and contacts in the background right after start, so the first call is fast |
 | `TOOL_WORKERS` | 8 | Tool calls that can run at the same time |
 | `OWNER_ADDRESSES` | (none) | More addresses that are yours (aliases), so invitations to them count as yours |

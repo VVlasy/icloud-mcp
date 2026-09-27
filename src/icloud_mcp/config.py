@@ -151,6 +151,7 @@ class Settings:
     imap_idle_seconds: int = 600  # IMAP_IDLE_SECONDS: a pooled connection unused for longer is closed instead of reused
     caldav_pool_size: int = 4     # CALDAV_POOL_SIZE: CalDAV connections kept for reuse (calendars are read in parallel)
     caldav_keepalive_seconds: int = 600   # CALDAV_KEEPALIVE_SECONDS: keep pooled CalDAV connections warm this long after the last call (0 = off)
+    caldav_auth: str = "auto"    # CALDAV_AUTH: 'basic' = Basic up front (https or loopback only); 'auto' = so for iCloud and loopback
     enable_maps: bool = False     # ENABLE_MAPS: Apple Maps travel times and place search via the Mac helper (needs BRIDGE_TOKEN)
     enable_imessage: bool = False  # ENABLE_IMESSAGE: read and search the owner's own iMessage history via the Mac helper
     enable_health: bool = False    # ENABLE_HEALTH: daily Apple Health figures from the owner's iPhone exports, via the Mac helper
@@ -242,6 +243,7 @@ class Settings:
             imap_idle_seconds=max(30, _int("IMAP_IDLE_SECONDS", 600)),
             caldav_pool_size=max(1, min(_int("CALDAV_POOL_SIZE", 4), 8)),
             caldav_keepalive_seconds=max(0, _int("CALDAV_KEEPALIVE_SECONDS", 600)),
+            caldav_auth=_str("CALDAV_AUTH", "auto").lower(),
             enable_maps=_bool("ENABLE_MAPS", False),
             enable_imessage=_bool("ENABLE_IMESSAGE", False),
             enable_health=_bool("ENABLE_HEALTH", False),

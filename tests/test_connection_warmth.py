@@ -9,6 +9,7 @@ from email.message import EmailMessage
 import httpx
 import pytest
 
+import caldav_fakes
 import icloud_mcp.cal as cal_mod
 import icloud_mcp.mail as mail_mod
 from icloud_mcp.cal import CalendarError, CalendarService
@@ -43,16 +44,13 @@ class Clock:
 
 # ------------------------------------------------------------------------------------------------ CalDAV pool
 class FakeCal:
-    def __init__(self, client, name):
-        self.client, self.name, self.url = client, name, f"https://caldav.example/1/calendars/{name.lower()}/"
-
-    def get_supported_components(self):
-        return ["VEVENT"]
+    def __init__(self, client, name, url=None):
+        self.client, self.name, self.url = client, name, url or f"https://caldav.example/1/calendars/{name.lower()}/"
 
 
 class FakePrincipal:
-    def __init__(self, client):
-        self.client, self.url = client, "https://caldav.example/1/principal/"
+    def __init__(self, client, url=None):
+        self.client, self.url = client, url or "https://caldav.example/1/principal/"
 
     def calendars(self):
         self.client.net.append("calendars")
@@ -62,20 +60,34 @@ class FakePrincipal:
 
 
 class FakeDAV:
+    """Logs what crosses the network: 'principal' (discovery), 'home-set', 'calendars' (the Depth:1 list) and 'propfind' (a
+    Depth:0 warm-up or keep-alive ping, whose URL goes to `pinged`)."""
     made = []
+    home = "https://caldav.example/1/calendars/"
+    hrefs = ["https://caldav.example/1/calendars/personal/", "https://caldav.example/1/calendars/work/"]
 
     def __init__(self, **kw):
-        self.net, self.dead, self.closed = ["connect"], False, False
+        self.kw, self.net, self.pinged, self.dead, self.closed = kw, ["connect"], [], False, False
         FakeDAV.made.append(self)
 
-    def principal(self):
-        self.net.append("principal")
-        return FakePrincipal(self)
+    def principal(self, url=None):
+        if url is None:
+            self.net.append("principal")
+        return FakePrincipal(self, url)
 
-    def propfind(self, url, depth=0):
-        self.net.append("propfind")
+    def propfind(self, url, props=None, depth=0):
+        kind = "calendars" if depth == 1 else "home-set" if props else "propfind"
+        self.net.append(kind)
+        if kind == "propfind":
+            self.pinged.append(url)
         if self.dead:
             raise ConnectionResetError("reset by peer")
+        if kind == "calendars":
+            return caldav_fakes.calendar_list(url, [FakeCal(self, n, h) for n, h in zip(("Personal", "Work"), FakeDAV.hrefs)])
+        return caldav_fakes.home_set(url, FakeDAV.home) if kind == "home-set" else caldav_fakes.Reply([])
+
+    def calendar(self, url, name=None):
+        return FakeCal(self, name, url if "://" in url else "https://caldav.example" + url)
 
     def close(self):
         self.closed = True
@@ -118,7 +130,7 @@ def test_a_dead_pooled_connection_is_retried_once_on_a_fresh_one(cal):
     cal.list_calendars()
     first = FakeDAV.made[0]
     first.dead = True
-    cal._pool[0].cals = None                                        # force a request on the dead socket
+    cal._pool[0].cals = cal._cal_list = None                        # force a request on the dead socket
     assert [c["name"] for c in cal.list_calendars()] == ["Personal", "Work"]
     assert len(FakeDAV.made) == 2 and first.closed                  # the dead one is closed, never pooled again
     assert [c.client for c in cal._pool] == [FakeDAV.made[1]]
@@ -152,9 +164,9 @@ def test_a_write_is_never_retried_and_a_fresh_failure_is_real(s, monkeypatch):
         real(self, **kw)
         self.dead = True
     monkeypatch.setattr(FakeDAV, "__init__", dead_init)
-    with pytest.raises(ConnectionResetError):
+    with pytest.raises(CalendarError, match="Could not connect") as err:
         w.read()                                                    # a brand-new connection that fails is not retried
-    assert len(FakeDAV.made) == 2
+    assert len(FakeDAV.made) == 2 and isinstance(err.value.__cause__, ConnectionResetError)   # it failed at its sign-in request
 
 
 def test_idle_or_old_connections_are_not_handed_out(cal, monkeypatch):
@@ -198,25 +210,131 @@ def test_keepalive_off_and_a_dead_ping(cal, monkeypatch):
     assert cal._pool == [] and FakeDAV.made[0].closed               # a failed ping takes the connection out
     cal.s = dataclasses.replace(cal.s, caldav_keepalive_seconds=0)
     cal.list_calendars()
+    warmed = FakeDAV.made[1].net.count("propfind")                 # the new connection's one warm-up request
     clock.t += cal_mod._PING_AFTER_SECONDS
     cal._keepalive(clock.t)
-    assert FakeDAV.made[1].net.count("propfind") == 0
+    assert warmed == 1 and FakeDAV.made[1].net.count("propfind") == warmed
 
 
 def test_the_calendar_list_expires_and_an_auth_failure_is_reported(cal, monkeypatch):
     clock = Clock()
     monkeypatch.setattr(cal_mod.time, "monotonic", clock)
     cal.list_calendars()
+    clock.t += 5                                                   # still warm, so the same connection is used
+    cal._cal_list = (cal._cal_list[0], clock.t - cal_mod._CALENDARS_SECONDS - 1, cal._cal_list[2])
     cal._pool[0].cals_at -= cal_mod._CALENDARS_SECONDS + 1
     cal.list_calendars()
-    assert FakeDAV.made[0].net.count("calendars") == 2
+    assert FakeDAV.made[0].net.count("calendars") == 2 and FakeDAV.made[0].net.count("home-set") == 1   # the home is kept
 
-    def denied(self):
+    def denied(self, *a, **kw):
         raise cal_mod.caldav.error.AuthorizationError("401")
     monkeypatch.setattr(FakeDAV, "principal", denied)
+    monkeypatch.setattr(FakeDAV, "propfind", denied)                # a wrong password: the kept URLs' warm-up is refused too
     cal.close_pool()
     with pytest.raises(CalendarError, match="authentication failed"):
         cal.list_calendars()
+    assert cal._principal_url is None                               # forgotten; the next connection discovers afresh
+
+
+def test_the_calendar_list_is_shared_but_calendar_objects_never_are(cal):
+    cal.list_calendars()                                            # what prewarm does, without its worker threads: the list once,
+    for spare in [cal._open(), cal._open()]:                        # then two spares
+        cal._checkin(spare)
+    assert [d.net for d in FakeDAV.made] == [["connect", "principal", "home-set", "calendars"],
+                                             ["connect", "propfind"], ["connect", "propfind"]]   # a spare: one warm-up request
+    seen = []
+    for conn in list(cal._pool):
+        cal._tl.conn = conn
+        try:
+            seen.append(cal._event_calendars(conn.principal))
+        finally:
+            cal._tl.conn = None
+    assert all(c.client is conn.client for conn, cals in zip(cal._pool, seen) for c in cals)   # each built on its own client
+    assert sum(d.net.count("calendars") for d in FakeDAV.made) == 1                            # from the one list, no request
+
+
+@pytest.mark.parametrize("hrefs, pinged", [
+    (["https://p42.example.net/1/calendars/personal/"], "https://p42.example.net/1/calendars/"),   # calendars on the home host
+    (["/1/calendars/personal/"], "https://caldav.example/1/principal/"),   # relative (caldav 3): on the client's host, as iCloud
+])
+def test_the_keepalive_pings_the_host_the_event_requests_use(cal, monkeypatch, hrefs, pinged):
+    monkeypatch.setattr(FakeDAV, "home", "https://p42.example.net/1/calendars/")
+    monkeypatch.setattr(FakeDAV, "hrefs", hrefs)
+    clock = Clock()
+    monkeypatch.setattr(cal_mod.time, "monotonic", clock)
+    cal.list_calendars()
+    clock.t += cal_mod._PING_AFTER_SECONDS
+    cal._keepalive(clock.t)
+    assert FakeDAV.made[0].pinged == [pinged]
+    clock.t += cal_mod._MAX_AGE_SECONDS
+    cal._keepalive(clock.t)                                         # too old: replaced, and the new one is warmed on the same host
+    assert FakeDAV.made[1].net == ["connect", "propfind"] and cal_mod._host(FakeDAV.made[1].pinged[0]) == cal_mod._host(pinged)
+
+
+def test_basic_auth_is_sent_up_front_only_to_icloud_over_https_or_to_loopback(s, cal):
+    auth = lambda url, mode="auto": cal_mod._auth_type(dataclasses.replace(s, caldav_url=url, caldav_auth=mode))   # noqa: E731
+    assert auth("https://caldav.icloud.com") == auth("https://p42-caldav.icloud.com:443/") == "basic"
+    assert auth("http://127.0.0.1:5232") == auth("http://localhost:5232") == auth("http://[::1]:5232") == "basic"
+    assert auth("https://dav.example.com") is None and auth("https://dav.example.com", "basic") == "basic"
+    assert auth("http://caldav.icloud.com") is None and auth("http://dav.example.com", "basic") is None   # never over plain http
+    assert auth("https://icloud.com.example.net") is None
+    cal.list_calendars()
+    assert FakeDAV.made[0].kw["auth_type"] == "basic"
+
+
+# ------------------------------------------------------------------------------------------------ CalDAV round trips
+@pytest.fixture
+def dav(s, monkeypatch):
+    """The real caldav client against an iCloud-shaped in-memory server: every count below is an HTTP request."""
+    server = caldav_fakes.Server(password=s.app_password)
+
+    class Client(cal_mod.caldav.DAVClient):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.session.request = server
+    monkeypatch.setattr(cal_mod.caldav, "DAVClient", Client)
+    return CalendarService(dataclasses.replace(s, default_timezone="Europe/Berlin")), server
+
+
+def test_request_counts_per_calendar_operation(dav):
+    svc, server = dav
+    assert svc.list_calendars() == [{"name": "Calendar", "id": "home"}, {"name": "Work", "id": "work"}]
+    assert server.log == [("PROPFIND", "caldav.icloud.com", ""), ("PROPFIND", "caldav.icloud.com", "/123/principal/"),
+                          ("PROPFIND", "p42-caldav.icloud.com", "/123/calendars/")]   # no 401 first, no PROPFIND per calendar
+    server.log.clear()
+    made = svc.create_event(summary="Dentist", start="2026-10-05T10:00", end="2026-10-05T11:00", calendar="home")
+    svc.get_event(made["uid"], calendar="Calendar")
+    assert [m for m, *_ in server.log] == ["REPORT", "REPORT", "PUT", "GET"]            # get_event: one GET
+    server.log.clear()
+    svc.update_event(made["uid"], summary="Dentist (moved)")
+    svc.delete_event(made["uid"])
+    assert [m for m, *_ in server.log] == ["GET", "PUT", "GET", "DELETE"]              # create + update + delete: 7 in all
+    assert server.events["home"] == {}
+
+
+def test_a_new_connection_skips_discovery_and_a_moved_home_is_found_again(dav):
+    svc, server = dav
+    svc.list_calendars()
+    server.log.clear()
+    svc._checkin(svc._open())
+    assert server.log == [("PROPFIND", "caldav.icloud.com", "/123/principal/")]       # one authenticated warm-up request
+    server.missing.add(("p42-caldav.icloud.com", "/123/calendars/"))
+    server.home_host = "p43-caldav.icloud.com"
+    svc._calendars_changed()
+    server.log.clear()
+    assert [c["name"] for c in svc.list_calendars()] == ["Calendar", "Work"]
+    assert [(h, p) for _, h, p in server.log] == [("p42-caldav.icloud.com", "/123/calendars/"),
+                                                  ("caldav.icloud.com", "/123/principal/"), ("p43-caldav.icloud.com", "/123/calendars/")]
+
+
+def test_a_wrong_password_is_still_an_authentication_error(dav):
+    svc, server = dav
+    svc.list_calendars()
+    svc.close_pool()
+    server.password = "changed"
+    with pytest.raises(CalendarError, match="CalDAV authentication failed"):
+        svc.list_calendars()
+    assert all(host == "caldav.icloud.com" for _, host, _ in server.log[3:])
 
 
 def test_get_tz_is_cached():

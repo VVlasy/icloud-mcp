@@ -6,6 +6,7 @@ import dataclasses
 import icalendar
 import pytest
 
+from caldav_fakes import principal_of
 from icloud_mcp.cal import CalendarError, CalendarService, build_event, get_tz, parse_attendees
 from icloud_mcp.config import Settings
 from icloud_mcp.mailbulk import expand_uid_set
@@ -62,7 +63,7 @@ class FakeCal:
 
 def _svc(s, monkeypatch, names):
     cals = [FakeCal(n) for n in names]
-    principal = type("P", (), {"calendars": lambda self: cals})()
+    principal = principal_of(cals)
 
     @contextlib.contextmanager
     def fake_principal(self):
@@ -128,18 +129,21 @@ def test_calendar_facts_are_cached_between_calls_and_expire(s, monkeypatch):
     class CountingCal(FakeCal):
         def get_supported_components(self):
             calls["components"] += 1
-            return ["VEVENT"]
+            return ["VTODO"]
 
-    cals = [CountingCal("Calendar"), CountingCal("Work")]
-    principal = type("P", (), {"calendars": lambda self: cals})()
+    cals = [CountingCal("Calendar"), CountingCal("Work"), CountingCal("Reminders"), CountingCal("Odd")]
+    kinds = {"Calendar": ["VEVENT"], "Work": None, "Reminders": ["VTODO"], "Odd": object()}   # None: no set given, any component
+    principal = principal_of(cals, components=lambda c: kinds[c.name])
     svc = CalendarService(s)
     for _ in range(3):
         assert [svc._cal_name(c) for c in svc._event_calendars(principal)] == ["Calendar", "Work"]
-    assert calls["components"] == 2                               # once per calendar, not once per call
+    assert principal.client.requests == [("https://caldav.example/1/principal/", 0), ("https://caldav.example/1/calendars/", 1)]
+    assert calls["components"] == 1                               # read from the list; only the set that did not parse is asked
     import icloud_mcp.cal as calmod
     monkeypatch.setattr(calmod.time, "monotonic", lambda t0=calmod.time.monotonic(): t0 + 10_000)
     svc._event_calendars(principal)
-    assert calls["components"] == 4                               # refreshed after the cache lifetime
+    assert principal.client.requests[2:] == [("https://caldav.example/1/calendars/", 1)]   # refreshed after its lifetime: one PROPFIND
+    assert calls["components"] == 1                               # a component set never changes, so it is not asked again
 
 
 # ------------------------------------------------------------------ mail: recipients are never silently dropped
