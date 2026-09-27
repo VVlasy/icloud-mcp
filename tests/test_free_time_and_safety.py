@@ -13,6 +13,7 @@ from icloud_mcp.cal import CalendarError, CalendarService, free_slots, not_busy_
 from icloud_mcp.config import Settings
 from icloud_mcp.contacts import ContactsError, ContactsService
 from icloud_mcp.mail import MailError, MailService
+from icloud_mcp.mailbulk import expand_uid_set
 
 TZ = ZoneInfo("Europe/Amsterdam")
 
@@ -237,6 +238,11 @@ def test_create_contact_preflight_requires_matching_uid(s):
 
 
 # ------------------------------------------------------------------ mail: uid + uidvalidity
+def uids_of(seq):
+    """What the server reads from a uid argument: a uid set such as b"3:5,9", or a plain list."""
+    return expand_uid_set(seq, 10 ** 6) if isinstance(seq, (bytes, str)) else list(seq)
+
+
 class FakeIMAP:
     def __init__(self, uidvalidity=5):
         self.uidvalidity, self.flag_calls = uidvalidity, []
@@ -253,10 +259,10 @@ class FakeIMAP:
                     b"BODY[HEADER.FIELDS (FROM)]": raw.split(b"\r\n\r\n")[0]} for u in uids}
 
     def add_flags(self, uids, flags, silent=False):
-        self.flag_calls.append(("add", list(uids)))
+        self.flag_calls.append(("add", uids_of(uids)))
 
-    def remove_flags(self, uids, flags):
-        self.flag_calls.append(("remove", list(uids)))
+    def remove_flags(self, uids, flags, silent=False):
+        self.flag_calls.append(("remove", uids_of(uids)))
 
 
 @pytest.fixture

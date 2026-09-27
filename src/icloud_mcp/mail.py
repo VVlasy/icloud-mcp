@@ -42,7 +42,7 @@ from .keepalive import TICKER
 from .matching import fuzzy_match_all, norm, similar_enough
 from .safety import HIDDEN_NOTICE, HIDDEN_TEXT_WARNING, compact, confirm_problem, hidden_text, strip_hidden_html, warnings_for
 from .safety import confirm_token as make_confirm_token
-from .mailbulk import bulk_view
+from .mailbulk import bulk_view, uid_chunks, uid_set
 from . import mailparts
 from .outbox import Outbox, OutboxFull, QueuedMessage
 
@@ -1955,26 +1955,41 @@ class MailService:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
             self._select(c, folder, readonly=False, expect=uidvalidity)
+            sets = [uid_set(chunk) for chunk in uid_chunks(uids)]      # a long list goes in several commands
             for val, flag in ((read, SEEN), (flagged, FLAGGED)):
-                if val is True:
-                    c.add_flags(uids, [flag])
-                elif val is False:
-                    c.remove_flags(uids, [flag])
+                if val is None:
+                    continue
+                for seq in sets:        # SILENT: the answer is not read, and imapclient cannot map a non-silent one to a uid set
+                    (c.add_flags if val else c.remove_flags)(seq, [flag], silent=True)
         return {"folder": folder, "uids": uids, "read": read, "flagged": flagged}
 
     @staticmethod
-    def _move_messages(c: IMAPClient, uids: list[int], dst: str) -> None:
+    def _move_messages(c: IMAPClient, uids: list[int], dst: str) -> Any:
         """Move messages out of the selected folder. iCloud does not implement IMAP MOVE, so fall back to
         COPY + flag \\Deleted + UID EXPUNGE of exactly these uids (never a plain EXPUNGE, which would also remove
-        unrelated messages that happen to be flagged \\Deleted)."""
+        unrelated messages that happen to be flagged \\Deleted). A long list goes in chunks (mailbulk.uid_chunks), stopping at
+        the first failure. Returns the COPY answer (its [COPYUID ...] says where the messages landed) when one COPY did it all."""
+        chunks = list(uid_chunks(uids))
         if c.has_capability("MOVE"):
-            c.move(uids, dst)
-            return
+            for chunk in chunks:
+                c.move(uid_set(chunk), dst)
+            return None
         if not c.has_capability("UIDPLUS"):
             raise MailError("This mail server supports neither MOVE nor UIDPLUS, so messages cannot be moved safely.")
-        c.copy(uids, dst)                       # if this fails nothing has been changed
-        c.add_flags(uids, [DELETED], silent=True)
-        c.expunge(uids)                         # UID EXPUNGE: only the copied messages
+        res, moved, total = None, 0, sum(map(len, chunks))
+        for chunk in chunks:
+            seq = uid_set(chunk)
+            try:
+                res = c.copy(seq, dst)          # if this fails nothing more has been changed
+                c.add_flags(seq, [DELETED], silent=True)
+                c.expunge(seq)                  # UID EXPUNGE: only the copied messages
+            except Exception as e:  # noqa: BLE001 - never retried: report what already happened
+                if not moved:
+                    raise
+                raise MailError(f"Stopped after moving {moved} of {total} messages to {dst} ({e}). "
+                                "Search again to see what is left.") from e
+            moved += len(chunk)
+        return res if len(chunks) == 1 else None
 
     def move(self, folder: str, uids: list[int], destination: str, *, uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
@@ -2152,9 +2167,9 @@ class MailService:
                 all_uids = sorted(c.search(["ALL"]))
                 moved = 0
                 try:
-                    for i in range(0, len(all_uids), 250):
-                        self._move_messages(c, all_uids[i:i + 250], trash)
-                        moved += len(all_uids[i:i + 250])
+                    for chunk in uid_chunks(all_uids):
+                        self._move_messages(c, chunk, trash)
+                        moved += len(chunk)
                 except Exception as e:  # noqa: BLE001 - never retried: report what already happened
                     raise MailError(f"Stopped after moving {moved} of {len(all_uids)} messages to Trash ({e}); the folder was not "
                                     "deleted. Call mail_delete_folder again for a new preview of what is left.") from e

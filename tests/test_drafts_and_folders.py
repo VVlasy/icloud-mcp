@@ -10,6 +10,12 @@ import pytest
 import icloud_mcp.mail as mail_mod
 from icloud_mcp.config import Settings
 from icloud_mcp.mail import MailError, MailService
+from icloud_mcp.mailbulk import expand_uid_set
+
+
+def uids_of(seq):
+    """What the server reads from a uid argument: a uid set such as b"3:5,9", or a plain list."""
+    return expand_uid_set(seq, 10 ** 6) if isinstance(seq, (bytes, str)) else list(seq)
 
 
 class FakeIMAP:
@@ -63,7 +69,7 @@ class FakeIMAP:
         return f"[APPENDUID {self.uv} {uid}] APPEND completed".encode()
 
     def copy(self, uids, dst):
-        for u in uids:
+        for u in uids_of(uids):
             raw, flags = self.msgs[(self.cur, u)]
             self.add(dst, raw, flags)
 
@@ -71,7 +77,7 @@ class FakeIMAP:
         pass
 
     def expunge(self, uids):
-        for u in uids:
+        for u in uids_of(uids):
             self.folders[self.cur].remove(u)
             self.msgs.pop((self.cur, u))
 

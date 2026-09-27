@@ -8,6 +8,7 @@ import pytest
 
 from icloud_mcp.cal import CalendarError, CalendarService, build_event, get_tz, parse_attendees
 from icloud_mcp.config import Settings
+from icloud_mcp.mailbulk import expand_uid_set
 from icloud_mcp.server import build_instructions, create_server
 
 
@@ -175,6 +176,11 @@ def test_instructions_carry_the_mail_workflow(s):
 
 
 # ------------------------------------------------------------------ iCloud has no IMAP MOVE: move/delete must still work, safely
+def uids_of(seq):
+    """What the server reads from a uid argument: a uid set such as b"3:5,9", or a plain list."""
+    return expand_uid_set(seq, 10 ** 6) if isinstance(seq, (bytes, str)) else list(seq)
+
+
 class _MoveIMAP:
     def __init__(self, caps):
         self.caps, self.log = set(caps), []
@@ -186,16 +192,16 @@ class _MoveIMAP:
         self.log.append(("select", f))
 
     def move(self, uids, dst):
-        self.log.append(("move", list(uids), dst))
+        self.log.append(("move", uids_of(uids), dst))
 
     def copy(self, uids, dst):
-        self.log.append(("copy", list(uids), dst))
+        self.log.append(("copy", uids_of(uids), dst))
 
     def add_flags(self, uids, flags, silent=False):
-        self.log.append(("flag", list(uids), list(flags)))
+        self.log.append(("flag", uids_of(uids), list(flags)))
 
     def expunge(self, uids=None):
-        self.log.append(("expunge", list(uids) if uids is not None else None))
+        self.log.append(("expunge", uids_of(uids) if uids is not None else None))
 
 
 def _mail_with(s, monkeypatch, caps):
