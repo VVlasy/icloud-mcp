@@ -398,10 +398,10 @@ was checked against the code.
 
 | measure (every area on, `dev/tool_surface.py`) | before | after |
 |---|---|---|
-| description chars | 21,682 | 124,910 |
+| description chars | 21,682 | 131,244 |
 | schema chars | 47,213 | 47,213 |
-| `tools/list` result | 82,035 B | 185,930 B |
+| `tools/list` result | 82,035 B | 192,589 B |
 
-That is roughly 26,000 more tokens of tool definitions when every area is on, read once per session. Clients that pay for
+That is roughly 27,000 more tokens of tool definitions when every area is on, read once per session. Clients that pay for
 every tool on every turn should use `TOOLS` presets (`TOOLS=essential`, `TOOLS=mail,calendar`), which cut the list to the
 tools a task needs. `LIST_BUDGET` in `tests/test_tool_surface.py` moved from 80,000 to 180,000 bytes accordingly.
