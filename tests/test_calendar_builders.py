@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 import icalendar
 import pytest
 
-from icloud_mcp.cal import CalendarError, build_event, event_to_dict, get_tz, parse_when
+from icloud_mcp.cal import CalendarError, _as_dt, build_event, event_to_dict, get_tz, parse_range_bound, parse_when
 
 LOCAL_TZ = get_tz("Europe/Berlin")
 
@@ -67,6 +67,26 @@ def test_parse_when():
     assert parse_when("2026-09-21", LOCAL_TZ) == (date(2026, 9, 21), True)
     v, is_date = parse_when("2026-09-21T09:00", LOCAL_TZ)
     assert not is_date and v.tzinfo is not None and v.utcoffset() == timedelta(hours=2)
+
+
+def test_read_ranges_take_relative_days_in_the_owners_timezone():
+    ams = get_tz("Europe/Amsterdam")
+    late = datetime(2026, 10, 24, 23, 59, tzinfo=ams)                       # the evening before the clocks go back
+    assert parse_range_bound("today", ams, now=late) == (date(2026, 10, 24), True)          # 23:59 is still today
+    assert parse_range_bound(" Tomorrow ", ams, now=late) == (date(2026, 10, 25), True)
+    assert parse_range_bound("+1d", ams, now=late) == parse_range_bound("tomorrow", ams, now=late)
+    assert parse_range_bound("yesterday", ams, now=late)[0] == parse_range_bound("-1d", ams, now=late)[0] == date(2026, 10, 23)
+    assert parse_range_bound("+800d", ams, now=late)[0] == date(2026, 10, 24) + timedelta(days=800)
+    day = parse_range_bound("tomorrow", ams, now=late)[0]                   # the DST day is 25 hours long
+    first, after = _as_dt(day, ams), _as_dt(day + timedelta(days=1), ams)
+    assert (first.isoformat(), after.isoformat()) == ("2026-10-25T00:00:00+02:00", "2026-10-26T00:00:00+01:00")
+    assert after.timestamp() - first.timestamp() == 25 * 3600
+    utc_evening = datetime(2026, 9, 27, 22, 30, tzinfo=get_tz("UTC"))      # 00:30 the next day in Amsterdam
+    assert parse_range_bound("today", ams, now=utc_evening)[0] == date(2026, 9, 28)
+    assert parse_range_bound("2026-09-21T09:00", LOCAL_TZ) == parse_when("2026-09-21T09:00", LOCAL_TZ)   # ISO as before
+    for bad in ("next week", "+801d", "+1000d", "+5", "1d", "tomorrow morning", "today+1d"):
+        with pytest.raises(CalendarError):
+            parse_range_bound(bad, ams, now=late)
 
 
 # ---------------------------------------------------------------- uid lookup on iCloud

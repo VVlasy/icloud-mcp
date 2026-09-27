@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import caldav
 from caldav.elements import dav as dav_elements
 import icalendar
+import recurring_ical_events
 
 from . import callctx
 from .config import Settings
@@ -61,6 +62,25 @@ def parse_when(value: str, tz: ZoneInfo) -> tuple[date | datetime, bool]:
     except ValueError as e:
         raise CalendarError(f"Could not parse '{value}'. Use ISO 8601, e.g. 2026-09-21 or 2026-09-21T14:30.") from e
     return (dt.replace(tzinfo=tz) if dt.tzinfo is None else dt.astimezone(tz)), False
+
+
+_RELATIVE_DAY = re.compile(r"^(today|tomorrow|yesterday|[+-]\d{1,3}d)$", re.I)
+
+
+def parse_range_bound(value: str, tz: ZoneInfo, *, now: datetime | None = None) -> tuple[date | datetime, bool]:
+    """A read range bound (calendar_list_events, calendar_find_free_time): today, tomorrow, yesterday or +Nd / -Nd (days
+    from today in tz, |N| <= 800) as a whole date, anything else as parse_when. Writes keep parse_when: a booked date is
+    one the owner can see."""
+    v = value.strip().lower()
+    if not _RELATIVE_DAY.match(v):
+        try:
+            return parse_when(value, tz)
+        except CalendarError as e:
+            raise CalendarError(f"{e} Or today, tomorrow, yesterday, +7d, -3d.") from e
+    n = {"today": 0, "tomorrow": 1, "yesterday": -1}.get(v)
+    if n is None and abs(n := int(v[:-1])) > 800:
+        raise CalendarError(f"'{value}' is too far: use at most +800d.")
+    return (now or datetime.now(tz)).astimezone(tz).date() + timedelta(days=n), True
 
 
 def _as_dt(v: date | datetime, tz: ZoneInfo) -> datetime:
@@ -528,25 +548,61 @@ def _same_instant(a: Any, b: Any) -> bool:
 _MAX_PER_DAY = 48      # more occurrences a day than this (every 30 minutes) is never a real plan, and expanding it can hang a read
 
 
+def _rule_parts(rule: Any) -> list[dict[str, list[Any]]]:
+    """Each repeat rule (text or icalendar vRecur, one or several) as {PART: [values]}. Raises when one cannot be read."""
+    out = []
+    for r in (rule if isinstance(rule, list) else [rule]):
+        rec = icalendar.vRecur.from_ical(r) if isinstance(r, str) else r
+        out.append({str(k).upper(): (v if isinstance(v, list) else [v]) for k, v in dict(rec).items()})
+    return out
+
+
+def _per_day(parts: dict[str, list[Any]]) -> int:
+    """Occurrences a day of an hourly or daily rule: BYSECOND x BYMINUTE x BYHOUR (every hour for an hourly one)."""
+    per_hour = len(parts.get("BYMINUTE", [0])) * len(parts.get("BYSECOND", [0]))
+    return per_hour * (24 if str(parts.get("FREQ", [""])[0]).upper() == "HOURLY" else len(parts.get("BYHOUR", [0])))
+
+
 def too_frequent(rule: Any) -> bool:
     """Whether a repeat rule (text or icalendar vRecur, one or several) would produce more than _MAX_PER_DAY occurrences a
     day: FREQ finer than hourly, or BYSECOND / BYMINUTE / BYHOUR lists that multiply an hourly or daily rule up. Unreadable
     rules count as too frequent: they are never expanded."""
-    rules = rule if isinstance(rule, list) else [rule]
-    for r in rules:
-        try:
-            rec = icalendar.vRecur.from_ical(r) if isinstance(r, str) else r
-            parts = {str(k).upper(): (v if isinstance(v, list) else [v]) for k, v in dict(rec).items()}
-            freq = str(parts.get("FREQ", [""])[0]).upper()
-            if freq in ("SECONDLY", "MINUTELY"):
+    try:
+        for parts in _rule_parts(rule):
+            if str(parts.get("FREQ", [""])[0]).upper() in ("SECONDLY", "MINUTELY") or _per_day(parts) > _MAX_PER_DAY:
                 return True
-            per_hour = len(parts.get("BYMINUTE", [0])) * len(parts.get("BYSECOND", [0]))
-            hours = 24 if freq == "HOURLY" else len(parts.get("BYHOUR", [0]))
-            if per_hour * hours > _MAX_PER_DAY:
-                return True
-        except Exception:  # noqa: BLE001 - a rule we cannot read is not expanded
-            return True
+    except Exception:  # noqa: BLE001 - a rule we cannot read is not expanded
+        return True
     return False
+
+
+_MAX_STEPS = 100_000   # expansion walks from DTSTART: hourly since 2016 is ~88k steps (~0.3 s CPU), daily since 1900 ~46k
+_DAY_LISTS = ("BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYSETPOS")
+
+
+def series_too_costly(rule: Any, dtstart: Any, window_end: Any) -> bool:
+    """Whether expanding a series up to window_end walks more than _MAX_STEPS occurrences. Expansion starts at DTSTART, so a
+    stranger's hourly invitation dated 1900 costs seconds of CPU on every read that covers it, though no day has too many.
+    Per rule: min(COUNT, occurrences a day x days from DTSTART to UNTIL or window_end); weekly, monthly and yearly rules count
+    as daily when they list days, else once per period. Unreadable input counts as too costly: it is never expanded."""
+    try:
+        first = dtstart.date() if isinstance(dtstart, datetime) else dtstart
+        steps = 0.0
+        for parts in _rule_parts(rule):
+            last = window_end.date() if isinstance(window_end, datetime) else window_end
+            if (until := parts.get("UNTIL", [None])[0]) is not None:
+                last = min(last, until.date() if isinstance(until, datetime) else until)
+            period = {"WEEKLY": 7, "MONTHLY": 28, "YEARLY": 365}.get(str(parts.get("FREQ", [""])[0]).upper(), 1)
+            per_day = _per_day(parts) / (1 if any(k in parts for k in _DAY_LISTS) else period)
+            est = per_day * max(0, (last - first).days + 1) / max(1, int(parts.get("INTERVAL", [1])[0]))
+            steps += min(est, int(parts["COUNT"][0])) if "COUNT" in parts else est
+        return steps > _MAX_STEPS
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _risky(rule: Any, dtstart: Any, window_end: Any) -> bool:
+    return too_frequent(rule) or series_too_costly(rule, dtstart, window_end)
 
 
 def parse_rrule(text: str) -> icalendar.vRecur:
@@ -563,38 +619,51 @@ def parse_rrule(text: str) -> icalendar.vRecur:
     return rec
 
 
-_SKIPPED_NOTE = ("series that repeat more than 48 times a day (usually spam invitations) were left unexpanded: only their "
-                 "dated exceptions are included. The rest of the result is complete.")
+_SKIPPED_NOTE = ("series too costly to expand (more than 48 times a day, or very often for decades; usually spam invitations) were "
+                 "left unexpanded: only their dated exceptions are included. The rest of the result is complete.")
 
 
-def _search_expanded(cal: Any, s_dt: datetime, e_dt: datetime, skipped: list[int]) -> list[str]:
-    """The events of one calendar in [s_dt, e_dt), recurring ones expanded client-side. caldav's own expand=True expands
-    before we see the rule, so a stranger's invitation repeating every second would expand into millions of occurrences
-    and hang the call: fetch unexpanded (the same one REPORT), set such series aside (counted in `skipped`, never named:
-    their text is a stranger's), and let caldav expand the rest exactly as search(expand=True) would. Only the dated
-    exceptions of a set-aside series come back."""
-    objs = cal.search(start=s_dt, end=e_dt, event=True, expand=False)
-    safe, out = [], []
-    for o in objs:
-        data = o.data or ""
+def _between(comps: list[icalendar.Component], s_dt: datetime, e_dt: datetime) -> list[icalendar.Component]:
+    """recurring_ical_events' occurrences of comps in [s_dt, e_dt), on a bare calendar as caldav's own expansion builds it."""
+    wrapper = icalendar.Calendar()
+    for c in comps:
+        wrapper.add_component(c)
+    return list(recurring_ical_events.of(wrapper).between(s_dt, e_dt))
+
+
+def _overlaps(comp: icalendar.Component, s_dt: datetime, e_dt: datetime) -> bool:
+    """Whether a single event falls in [s_dt, e_dt), by the library's rules (dates, floating times, DURATION, no end)."""
+    try:
+        return bool(_between([comp], s_dt, e_dt))
+    except Exception:  # noqa: BLE001 - no readable start: left out, as readable_event would
+        return False
+
+
+def _search_expanded(cal: Any, s_dt: datetime, e_dt: datetime, skipped: list[int]) -> list[icalendar.Component]:
+    """The event components of one calendar in [s_dt, e_dt), recurring ones expanded client-side. caldav's own expand=True
+    expands before we see the rule, so a stranger's invitation repeating every second (or hourly since 1900) would expand
+    into millions of occurrences and hang the call: fetch unexpanded (the same one REPORT), parse each object once, set such
+    series aside (counted in `skipped`, never named: their text is a stranger's) and expand the rest with
+    recurring_ical_events as search(expand=True) would. Only the dated exceptions of a set-aside series come back. An
+    object without RRULE/RDATE keeps its own VEVENTs, each only when the library finds it in the range; an object that
+    cannot be read or expanded is left out (a stranger's invitation must not fail the listing)."""
+    out: list[icalendar.Component] = []
+    for o in cal.search(start=s_dt, end=e_dt, event=True, expand=False):
         try:
-            parsed = icalendar.Calendar.from_ical(data)
-        except Exception:  # noqa: BLE001 - caldav would not expand what icalendar cannot read either
-            safe.append(o)
+            parsed = icalendar.Calendar.from_ical(o.data or "")
+            risky = [c for c in parsed.walk("VEVENT") if c.get("rrule") is not None and _risky(c.get("rrule"), _dt(c, "dtstart"), e_dt)]
+            if risky:
+                skipped.append(len(risky))
+                for comp in risky:
+                    parsed.subcomponents.remove(comp)
+            events = parsed.walk("VEVENT")
+            if any(c.get("rrule") is not None or c.get("rdate") is not None for c in events):
+                out += _between(events, s_dt, e_dt)
+            else:
+                out += [c for c in events if _overlaps(c, s_dt, e_dt)]
+        except Exception:  # noqa: BLE001
             continue
-        risky = [c for c in parsed.walk("VEVENT") if c.get("rrule") is not None and too_frequent(c.get("rrule"))]
-        if not risky:
-            safe.append(o)
-            continue
-        skipped.append(len(risky))
-        for comp in risky:
-            parsed.subcomponents.remove(comp)
-        if any(c.name == "VEVENT" for c in parsed.subcomponents):
-            out.append(parsed.to_ical().decode())
-    if safe and hasattr(cal, "searcher") and hasattr(safe[0], "icalendar_instance"):
-        from caldav.search import filter_search_results
-        safe = filter_search_results(safe, cal.searcher(start=s_dt, end=e_dt, event=True, expand=True))
-    return [o.data for o in safe] + out
+    return out
 
 
 def occurs_in_series(master: icalendar.Component, rid: Any) -> bool:
@@ -613,7 +682,7 @@ def occurs_in_series(master: icalendar.Component, rid: Any) -> bool:
     if (s.tzinfo is None) != (r.tzinfo is None):
         s, r = s.replace(tzinfo=None), r.replace(tzinfo=None)
     try:
-        if too_frequent(rule):                            # a stranger's invitation could carry one; expanding it would take minutes
+        if _risky(rule, start, r):                        # a stranger's invitation could carry one; expanding it would take minutes
             return False
         text = rule.to_ical().decode()
         if s.tzinfo is None:                              # dateutil refuses an aware UNTIL with a floating start
@@ -1198,10 +1267,13 @@ class CalendarService:
             s_dt = datetime.now(tz).replace(microsecond=0)
             e_dt = s_dt + timedelta(minutes=int(starting_within_minutes))
         else:
-            if not start or not end:
-                raise CalendarError("Give start and end (ISO dates or date-times), or starting_within_minutes.")
-            s_val, _ = parse_when(start, tz)
-            e_val, e_is_date = parse_when(end, tz)
+            s_val, _ = parse_range_bound(start or "today", tz)
+            if end:
+                e_val, e_is_date = parse_range_bound(end, tz)
+            elif not start and (query or needs_reply):
+                e_val, e_is_date = parse_range_bound("+60d", tz)          # a search without dates looks ahead two months
+            else:
+                e_val, e_is_date = _as_dt(s_val, tz).date(), True         # the start's whole day (today without start)
             s_dt = _as_dt(s_val, tz)
             e_dt = _as_dt(e_val, tz) + (timedelta(days=1) if e_is_date else timedelta())
         if e_dt <= s_dt:
@@ -1242,15 +1314,22 @@ class CalendarService:
 
     @staticmethod
     def _listed(comp: icalendar.Component, name: str, fields: str) -> dict[str, Any]:
+        """One listed event. all_day and has_attendees only when true. An occurrence of a series always says so (an edit
+        without occurrence_start changes the whole series): recurrence_id when it was moved from its original start, else
+        'recurring': true."""
         d = event_to_dict(comp, name)
+        rid = _dt(comp, "recurrence-id")
+        if rid is not None and _same_instant(rid, _dt(comp, "dtstart")):
+            d["recurrence_id"], d["recurring"] = None, True
         if fields == "summary":
-            keep = ("uid", "calendar", "summary", "start", "end", "all_day", "location", "status", "safety_warnings")
+            keep = ("uid", "calendar", "summary", "start", "end", "all_day", "location", "status", "recurrence_id", "recurring",
+                    "safety_warnings")
             return compact({**{k: d[k] for k in keep if k in d}, "has_attendees": bool(d.get("attendees"))},
-                           keep=("uid", "calendar", "summary", "start", "end", "all_day", "has_attendees"))
+                           keep=("uid", "calendar", "summary", "start", "end"))
         text = d.get("description")
         if text and len(text) > _DESCRIPTION_CHARS:
             d["description"], d["description_truncated"] = text[:_DESCRIPTION_CHARS], True
-        return compact(d, keep=("uid", "calendar", "summary", "start", "end", "all_day"))
+        return compact(d, keep=("uid", "calendar", "summary", "start", "end"))
 
     def _take_idle(self, n: int) -> list[_Conn]:
         """Up to n pooled connections that are ready now. Never opens one: a new CalDAV connection costs more than reading a
@@ -1338,28 +1417,25 @@ class CalendarService:
         search = lambda cal: _search_expanded(cal, s_dt, e_dt, skipped)   # noqa: E731
         found = (self._each_calendar_or_skip(principal, cals, search, not_read) if not_read is not None
                  else self._each_calendar(principal, cals, search))
-        for name, datas in zip(names, found):
-            for data in datas or []:
-                try:
-                    comps = icalendar.Calendar.from_ical(data).walk("VEVENT")
-                except Exception:  # noqa: BLE001 - one unreadable object (a stranger's invitation) must not fail the listing
-                    continue
-                for comp in comps:
-                    if readable_event(comp):
-                        yield name, comp
+        for name, comps in zip(names, found):
+            for comp in comps or []:
+                if readable_event(comp):
+                    yield name, comp
 
     @_reconnecting
     def find_free_time(
-        self, start: str, end: str, duration_minutes: int, *, calendar: str | None = None, timezone_name: str | None = None,
+        self, start: str | None, end: str | None, duration_minutes: int, *, calendar: str | None = None, timezone_name: str | None = None,
         day_start: str = "09:00", day_end: str = "18:00", weekdays: list[str] | None = None, include_travel: bool = True,
         limit: int = 20,
     ) -> dict[str, Any]:
         tz = get_tz(timezone_name or self.s.default_timezone)
-        s_val, _ = parse_when(start, tz)
-        e_val, e_is_date = parse_when(end, tz)
-        s_dt = _as_dt(s_val, tz)
-        e_dt = _as_dt(e_val, tz) + (timedelta(days=1) if e_is_date else timedelta())
         now = datetime.now(tz)
+        s_dt = _as_dt(parse_range_bound(start, tz)[0], tz) if start else now
+        if end:
+            e_val, e_is_date = parse_range_bound(end, tz)
+            e_dt = _as_dt(e_val, tz) + (timedelta(days=1) if e_is_date else timedelta())
+        else:
+            e_dt = max(s_dt, now) + timedelta(days=14)                   # default: two weeks from the start (or from now)
         s_dt = max(s_dt, now.replace(second=0, microsecond=0))          # never offer a slot in the past
         if e_dt <= s_dt:
             raise CalendarError("The range is entirely in the past, or end is not after start.")
@@ -1425,6 +1501,7 @@ class CalendarService:
             "notice": UNTRUSTED_NOTICE,
             "now": datetime.now(tz).replace(microsecond=0).isoformat(),
             "timezone": str(tz),
+            "range": {"start": s_dt.isoformat(), "end": e_dt.isoformat()},
             "duration_minutes": int(duration_minutes),
             "hours": f"{day_start}-{day_end}",
             "free_slots": [{"start": a.isoformat(), "end": b.isoformat(), "minutes": int((b - a).total_seconds() // 60)}

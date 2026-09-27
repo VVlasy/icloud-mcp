@@ -110,7 +110,8 @@ def test_starting_within_minutes_is_a_window_from_now(calsvc):
     got = svc.list_events(starting_within_minutes=60)
     assert [e["uid"] for e in got["events"]] == ["soon"]
     with pytest.raises(CalendarError, match="starting_within_minutes"):
-        svc.list_events()
+        svc.list_events(starting_within_minutes=0)
+    assert svc.list_events()["range"]["start"][11:19] == "00:00:00"     # no window and no dates: today (it used to fail)
 
 
 def test_create_reports_conflicts_counting_travel_and_duplicates(calsvc):

@@ -114,6 +114,49 @@ def test_find_free_time_filters_weekdays_and_validates_input(cal):
         cal.find_free_time("2001-01-01", "2001-01-02", 60)
 
 
+def test_read_ranges_default_and_take_relative_days(s, monkeypatch):
+    """No dates, a start alone, or a search without dates read a sensible range (echoed), where before they failed; given
+    ISO bounds read exactly what they did, and the caps still apply after the defaults."""
+    svc = CalendarService(s)
+    seen = []
+    monkeypatch.setattr(CalendarService, "_principal", lambda self: contextlib.nullcontext(object()))
+    monkeypatch.setattr(CalendarService, "_occurrences",
+                        lambda self, p, calendar, s_dt, e_dt, not_read=None, skipped=None: seen.append((s_dt, e_dt)) or iter([]))
+    days = {datetime.now(TZ).date() for _ in "xx"}                             # either side of a midnight during the test
+
+    def span(**kw):
+        return svc.list_events(**kw)["range"]
+    midnight = lambda d: datetime(d.year, d.month, d.day, tzinfo=TZ).isoformat()   # noqa: E731
+    today = span()
+    assert any(today == {"start": midnight(d), "end": midnight(d + timedelta(days=1))} for d in days)
+    assert span(start="today", end="today") == today and span(start="today") == today
+    assert span(start="2030-03-04") == span(start="2030-03-04", end="2030-03-04")      # a date alone: that whole day
+    assert span(start="2030-03-04T15:00") == {"start": "2030-03-04T15:00:00+01:00", "end": "2030-03-05T00:00:00+01:00"}
+    assert span(start="2030-03-04", end="2030-03-10T12:00") == {"start": "2030-03-04T00:00:00+01:00",
+                                                                "end": "2030-03-10T12:00:00+01:00"}   # ISO exactly as before
+    search = span(query="dentist")
+    assert any(search == {"start": midnight(d), "end": midnight(d + timedelta(days=61))} for d in days)
+    assert span(needs_reply=True) == search
+    week = span(start="tomorrow", end="+7d")
+    assert any(week == {"start": midnight(d + timedelta(days=1)), "end": midnight(d + timedelta(days=8))} for d in days)
+    with pytest.raises(CalendarError, match="Range too large"):
+        svc.list_events("-400d", "+401d")
+    with pytest.raises(CalendarError, match="end must be after start"):
+        svc.list_events("today", "yesterday")
+    with pytest.raises(CalendarError, match="today, tomorrow"):
+        svc.list_events("next friday")
+
+    free = svc.find_free_time(None, None, 30)
+    s_dt, e_dt = seen[-1]
+    assert e_dt - s_dt <= timedelta(days=14) and e_dt - datetime.now(TZ) > timedelta(days=13, hours=23)
+    assert free["range"] == {"start": s_dt.isoformat(), "end": e_dt.isoformat()}
+    ahead = svc.find_free_time("tomorrow", "+3d", 30)["range"]
+    assert any(ahead == {"start": midnight(d + timedelta(days=1)), "end": midnight(d + timedelta(days=4))} for d in days)
+    assert svc.find_free_time("2030-03-04", None, 30)["range"]["end"] == "2030-03-18T00:00:00+01:00"
+    with pytest.raises(CalendarError, match="Range too large"):
+        svc.find_free_time("today", "+70d", 30)
+
+
 # ------------------------------------------------------------------ safe retries on create
 def test_retry_uid_is_stable_per_account_and_request():
     assert retry_uid("me@icloud.com", "lunch-1") == retry_uid("ME@icloud.com", "lunch-1")

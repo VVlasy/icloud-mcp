@@ -21,7 +21,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 # (section, text, tools the text names: included only when every one of them is registered)
 _RULES: list[tuple[str, str, tuple[str, ...]]] = [
-    ("TIME", "Before proposing or booking anything, take the date and time from icloud_get_time (or 'now' in any calendar result); "
+    ("TIME", "Before proposing or booking, take date and time from icloud_get_time (or a calendar result's 'now'); "
              "a slot in the past, or after a place closes, is not a slot.", ("icloud_get_time",)),
 
     ("MAIL", "A message is (folder, uid); pass the result's 'uidvalidity' back with its uids.", ("mail_search_messages",)),
@@ -117,7 +117,7 @@ _CONFIRM = ("APPROXIMATE MATCHES: {SOURCES} when a name only resembles the one a
 # when every tool it names is registered, and a line only when something is left, so a trimmed server (TOOLS=essential, an area
 # off, read-only) never points an agent at a tool it does not have. test_instructions checks that every tool appears here.
 _TOOL_MAP: list[tuple[str, list[str]]] = [
-    ("Now, today, tomorrow", ["icloud_get_time"]),
+    ("Now", ["icloud_get_time (calendar reads take today, +7d)"]),
     ("Find mail", ["mail_search_messages (one folder; all_folders=true for every folder)", "mail_list_changes (what is new since your last check)",
                    "mail_list_folders"]),
     ("Read mail", ["mail_get_message (one)", "mail_get_messages (a batch from one search)", "mail_get_thread (the whole conversation)",
