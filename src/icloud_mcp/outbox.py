@@ -32,18 +32,19 @@ class QueuedMessage:
     recipients: list[str]
     followup: dict[str, Any] | None   # e.g. {"folder": "INBOX", "uid": 7, "flag": "\\Answered"} applied after a successful send
     sha256: str
+    key: str | None = None            # what the message was made from (e.g. one saved draft), so asking again finds this entry
 
     def to_json(self) -> dict[str, Any]:
         return {"id": self.id, "created_at": self.created_at, "expires_at": self.expires_at,
                 "raw": base64.b64encode(self.raw).decode(), "recipients": self.recipients,
-                "followup": self.followup, "sha256": self.sha256}
+                "followup": self.followup, "sha256": self.sha256, **({"key": self.key} if self.key else {})}
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "QueuedMessage":
         raw = base64.b64decode(d["raw"])
         if hashlib.sha256(raw).hexdigest() != d["sha256"]:
             raise ValueError("outbox entry failed its integrity check")
-        return cls(d["id"], d["created_at"], d["expires_at"], raw, list(d["recipients"]), d.get("followup"), d["sha256"])
+        return cls(d["id"], d["created_at"], d["expires_at"], raw, list(d["recipients"]), d.get("followup"), d["sha256"], d.get("key"))
 
 
 class Outbox:
@@ -87,19 +88,21 @@ class Outbox:
         self._items = {k: v for k, v in self._items.items() if v.expires_at > now}
 
     # -- operations ------------------------------------------------------------
-    def add(self, raw: bytes, recipients: list[str], followup: dict[str, Any] | None = None) -> QueuedMessage:
+    def add(self, raw: bytes, recipients: list[str], followup: dict[str, Any] | None = None, key: str | None = None) -> QueuedMessage:
+        """Queue a message, or return the entry already waiting for the same bytes or the same key. A key names what the message
+        was built from (one saved draft), for when rebuilding it gives different bytes (a fresh Date or Message-ID)."""
         with self._lock:
             self._prune()
             sha = hashlib.sha256(raw).hexdigest()
-            same = next((q for q in self._items.values() if q.sha256 == sha), None)
-            if same is not None:                 # the exact same message is already waiting: one entry, not two
+            same = next((q for q in self._items.values() if q.sha256 == sha or (key is not None and q.key == key)), None)
+            if same is not None:                 # the same message is already waiting: one entry, not two
                 return same
             if len(self._items) >= self.max_items:
                 raise OutboxFull(f"{len(self._items)} messages are already waiting for owner approval (OUTBOX_MAX={self.max_items}). "
                                  "Nothing was queued. Do not retry: tell the owner to review the queue on the /outbox page, "
                                  "where they can send or discard what is waiting.")
             now = time.time()
-            q = QueuedMessage(secrets.token_urlsafe(12), now, now + self.ttl, raw, recipients, followup, sha)
+            q = QueuedMessage(secrets.token_urlsafe(12), now, now + self.ttl, raw, recipients, followup, sha, key)
             self._items[q.id] = q
             self._save()
             return q

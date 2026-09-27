@@ -546,8 +546,9 @@ case "reminder_list_update":
     printJSON(["id": list.calendarIdentifier, "from": old, "name": list.title])
 
 case "reminder_list_delete":
-    // Reminders has no trash: deleting a list deletes every reminder in it for good. The server previews first and passes
-    // delete_reminders only with the owner's confirmation; this refuses anything else.
+    // Reminders has no trash: deleting a list deletes every reminder in it for good. The server previews first (preview: the
+    // count of every reminder in the list, of any age, done or not, and a sample) and passes delete_reminders, with the count the
+    // owner confirmed as expected, only after the owner's yes; this refuses anything else.
     ensureAccess()
     guard let id = args["list_id"] as? String, let name = args["name"] as? String else { fail("list_id and name are required") }
     let list = findList(id: id, name: nil)
@@ -556,8 +557,16 @@ case "reminder_list_delete":
         fail("'\(list.title)' is the default list for new reminders, so it is not deleted")
     }
     guard list.allowsContentModifications else { fail("the list '\(list.title)' is read-only") }
-    let count = fetch(store.predicateForReminders(in: [list])).count
+    let items = fetch(store.predicateForReminders(in: [list]))
+    let count = items.count
+    if (args["preview"] as? Bool) == true {
+        printJSON(["preview": true, "name": list.title, "reminders": count, "sample": items.prefix(3).map { $0.title ?? "" }])
+        exit(0)
+    }
     if count > 0 && (args["delete_reminders"] as? Bool) != true { fail("the list holds \(count) reminders; nothing was deleted") }
+    if let expected = args["expected"] as? Int, expected != count {
+        fail("the list holds \(count) reminders now, not the \(expected) that were confirmed; nothing was deleted")
+    }
     do { try store.removeCalendar(list, commit: true) } catch { fail("could not delete the list: \(error.localizedDescription)") }
     printJSON(["deleted": true, "name": list.title, "reminders_deleted": count])
 

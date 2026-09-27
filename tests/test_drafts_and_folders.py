@@ -89,12 +89,13 @@ class FakeIMAP:
         del self.folders[name]
 
 
-def draft_bytes(bcc=True):
+def draft_bytes(bcc=True, stamped=True):
     m = EmailMessage()
     m["From"], m["To"], m["Subject"] = "Me <me@icloud.com>", "Anna <anna@example.org>", "Lunch"
     if bcc:
         m["Bcc"] = "boss@example.org"
-    m["Message-ID"], m["Date"] = "<d1@example.org>", "Thu, 24 Sep 2026 10:00:00 +0200"
+    if stamped:                                    # some mail apps save drafts with no Message-ID or Date
+        m["Message-ID"], m["Date"] = "<d1@example.org>", "Thu, 24 Sep 2026 10:00:00 +0200"
     m.set_content("Hi Anna,\n\nFriday?\n\nMe")
     m.add_attachment(b"%PDF-1.4 x", maintype="application", subtype="pdf", filename="menu.pdf")
     return m.as_bytes(policy=policy.SMTP)
@@ -159,6 +160,32 @@ def test_approval_and_local_mode_apply_to_drafts_too(env, monkeypatch):
     assert r["status"] == "queued_for_owner_approval" and not sent and imap.folders["Drafts"] == [uid]   # draft stays until release
     svc.s = dataclasses.replace(svc.s, local_mode=True)
     assert svc.send_draft(uid, uidvalidity=7)["status"] == "already_a_draft"
+
+
+def test_sending_the_same_draft_twice_for_approval_queues_it_once(env):
+    # A draft saved without Message-ID or Date gets fresh ones on every send_draft, so the bytes differ each time: the outbox
+    # used to hold two copies, and the owner could release both.
+    svc, imap, sent = env
+    uid = imap.add("Drafts", draft_bytes(stamped=False), (b"\\Draft",))
+    svc.s = dataclasses.replace(svc.s, require_approval=True)
+    first = svc.send_draft(uid, uidvalidity=7)
+    again = svc.send_draft(uid, uidvalidity=7)
+    assert len(svc.outbox.pending()) == 1 and not sent
+    assert again["outbox_id"] == first["outbox_id"] and again["already_queued"] is True and "already_queued" not in first
+    assert again["message_id"] == first["message_id"] and again["subject"] == "Lunch" and again["to"] == first["to"]
+    assert 0 < again["expires_in_seconds"] <= first["expires_in_seconds"]
+    changed = svc.update_draft(uid, uidvalidity=7, subject="Lunch on Friday")["uid"]  # a changed draft is a new message
+    other = svc.send_draft(changed, uidvalidity=7)
+    assert other["outbox_id"] != first["outbox_id"] and len(svc.outbox.pending()) == 2
+
+
+def test_a_draft_with_its_own_message_id_is_also_reported_as_already_queued(env):
+    svc, imap, sent = env
+    uid = imap.add("Drafts", draft_bytes(), (b"\\Draft",))
+    svc.s = dataclasses.replace(svc.s, require_approval=True)
+    first, again = svc.send_draft(uid, uidvalidity=7), svc.send_draft(uid, uidvalidity=7)
+    assert again["outbox_id"] == first["outbox_id"] and again["already_queued"] is True and len(svc.outbox.pending()) == 1
+    assert again["message_id"] == "<d1@example.org>" and not sent
 
 
 def test_updating_a_draft_keeps_what_was_not_changed_and_never_loses_it(env):

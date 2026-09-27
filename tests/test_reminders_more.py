@@ -62,20 +62,65 @@ def test_completed_reminders_are_asked_for_only_when_wanted(s):
     assert seen == [("reminders_list", {"limit": 50, "completed": "only", "completed_since": "2026-09-01"})]
 
 
+def list_helper(count, titles=("Milk", "Eggs")):
+    """A fake Mac for reminders_delete_list: the preview counts the list itself; reminders_list (which only sees active reminders
+    and those done in the last 30 days) finds nothing, as for a list holding only reminders completed long ago."""
+    def answer(op, a):
+        if op == "reminder_list_delete" and a.get("preview"):
+            return {"preview": True, "name": a["name"], "reminders": count(), "sample": list(titles)[:3]}
+        if op == "reminder_list_delete":
+            return {"deleted": True, "name": a["name"], "reminders_deleted": count()}
+        return {"reminders": []}
+    return answer
+
+
 def test_deleting_a_list_with_reminders_needs_the_preview_token(s):
-    items = {"reminders": [{"id": "a", "title": "Milk"}, {"id": "b", "title": "Eggs"}]}
-    answer = lambda op, a: items if op == "reminders_list" else {"deleted": True}              # noqa: E731
+    answer = list_helper(lambda: 2)
     out, seen = run(s, "reminders_delete_list", {"list_id": "L1", "name": "Groceries"}, answer)
     assert out["deleted"] is False and out["reminders"] == 2 and out["sample"] == ["Milk", "Eggs"] and out["confirm_token"]
-    assert [op for op, _ in seen] == ["reminders_list"]                                          # nothing deleted yet
+    assert seen == [("reminder_list_delete", {"list_id": "L1", "name": "Groceries", "preview": True})]    # nothing deleted yet
     done, seen = run(s, "reminders_delete_list", {"list_id": "L1", "name": "Groceries", "confirm_token": out["confirm_token"]}, answer)
-    assert seen[-1] == ("reminder_list_delete", {"list_id": "L1", "name": "Groceries", "delete_reminders": True})
+    assert seen[-1] == ("reminder_list_delete", {"list_id": "L1", "name": "Groceries", "delete_reminders": True, "expected": 2})
     from mcp.server.mcpserver.exceptions import ToolError
     with pytest.raises(ToolError, match="confirm_token"):                                        # a bad token deletes nothing
         run(s, "reminders_delete_list", {"list_id": "L1", "name": "Groceries", "confirm_token": "1.forged"}, answer)
-    empty = lambda op, a: {"reminders": []} if op == "reminders_list_reminders" else {"deleted": True}     # noqa: E731
-    _, seen = run(s, "reminders_delete_list", {"list_id": "L2", "name": "Empty"}, empty)
-    assert seen[-1] == ("reminder_list_delete", {"list_id": "L2", "name": "Empty", "delete_reminders": False})
+    _, seen = run(s, "reminders_delete_list", {"list_id": "L2", "name": "Empty"}, list_helper(lambda: 0, ()))
+    assert seen[-1] == ("reminder_list_delete", {"list_id": "L2", "name": "Empty", "delete_reminders": False, "expected": 0})
+
+
+def test_a_list_of_only_long_done_reminders_is_previewed_not_treated_as_empty(s):
+    # reminders_list sees nothing here; the old preview called the list empty and asked the Mac to delete it without
+    # delete_reminders, which the Mac refused ("the list holds 4 reminders"), so the list could never be deleted.
+    answer = list_helper(lambda: 4, ("Old 1", "Old 2", "Old 3", "Old 4"))
+    out, seen = run(s, "reminders_delete_list", {"list_id": "L1", "name": "Archive"}, answer)
+    assert out["deleted"] is False and out["reminders"] == 4 and out["sample"] == ["Old 1", "Old 2", "Old 3"]
+    assert "reminders_list" not in [op for op, _ in seen]
+    done, seen = run(s, "reminders_delete_list", {"list_id": "L1", "name": "Archive", "confirm_token": out["confirm_token"]}, answer)
+    assert seen[-1] == ("reminder_list_delete", {"list_id": "L1", "name": "Archive", "delete_reminders": True, "expected": 4})
+    assert done["deleted"]["reminders_deleted"] == 4
+
+
+def test_the_preview_count_is_not_capped_and_binds_the_token(s):
+    n = {"v": 350}
+    answer = list_helper(lambda: n["v"])
+    out, _ = run(s, "reminders_delete_list", {"list_id": "L1", "name": "Big"}, answer)
+    assert out["reminders"] == 350                                                               # not 200
+    n["v"] = 351                                                                                 # one more since the preview
+    from mcp.server.mcpserver.exceptions import ToolError
+    with pytest.raises(ToolError, match="changed since the preview"):
+        run(s, "reminders_delete_list", {"list_id": "L1", "name": "Big", "confirm_token": out["confirm_token"]}, answer)
+    n["v"] = 350
+    _, seen = run(s, "reminders_delete_list", {"list_id": "L1", "name": "Big", "confirm_token": out["confirm_token"]}, answer)
+    assert seen[-1][1]["expected"] == 350
+
+
+def test_the_list_delete_preview_needs_a_helper_that_counts_the_list():
+    b = MacBridge(timeout=1)
+    b.next_job({"version": "0.7.0"}, 0)
+    with pytest.raises(BridgeError, match="preview on reminder_list_delete needs 0.8.0 or newer"):
+        b.call("reminder_list_delete", {"list_id": "L1", "name": "x", "preview": True})
+    with pytest.raises(BridgeError, match="expected on reminder_list_delete needs 0.8.0 or newer"):
+        b.call("reminder_list_delete", {"list_id": "L1", "name": "x", "delete_reminders": True, "expected": 3})
 
 
 def test_an_older_helper_is_told_to_update_for_new_arguments():

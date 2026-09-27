@@ -149,6 +149,15 @@ def test_creating_folders_is_idempotent(drive):
     fails(drive, "drive_mkdir", {"path": "notes.md"}, "file with that name")
 
 
+@pytest.mark.parametrize("path", ["notes.md/sub", "notes.md/a/b", "Documents/Tax/2025.txt/2026"])
+def test_a_file_in_the_way_of_a_new_folder_is_named_not_a_crash(drive, path):
+    file = path.split(".txt")[0] + ".txt" if ".txt" in path else "notes.md"
+    out = fails(drive, "drive_mkdir", {"path": path}, f"'{file}' is a file, not a folder")
+    assert "Traceback" not in out and "nothing was created" in out
+    out = fails(drive, "drive_write", {"path": path + "/x.txt", "content": "x"}, f"'{file}' is a file, not a folder")
+    assert "Traceback" not in out
+
+
 def test_moving_renames_or_moves_into_a_folder_and_never_overwrites(drive):
     root, _ = drive
     assert ok(drive, "drive_move", {"path": "notes.md", "to": "ideas.md"})["to"] == "ideas.md"
