@@ -332,7 +332,7 @@ def test_a_tool_call_with_no_helper_says_so_plainly(s):
             await mcp.call_tool("reminders_list_lists", {})
         status = await mcp.call_tool("icloud_get_helper_status", {})
         return status.content[0].text
-    assert '"online": false' in asyncio.run(go())
+    assert json.loads(asyncio.run(go()))["online"] is False
 
 
 def test_reminders_list_passes_the_new_arguments_and_shapes_the_answer(s):
@@ -389,6 +389,27 @@ def test_drive_tools_pass_exactly_the_given_arguments_to_the_mac(s):
     assert seen[-1] == ("drive_move", {"path": "a.txt", "to": "A"})
     asyncio.run(go("drive_write_file", {"path": "n.md", "content": "x"}, {}))
     assert seen[-1] == ("drive_write", {"path": "n.md", "content": "x"})                           # overwrite not sent unless true
+
+
+def test_drive_listings_leave_out_what_the_folder_already_says(s):
+    seen = []
+
+    async def go(tool, args, answer):
+        mcp, _ = create_server(dataclasses.replace(s, enable_drive=True))
+        mcp._icloud_bridge.call = lambda op, a=None: seen.append((op, a)) or answer
+        return json.loads((await mcp.call_tool(tool, args)).content[0].text)
+    items = [{"path": "Docs/Tax", "name": "Tax", "type": "folder", "modified": "2026-09-20T10:00:00.123456Z"},
+             {"path": "Docs/a.pdf", "name": "a.pdf", "type": "file", "modified": "2026-09-20T10:00:00Z", "bytes": 5, "offloaded": False},
+             {"path": "Docs/b.pdf", "name": "b.pdf", "type": "file", "modified": "2026-09-20T10:00:00.5+00:00", "bytes": 7, "offloaded": True}]
+    out = asyncio.run(go("drive_list_folder", {"path": "Docs"}, {"path": "Docs", "count": 3, "truncated": False, "items": items}))
+    assert out["items"] == [{"name": "Tax", "type": "folder", "modified": "2026-09-20T10:00:00Z"},
+                            {"name": "a.pdf", "type": "file", "modified": "2026-09-20T10:00:00Z", "bytes": 5},
+                            {"name": "b.pdf", "type": "file", "modified": "2026-09-20T10:00:00+00:00", "bytes": 7, "offloaded": True}]
+    root = [{"path": "a.txt", "name": "a.txt", "type": "file", "bytes": 1}, {"path": "Other/x.txt", "name": "x.txt", "type": "file"}]
+    out = asyncio.run(go("drive_list_folder", {}, {"path": "", "count": 2, "truncated": False, "items": root}))
+    assert "path" not in out["items"][0] and out["items"][1]["path"] == "Other/x.txt"               # kept when it says more
+    out = asyncio.run(go("drive_search_files", {"query": "a"}, {"query": "a", "count": 1, "items": [dict(items[1])]}))
+    assert out["items"] == [{"path": "Docs/a.pdf", "type": "file", "modified": "2026-09-20T10:00:00Z", "bytes": 5, "offloaded": False}]
 
 
 def test_instructions_mention_drive_only_when_enabled(s):

@@ -8,6 +8,7 @@ from email import policy
 import caldav
 import pytest
 
+import caldav_fakes
 import icloud_mcp.cal as cal_mod
 import icloud_mcp.mail as mail_mod
 import icloud_mcp.server as server_mod
@@ -84,9 +85,6 @@ class Principal:
     def __init__(self, client):
         self.client, self.url = client, "https://caldav.example/1/principal/"
 
-    def calendars(self):
-        return [Cal(self.client, n) for n in DATA]
-
 
 class DAV:
     made = []
@@ -96,10 +94,16 @@ class DAV:
         DAV.made.append(self)
         self.log = DAV.log
 
-    def principal(self):
+    def principal(self, url=None):
         return Principal(self)
 
-    def calendar(self, url):
+    def propfind(self, url, props=None, depth=0):
+        home = "https://caldav.example/1/calendars/"
+        if depth == 1:
+            return caldav_fakes.calendar_list(home, [Cal(self, n) for n in DATA])
+        return caldav_fakes.home_set(url, home) if props else caldav_fakes.Reply([])
+
+    def calendar(self, url, name=None):
         return Cal(self, next(n for n in DATA if url.endswith(f"/{n.lower()}/")))
 
     def close(self):
@@ -154,8 +158,8 @@ def test_limit_is_applied_before_events_are_converted(cal, monkeypatch):
 def test_summary_fields_and_capped_descriptions(cal, monkeypatch):
     compact = cal.list_events("2026-10-05", "2026-10-08", fields="summary")["events"][0]
     assert set(compact) <= {"uid", "calendar", "summary", "start", "end", "all_day", "location", "status", "has_attendees"}
-    assert {"uid", "calendar", "summary", "start", "end", "all_day", "has_attendees"} <= set(compact)   # empty ones left out
-    assert compact["has_attendees"] is True
+    assert {"uid", "calendar", "summary", "start", "end", "has_attendees"} <= set(compact)   # empty ones left out
+    assert compact["has_attendees"] is True and "all_day" not in compact                     # flags only when true
     long = "x" * 5000
     monkeypatch.setitem(DATA, "Health", [("h1", 5)])
     real_ics = ics
@@ -164,6 +168,25 @@ def test_summary_fields_and_capped_descriptions(cal, monkeypatch):
     e = out["events"][0]
     assert len(e["description"]) == cal_mod._DESCRIPTION_CHARS and e["description_truncated"] is True
     assert "calendar_get_event" in out["hint"]
+
+
+def test_every_listed_occurrence_of_a_series_says_so_in_both_modes():
+    """Expanded occurrences carry no RRULE: without a marker an agent would edit or delete the whole series."""
+    import icalendar
+    series = ("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:s\r\nDTSTAMP:20260901T000000Z\r\n"
+              "DTSTART;VALUE=DATE:20261005\r\nSUMMARY:Standup\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\n"
+              "BEGIN:VEVENT\r\nUID:s\r\nDTSTAMP:20260901T000000Z\r\nRECURRENCE-ID;VALUE=DATE:20261006\r\n"
+              "DTSTART;VALUE=DATE:20261009\r\nSUMMARY:Standup moved\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+    comps = cal_mod._between(icalendar.Calendar.from_ical(series).walk("VEVENT"), datetime(2026, 10, 1).astimezone(),
+                             datetime(2026, 10, 12).astimezone())
+    single = icalendar.Calendar.from_ical(ics("x", BASE, "One-off")).walk("VEVENT")[0]
+    for fields in ("full", "summary"):
+        listed = {e["start"]: e for e in (CalendarService._listed(c, "Home", fields) for c in comps)}
+        assert listed["2026-10-05"]["recurring"] is True and "recurrence_id" not in listed["2026-10-05"]
+        assert listed["2026-10-09"]["recurrence_id"] == "2026-10-06" and "recurring" not in listed["2026-10-09"]
+        assert all(e["all_day"] is True for e in listed.values())
+        one = CalendarService._listed(single, "Home", fields)
+        assert not {"recurring", "recurrence_id", "all_day"} & set(one)
 
 
 def test_find_asks_every_calendar_at_once_then_reads_on_its_own_connection(cal):

@@ -67,6 +67,38 @@ def test_health_reports_each_area_and_never_raises(s, monkeypatch):
     assert "contacts" not in payload["areas"] and all("ms" in a for a in payload["areas"].values())
 
 
+def test_health_checks_run_at_once_in_a_stable_order_with_the_callers_stage_holder(s, monkeypatch):
+    import threading
+    import time
+
+    from icloud_mcp import callctx
+    from icloud_mcp.contacts import ContactsService
+
+    seen, started = {}, threading.Barrier(3, timeout=5)            # each check waits for the others: they must run at once
+
+    def check(area, result):
+        def run(self, *a, **kw):
+            started.wait()
+            seen[area] = (callctx.current(), threading.current_thread().name)
+            callctx.stage(f"checking {area}")
+            time.sleep({"mail": 0.2, "calendar": 0, "contacts": 0.1}[area])
+            return result
+        return run
+    monkeypatch.setattr(MailService, "health", check("mail", {"inbox_messages": 1}))
+    monkeypatch.setattr(CalendarService, "list_calendars", check("calendar", []))
+    monkeypatch.setattr(ContactsService, "search", check("contacts", {"total_matches": 0}))
+    mcp, _ = create_server(s)
+    holder = {"stage": None}
+    callctx.begin(holder)
+    try:
+        report = mcp._icloud_health()
+    finally:
+        callctx.begin(None)
+    assert list(report["areas"]) == ["mail", "calendar", "contacts"] and report["ok"]
+    assert all(h is holder for h, _ in seen.values()) and holder["stage"].startswith("checking ")
+    assert len({name for _, name in seen.values()}) == 3 and all(name.startswith("icloud-health") for _, name in seen.values())
+
+
 # ------------------------------------------------------------------ Keychain
 class FakeRun:
     def __init__(self, stdout="", code=0):

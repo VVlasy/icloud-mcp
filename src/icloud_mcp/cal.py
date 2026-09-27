@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import ipaddress
 import logging
 import re
 import threading
@@ -12,15 +13,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email.utils import getaddresses
 from typing import Any, Iterator
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urljoin, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import caldav
 from caldav.elements import dav as dav_elements
 import icalendar
+import recurring_ical_events
 
 from . import callctx
-from .config import Settings
+from .config import CONNECT_TIMEOUT, DAV_PING_TIMEOUT, READ_TIMEOUT, Settings
 from .keepalive import TICKER
 from .safety import compact, confirm_problem, warnings_for
 from .safety import confirm_token as make_confirm_token
@@ -60,6 +62,25 @@ def parse_when(value: str, tz: ZoneInfo) -> tuple[date | datetime, bool]:
     except ValueError as e:
         raise CalendarError(f"Could not parse '{value}'. Use ISO 8601, e.g. 2026-09-21 or 2026-09-21T14:30.") from e
     return (dt.replace(tzinfo=tz) if dt.tzinfo is None else dt.astimezone(tz)), False
+
+
+_RELATIVE_DAY = re.compile(r"^(today|tomorrow|yesterday|[+-]\d{1,3}d)$", re.I)
+
+
+def parse_range_bound(value: str, tz: ZoneInfo, *, now: datetime | None = None) -> tuple[date | datetime, bool]:
+    """A read range bound (calendar_list_events, calendar_find_free_time): today, tomorrow, yesterday or +Nd / -Nd (days
+    from today in tz, |N| <= 800) as a whole date, anything else as parse_when. Writes keep parse_when: a booked date is
+    one the owner can see."""
+    v = value.strip().lower()
+    if not _RELATIVE_DAY.match(v):
+        try:
+            return parse_when(value, tz)
+        except CalendarError as e:
+            raise CalendarError(f"{e} Or today, tomorrow, yesterday, +7d, -3d.") from e
+    n = {"today": 0, "tomorrow": 1, "yesterday": -1}.get(v)
+    if n is None and abs(n := int(v[:-1])) > 800:
+        raise CalendarError(f"'{value}' is too far: use at most +800d.")
+    return (now or datetime.now(tz)).astimezone(tz).date() + timedelta(days=n), True
 
 
 def _as_dt(v: date | datetime, tz: ZoneInfo) -> datetime:
@@ -527,25 +548,61 @@ def _same_instant(a: Any, b: Any) -> bool:
 _MAX_PER_DAY = 48      # more occurrences a day than this (every 30 minutes) is never a real plan, and expanding it can hang a read
 
 
+def _rule_parts(rule: Any) -> list[dict[str, list[Any]]]:
+    """Each repeat rule (text or icalendar vRecur, one or several) as {PART: [values]}. Raises when one cannot be read."""
+    out = []
+    for r in (rule if isinstance(rule, list) else [rule]):
+        rec = icalendar.vRecur.from_ical(r) if isinstance(r, str) else r
+        out.append({str(k).upper(): (v if isinstance(v, list) else [v]) for k, v in dict(rec).items()})
+    return out
+
+
+def _per_day(parts: dict[str, list[Any]]) -> int:
+    """Occurrences a day of an hourly or daily rule: BYSECOND x BYMINUTE x BYHOUR (every hour for an hourly one)."""
+    per_hour = len(parts.get("BYMINUTE", [0])) * len(parts.get("BYSECOND", [0]))
+    return per_hour * (24 if str(parts.get("FREQ", [""])[0]).upper() == "HOURLY" else len(parts.get("BYHOUR", [0])))
+
+
 def too_frequent(rule: Any) -> bool:
     """Whether a repeat rule (text or icalendar vRecur, one or several) would produce more than _MAX_PER_DAY occurrences a
     day: FREQ finer than hourly, or BYSECOND / BYMINUTE / BYHOUR lists that multiply an hourly or daily rule up. Unreadable
     rules count as too frequent: they are never expanded."""
-    rules = rule if isinstance(rule, list) else [rule]
-    for r in rules:
-        try:
-            rec = icalendar.vRecur.from_ical(r) if isinstance(r, str) else r
-            parts = {str(k).upper(): (v if isinstance(v, list) else [v]) for k, v in dict(rec).items()}
-            freq = str(parts.get("FREQ", [""])[0]).upper()
-            if freq in ("SECONDLY", "MINUTELY"):
+    try:
+        for parts in _rule_parts(rule):
+            if str(parts.get("FREQ", [""])[0]).upper() in ("SECONDLY", "MINUTELY") or _per_day(parts) > _MAX_PER_DAY:
                 return True
-            per_hour = len(parts.get("BYMINUTE", [0])) * len(parts.get("BYSECOND", [0]))
-            hours = 24 if freq == "HOURLY" else len(parts.get("BYHOUR", [0]))
-            if per_hour * hours > _MAX_PER_DAY:
-                return True
-        except Exception:  # noqa: BLE001 - a rule we cannot read is not expanded
-            return True
+    except Exception:  # noqa: BLE001 - a rule we cannot read is not expanded
+        return True
     return False
+
+
+_MAX_STEPS = 100_000   # expansion walks from DTSTART: hourly since 2016 is ~88k steps (~0.3 s CPU), daily since 1900 ~46k
+_DAY_LISTS = ("BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYSETPOS")
+
+
+def series_too_costly(rule: Any, dtstart: Any, window_end: Any) -> bool:
+    """Whether expanding a series up to window_end walks more than _MAX_STEPS occurrences. Expansion starts at DTSTART, so a
+    stranger's hourly invitation dated 1900 costs seconds of CPU on every read that covers it, though no day has too many.
+    Per rule: min(COUNT, occurrences a day x days from DTSTART to UNTIL or window_end); weekly, monthly and yearly rules count
+    as daily when they list days, else once per period. Unreadable input counts as too costly: it is never expanded."""
+    try:
+        first = dtstart.date() if isinstance(dtstart, datetime) else dtstart
+        steps = 0.0
+        for parts in _rule_parts(rule):
+            last = window_end.date() if isinstance(window_end, datetime) else window_end
+            if (until := parts.get("UNTIL", [None])[0]) is not None:
+                last = min(last, until.date() if isinstance(until, datetime) else until)
+            period = {"WEEKLY": 7, "MONTHLY": 28, "YEARLY": 365}.get(str(parts.get("FREQ", [""])[0]).upper(), 1)
+            per_day = _per_day(parts) / (1 if any(k in parts for k in _DAY_LISTS) else period)
+            est = per_day * max(0, (last - first).days + 1) / max(1, int(parts.get("INTERVAL", [1])[0]))
+            steps += min(est, int(parts["COUNT"][0])) if "COUNT" in parts else est
+        return steps > _MAX_STEPS
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _risky(rule: Any, dtstart: Any, window_end: Any) -> bool:
+    return too_frequent(rule) or series_too_costly(rule, dtstart, window_end)
 
 
 def parse_rrule(text: str) -> icalendar.vRecur:
@@ -562,38 +619,51 @@ def parse_rrule(text: str) -> icalendar.vRecur:
     return rec
 
 
-_SKIPPED_NOTE = ("series that repeat more than 48 times a day (usually spam invitations) were left unexpanded: only their "
-                 "dated exceptions are included. The rest of the result is complete.")
+_SKIPPED_NOTE = ("series too costly to expand (more than 48 times a day, or very often for decades; usually spam invitations) were "
+                 "left unexpanded: only their dated exceptions are included. The rest of the result is complete.")
 
 
-def _search_expanded(cal: Any, s_dt: datetime, e_dt: datetime, skipped: list[int]) -> list[str]:
-    """The events of one calendar in [s_dt, e_dt), recurring ones expanded client-side. caldav's own expand=True expands
-    before we see the rule, so a stranger's invitation repeating every second would expand into millions of occurrences
-    and hang the call: fetch unexpanded (the same one REPORT), set such series aside (counted in `skipped`, never named:
-    their text is a stranger's), and let caldav expand the rest exactly as search(expand=True) would. Only the dated
-    exceptions of a set-aside series come back."""
-    objs = cal.search(start=s_dt, end=e_dt, event=True, expand=False)
-    safe, out = [], []
-    for o in objs:
-        data = o.data or ""
+def _between(comps: list[icalendar.Component], s_dt: datetime, e_dt: datetime) -> list[icalendar.Component]:
+    """recurring_ical_events' occurrences of comps in [s_dt, e_dt), on a bare calendar as caldav's own expansion builds it."""
+    wrapper = icalendar.Calendar()
+    for c in comps:
+        wrapper.add_component(c)
+    return list(recurring_ical_events.of(wrapper).between(s_dt, e_dt))
+
+
+def _overlaps(comp: icalendar.Component, s_dt: datetime, e_dt: datetime) -> bool:
+    """Whether a single event falls in [s_dt, e_dt), by the library's rules (dates, floating times, DURATION, no end)."""
+    try:
+        return bool(_between([comp], s_dt, e_dt))
+    except Exception:  # noqa: BLE001 - no readable start: left out, as readable_event would
+        return False
+
+
+def _search_expanded(cal: Any, s_dt: datetime, e_dt: datetime, skipped: list[int]) -> list[icalendar.Component]:
+    """The event components of one calendar in [s_dt, e_dt), recurring ones expanded client-side. caldav's own expand=True
+    expands before we see the rule, so a stranger's invitation repeating every second (or hourly since 1900) would expand
+    into millions of occurrences and hang the call: fetch unexpanded (the same one REPORT), parse each object once, set such
+    series aside (counted in `skipped`, never named: their text is a stranger's) and expand the rest with
+    recurring_ical_events as search(expand=True) would. Only the dated exceptions of a set-aside series come back. An
+    object without RRULE/RDATE keeps its own VEVENTs, each only when the library finds it in the range; an object that
+    cannot be read or expanded is left out (a stranger's invitation must not fail the listing)."""
+    out: list[icalendar.Component] = []
+    for o in cal.search(start=s_dt, end=e_dt, event=True, expand=False):
         try:
-            parsed = icalendar.Calendar.from_ical(data)
-        except Exception:  # noqa: BLE001 - caldav would not expand what icalendar cannot read either
-            safe.append(o)
+            parsed = icalendar.Calendar.from_ical(o.data or "")
+            risky = [c for c in parsed.walk("VEVENT") if c.get("rrule") is not None and _risky(c.get("rrule"), _dt(c, "dtstart"), e_dt)]
+            if risky:
+                skipped.append(len(risky))
+                for comp in risky:
+                    parsed.subcomponents.remove(comp)
+            events = parsed.walk("VEVENT")
+            if any(c.get("rrule") is not None or c.get("rdate") is not None for c in events):
+                out += _between(events, s_dt, e_dt)
+            else:
+                out += [c for c in events if _overlaps(c, s_dt, e_dt)]
+        except Exception:  # noqa: BLE001
             continue
-        risky = [c for c in parsed.walk("VEVENT") if c.get("rrule") is not None and too_frequent(c.get("rrule"))]
-        if not risky:
-            safe.append(o)
-            continue
-        skipped.append(len(risky))
-        for comp in risky:
-            parsed.subcomponents.remove(comp)
-        if any(c.name == "VEVENT" for c in parsed.subcomponents):
-            out.append(parsed.to_ical().decode())
-    if safe and hasattr(cal, "searcher") and hasattr(safe[0], "icalendar_instance"):
-        from caldav.search import filter_search_results
-        safe = filter_search_results(safe, cal.searcher(start=s_dt, end=e_dt, event=True, expand=True))
-    return [o.data for o in safe] + out
+    return out
 
 
 def occurs_in_series(master: icalendar.Component, rid: Any) -> bool:
@@ -612,7 +682,7 @@ def occurs_in_series(master: icalendar.Component, rid: Any) -> bool:
     if (s.tzinfo is None) != (r.tzinfo is None):
         s, r = s.replace(tzinfo=None), r.replace(tzinfo=None)
     try:
-        if too_frequent(rule):                            # a stranger's invitation could carry one; expanding it would take minutes
+        if _risky(rule, start, r):                        # a stranger's invitation could carry one; expanding it would take minutes
             return False
         text = rule.to_ical().decode()
         if s.tzinfo is None:                              # dateutil refuses an aware UNTIL with a floating start
@@ -738,7 +808,7 @@ _CACHE_SECONDS = 600  # calendar names / event support change rarely; a rename i
 _IDLE_TTL_SECONDS = 15.0
 _MAX_AGE_SECONDS = 240.0      # a connection older than this is replaced (by the keep-alive in the background, when it runs)
 _PING_AFTER_SECONDS = 10.0    # keep-alive: ping a pooled connection idle this long (the ticker runs every 3 s, so before 15 s)
-_CALENDARS_SECONDS = 120.0    # the calendar list per connection; a calendar added in the Calendar app appears within this time
+_CALENDARS_SECONDS = 120.0    # the calendar list (shared by the connections); a calendar added in the Calendar app appears within this time
 _DESCRIPTION_CHARS = 2000     # calendar_list_events cuts descriptions here; calendar_get_event returns the whole text
 # Calendars are read in parallel, each on its own pooled connection (a connection is never shared between threads).
 _READERS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="icloud-caldav")
@@ -768,14 +838,39 @@ def _is_transport_error(exc: BaseException | None) -> bool:
 # a write (a PUT or DELETE is never replayed), never on a brand-new connection, and the retry always uses a brand-new one.
 _reconnecting = callctx.retry_once_if_safe(_is_transport_error)
 
+_CALDAV_NS = "{urn:ietf:params:xml:ns:caldav}"
+_LIST_PROPS = ["{DAV:}resourcetype", "{DAV:}displayname", _CALDAV_NS + "supported-calendar-component-set"]
+
+
+def _host(url: Any) -> str:
+    return (urlsplit(str(url)).hostname or "").lower()
+
+
+def _auth_type(s: Settings) -> str | None:
+    """'basic' sends the credentials with the first request instead of waiting for a 401 (one round trip less on every new
+    connection), but only where Basic is known to be right: https to iCloud, a loopback test server, or CALDAV_AUTH=basic.
+    Anything else keeps caldav's negotiation, so Digest servers still work, and plain http to another host never gets
+    credentials unasked. caldav never renegotiates once an auth object is set."""
+    u, host = urlsplit(s.caldav_url), _host(s.caldav_url)
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback:
+        return "basic"
+    if u.scheme == "https" and (host == "icloud.com" or host.endswith(".icloud.com") or s.caldav_auth == "basic"):
+        return "basic"
+    return None
+
 
 class _Conn:
     """One logged-in CalDAV client with its principal, as held in the pool."""
-    __slots__ = ("client", "principal", "created", "last_used", "cals", "cals_at", "cals_gen")
+    __slots__ = ("client", "principal", "created", "last_used", "cals", "ev_cals", "cals_at", "cals_gen")
 
     def __init__(self, client: Any, principal: Any, now: float):
         self.client, self.principal, self.created, self.last_used = client, principal, now, now
         self.cals: list[Any] | None = None
+        self.ev_cals: list[Any] = []
         self.cals_at = 0.0
         self.cals_gen = 0
 
@@ -783,10 +878,16 @@ class _Conn:
 class CalendarService:
     def __init__(self, settings: Settings):
         self.s = settings
-        self._vevent_cache: dict[str, tuple[bool, float]] = {}
+        self._vevent_cache: dict[str, bool] = {}   # only for a calendar whose component set did not parse in the list
         self._name_cache: dict[str, tuple[str, float]] = {}
         self._cals_gen = 0                  # bumped when a calendar is created, renamed or deleted: every cached list is stale then
         self._uid_cache: dict[str, tuple[str, float]] = {}
+        # Discovery, shared by every connection: the principal and calendar-home URLs (kept for the process) and the calendar
+        # list as (href, name, holds events), read_at, gen. Only URLs and names: each connection builds its own calendar
+        # objects from them, since those are bound to the client that made them.
+        self._principal_url: str | None = None
+        self._home_url: str | None = None
+        self._cal_list: tuple[list[tuple[str, str, bool]], float, int] | None = None
         # Opening a CalDAV connection costs a TLS handshake plus the principal PROPFINDs, about 1.3 s against iCloud. Logged-in
         # connections are therefore kept in a small pool. Each is used by ONE call at a time (a requests session is not safe
         # from two threads at once), whichever worker thread runs it, and a connection whose call failed on the transport is
@@ -802,12 +903,50 @@ class CalendarService:
     def _open(self) -> _Conn:
         s = self.s
         callctx.stage("CalDAV sign-in")
-        client = caldav.DAVClient(url=s.caldav_url, username=s.caldav_username, password=s.app_password, require_tls=s.caldav_require_tls)
+        # An explicit (connect, read) timeout: without one niquests waits 30 s per read, and 120 s on a PUT or DELETE, longer
+        # than the tool timeout. Never rate_limit_handle: it sleeps and replays requests, PUTs included.
+        client = caldav.DAVClient(url=s.caldav_url, username=s.caldav_username, password=s.app_password, require_tls=s.caldav_require_tls,
+                                  auth_type=_auth_type(s), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), rate_limit_handle=False)
         try:
-            return _Conn(client, client.principal(), time.monotonic())
+            return _Conn(client, self._sign_in(client), time.monotonic())
         except Exception:
             self._close(client)
             raise
+
+    def _sign_in(self, client: Any) -> Any:
+        """The principal of a new connection. Once discovery has run, it is not repeated: one authenticated Depth:0 PROPFIND
+        on the warm-up URL checks the password (a 401 still fails here) and opens the socket the calls will use. A URL that
+        no longer answers (moved, 404, 403) is forgotten and discovery runs again, once."""
+        principal_url, warm = self._principal_url, self._warm_url()
+        if principal_url and warm:
+            try:
+                if client.propfind(warm, depth=0).status in (200, 207):
+                    return client.principal(url=principal_url)
+            except caldav.error.AuthorizationError:
+                pass                              # a 403 from a stale URL; a wrong password fails the discovery below as well
+            self._forget_discovery()
+        principal = client.principal()
+        self._principal_url = str(principal.url)
+        return principal
+
+    def _forget_discovery(self) -> None:
+        self._principal_url = self._home_url = self._cal_list = None
+
+    def _warm_url(self, conn: _Conn | None = None) -> str | None:
+        """Where the warm-up and keep-alive PROPFINDs (Depth:0) go: a URL on the host this connection's calendar and event
+        requests use, since that is the socket worth keeping open. The calendar home when the calendars live on its host.
+        caldav 3 builds calendar objects on the client's own host, so on iCloud (home on pNN-caldav.icloud.com, calendars
+        on caldav.icloud.com) the home host only serves the list refresh, and the principal is pinged instead."""
+        listed = self._cal_list[0] if self._cal_list else []
+        if conn is not None and conn.cals:
+            cal_url = str(conn.cals[0].url)
+        elif listed and "://" in listed[0][0]:
+            cal_url = listed[0][0]
+        else:
+            cal_url = None                        # relative hrefs: the calendars are on the client's host, as is the principal
+        principal = str(conn.principal.url) if conn is not None else self._principal_url
+        events_host = _host(cal_url or principal)
+        return next((u for u in (self._home_url, principal, cal_url) if u and _host(u) == events_host), None)
 
     @staticmethod
     def _close(conn_or_client: Any) -> None:
@@ -873,7 +1012,11 @@ class CalendarService:
                     self._close(conn)
                     conn = self._open()
                 else:
-                    conn.client.propfind(str(conn.principal.url), depth=0)
+                    # A short timeout, so one dead connection does not hold up the ticker's other jobs. Set only on this
+                    # popped connection, which nothing else holds, and restored before it goes back.
+                    conn.client.timeout = DAV_PING_TIMEOUT
+                    conn.client.propfind(self._warm_url(conn), depth=0)
+                    conn.client.timeout = (CONNECT_TIMEOUT, READ_TIMEOUT)
             except Exception:  # noqa: BLE001 - a dead connection is simply not put back
                 self._close(conn)
                 continue
@@ -911,6 +1054,7 @@ class CalendarService:
             else:
                 if isinstance(e, caldav.error.DAVError):
                     conn.cals = None              # the calendar list may be what is wrong
+                    self._forget_discovery()
                 self._checkin(conn)
             raise
         else:
@@ -924,7 +1068,7 @@ class CalendarService:
         key, now = str(cal.url), time.monotonic()
         hit = self._name_cache.get(key)
         if hit is None or now - hit[1] > _CACHE_SECONDS:
-            name = getattr(cal, "name", None)  # already filled in by principal.calendars(); avoids one request per calendar
+            name = getattr(cal, "name", None)  # already filled in from the calendar list; avoids one request per calendar
             if not name:
                 try:
                     name = cal.get_display_name()
@@ -933,45 +1077,117 @@ class CalendarService:
             hit = self._name_cache[key] = (name or key.rstrip("/").rsplit("/", 1)[-1], now)
         return hit[0]
 
-    def _calendars(self, principal: Any) -> list[Any]:
-        """principal.calendars(), kept for a while on the connection it was read with (calendar objects are bound to it)."""
+    def _calendar_objects(self, principal: Any) -> tuple[list[Any], list[Any]]:
+        """(every calendar, the ones that hold events) as objects of this principal's client, kept for a while on the
+        connection they were made for. They are built from the service-wide list, so a connection that has not listed
+        calendars yet costs no request."""
         conn = getattr(self._tl, "conn", None)
-        now = time.monotonic()
-        if (conn is not None and conn.principal is principal and conn.cals is not None and now - conn.cals_at < _CALENDARS_SECONDS
+        if conn is not None and conn.principal is not principal:
+            conn = None
+        if (conn is not None and conn.cals is not None and time.monotonic() - conn.cals_at < _CALENDARS_SECONDS
                 and conn.cals_gen == self._cals_gen):
-            return conn.cals
-        cals = principal.calendars()
-        if conn is not None and conn.principal is principal:
-            conn.cals, conn.cals_at, conn.cals_gen = cals, now, self._cals_gen
-        return cals
+            return conn.cals, conn.ev_cals
+        listed, read_at, gen = self._calendar_list(principal)
+        client = principal.client
+        cals = [client.calendar(url=href, name=name) for href, name, _ in listed]
+        events = [c for c, (_, _, holds) in zip(cals, listed) if holds]
+        if conn is not None:
+            conn.cals, conn.ev_cals, conn.cals_at, conn.cals_gen = cals, events, read_at, gen
+        return cals, events
+
+    def _calendars(self, principal: Any) -> list[Any]:
+        return self._calendar_objects(principal)[0]
+
+    def _event_calendars(self, principal: Any) -> list[Any]:
+        return self._calendar_objects(principal)[1]
+
+    def _calendar_list(self, principal: Any) -> tuple[list[tuple[str, str, bool]], float, int]:
+        """The service-wide calendar list, read again after _CALENDARS_SECONDS or after a calendar was created, renamed
+        or deleted (_cals_gen)."""
+        hit = self._cal_list
+        if hit is not None and time.monotonic() - hit[1] < _CALENDARS_SECONDS and hit[2] == self._cals_gen:
+            return hit
+        gen = self._cals_gen                      # taken first: a change while the list is read leaves it stale, not current
+        hit = self._cal_list = (self._read_calendar_list(principal), time.monotonic(), gen)
+        return hit
+
+    def _read_calendar_list(self, principal: Any) -> list[tuple[str, str, bool]]:
+        """One Depth:1 PROPFIND on the calendar home, asking for each collection's type, name and component set, so no
+        calendar needs a request of its own. The home URL is found once (a PROPFIND on the principal) and kept; a kept
+        one that stops answering (moved, 404, 403) is found again, once."""
+        client = principal.client
+        home, kept = self._home_url, self._home_url is not None
+        while True:
+            if home is None:
+                resp = client.propfind(str(principal.url), props=[_CALDAV_NS + "calendar-home-set"], depth=0)
+                href = next((r.properties.get(_CALDAV_NS + "calendar-home-set") for r in resp.results or []
+                             if r.properties.get(_CALDAV_NS + "calendar-home-set")), None)
+                home = urljoin(str(principal.url), href) if href else str(principal.url)   # no home set (GMX): the principal
+                if urlsplit(str(principal.url)).scheme == "https" and urlsplit(home).scheme != "https":
+                    raise CalendarError("The CalDAV server named a calendar home that is not https; not followed.")
+            try:
+                resp = client.propfind(home, props=_LIST_PROPS, depth=1)
+                status = resp.status
+            except caldav.error.AuthorizationError:
+                if not kept:
+                    raise
+                status = 403
+            if status in (200, 207):
+                break
+            if not kept:
+                raise caldav.error.PropfindError(url=home, reason=f"listing calendars failed with HTTP {status}")
+            home, kept = None, False
+        self._home_url = home
+        out = []
+        for r in resp.results or []:
+            kinds = r.properties.get("{DAV:}resourcetype") or []
+            if _CALDAV_NS + "calendar" not in (kinds if isinstance(kinds, list) else [kinds]):
+                continue                          # the home itself, and any other collection that is not a calendar
+            href = quote(unquote(r.href), safe="/@:")
+            name = r.properties.get("{DAV:}displayname") or href.rstrip("/").rsplit("/", 1)[-1]
+            comps = r.properties.get(_CALDAV_NS + "supported-calendar-component-set")
+            out.append((href, str(name), self._holds_events(client, href, comps)))
+        return out
+
+    def _holds_events(self, client: Any, href: str, comps: Any) -> bool:
+        """From the list's component set: a missing one means any component (VEVENT included). One that did not parse is
+        asked of that calendar once, and remembered (a calendar's component set is fixed when it is created)."""
+        if comps is None or comps == []:
+            return True
+        if isinstance(comps, str):
+            comps = [comps]
+        if isinstance(comps, (list, tuple)) and all(isinstance(c, str) for c in comps):
+            return "VEVENT" in {c.upper() for c in comps}
+        if href not in self._vevent_cache:
+            try:
+                found = client.calendar(url=href).get_supported_components()
+            except Exception:  # noqa: BLE001
+                found = ["VEVENT"]
+            self._vevent_cache[href] = not found or "VEVENT" in found
+        return self._vevent_cache[href]
 
     def _calendars_changed(self) -> None:
         self._cals_gen += 1
         self._name_cache.clear()
         self._vevent_cache.clear()
 
-    def _event_calendars(self, principal: Any) -> list[Any]:
-        # Which calendars hold events does not change between calls, so ask iCloud once per calendar, not on every tool call.
-        out = []
-        for cal in self._calendars(principal):
-            key, now = str(cal.url), time.monotonic()
-            hit = self._vevent_cache.get(key)
-            if hit is None or now - hit[1] > _CACHE_SECONDS:
-                try:
-                    comps = cal.get_supported_components()
-                except Exception:  # noqa: BLE001
-                    comps = ["VEVENT"]
-                hit = self._vevent_cache[key] = ((not comps or "VEVENT" in comps), now)
-            if hit[0]:
-                out.append(cal)
-        return out
+    @staticmethod
+    def _cal_id(cal: Any) -> str:
+        return str(cal.url).rstrip("/").rsplit("/", 1)[-1]
 
     def _pick(self, principal: Any, calendar: str | None) -> list[Any]:
+        """The calendars `calendar` names: by name (any case), by the id from calendar_list_calendars (the last segment of
+        its URL, whole) or by its full URL, which older ids were."""
         cals = self._event_calendars(principal)
         if not calendar:
             return cals
-        want = calendar.strip().lower()
-        hit = [c for c in cals if self._cal_name(c).lower() == want or str(c.url).rstrip("/").endswith(want)]
+        w = calendar.strip().rstrip("/").lower()
+        by_name = [c for c in cals if self._cal_name(c).lower() == w]
+        by_id = [c for c in cals if (u := str(c.url).rstrip("/").lower()) == w or u.endswith("/" + w)]
+        if by_name and by_id and {id(c) for c in by_name} != {id(c) for c in by_id}:
+            raise CalendarError(f"'{calendar}' is the name of one calendar and the id of another, so it is not guessed. "
+                                "Use the other calendar's name, or rename one in the Calendar app.")
+        hit = list({id(c): c for c in by_name + by_id}.values())
         if not hit:
             raise CalendarError(f"No calendar named '{calendar}'. Use one of: {', '.join(self._cal_name(c) for c in cals)}.")
         return hit
@@ -979,7 +1195,7 @@ class CalendarService:
     @_reconnecting
     def list_calendars(self) -> list[dict[str, Any]]:
         with self._principal() as p:
-            return [{"name": self._cal_name(c), "id": str(c.url)} for c in self._event_calendars(p)]
+            return [{"name": self._cal_name(c), "id": self._cal_id(c)} for c in self._event_calendars(p)]
 
     # -- managing calendars ---------------------------------------------------------------
     @staticmethod
@@ -998,7 +1214,7 @@ class CalendarService:
             self._tl.mutated = True
             cal = p.make_calendar(name=name, cal_id=str(uuid.uuid4()))
         self._calendars_changed()
-        return {"created": True, "name": name, "id": str(cal.url)}
+        return {"created": True, "name": name, "id": self._cal_id(cal)}
 
     @_reconnecting
     def update_calendar(self, calendar: str, new_name: str) -> dict[str, Any]:
@@ -1057,10 +1273,13 @@ class CalendarService:
             s_dt = datetime.now(tz).replace(microsecond=0)
             e_dt = s_dt + timedelta(minutes=int(starting_within_minutes))
         else:
-            if not start or not end:
-                raise CalendarError("Give start and end (ISO dates or date-times), or starting_within_minutes.")
-            s_val, _ = parse_when(start, tz)
-            e_val, e_is_date = parse_when(end, tz)
+            s_val, _ = parse_range_bound(start or "today", tz)
+            if end:
+                e_val, e_is_date = parse_range_bound(end, tz)
+            elif not start and (query or needs_reply):
+                e_val, e_is_date = parse_range_bound("+60d", tz)          # a search without dates looks ahead two months
+            else:
+                e_val, e_is_date = _as_dt(s_val, tz).date(), True         # the start's whole day (today without start)
             s_dt = _as_dt(s_val, tz)
             e_dt = _as_dt(e_val, tz) + (timedelta(days=1) if e_is_date else timedelta())
         if e_dt <= s_dt:
@@ -1101,15 +1320,22 @@ class CalendarService:
 
     @staticmethod
     def _listed(comp: icalendar.Component, name: str, fields: str) -> dict[str, Any]:
+        """One listed event. all_day and has_attendees only when true. An occurrence of a series always says so (an edit
+        without occurrence_start changes the whole series): recurrence_id when it was moved from its original start, else
+        'recurring': true."""
         d = event_to_dict(comp, name)
+        rid = _dt(comp, "recurrence-id")
+        if rid is not None and _same_instant(rid, _dt(comp, "dtstart")):
+            d["recurrence_id"], d["recurring"] = None, True
         if fields == "summary":
-            keep = ("uid", "calendar", "summary", "start", "end", "all_day", "location", "status", "safety_warnings")
+            keep = ("uid", "calendar", "summary", "start", "end", "all_day", "location", "status", "recurrence_id", "recurring",
+                    "safety_warnings")
             return compact({**{k: d[k] for k in keep if k in d}, "has_attendees": bool(d.get("attendees"))},
-                           keep=("uid", "calendar", "summary", "start", "end", "all_day", "has_attendees"))
+                           keep=("uid", "calendar", "summary", "start", "end"))
         text = d.get("description")
         if text and len(text) > _DESCRIPTION_CHARS:
             d["description"], d["description_truncated"] = text[:_DESCRIPTION_CHARS], True
-        return compact(d, keep=("uid", "calendar", "summary", "start", "end", "all_day"))
+        return compact(d, keep=("uid", "calendar", "summary", "start", "end"))
 
     def _take_idle(self, n: int) -> list[_Conn]:
         """Up to n pooled connections that are ready now. Never opens one: a new CalDAV connection costs more than reading a
@@ -1197,28 +1423,25 @@ class CalendarService:
         search = lambda cal: _search_expanded(cal, s_dt, e_dt, skipped)   # noqa: E731
         found = (self._each_calendar_or_skip(principal, cals, search, not_read) if not_read is not None
                  else self._each_calendar(principal, cals, search))
-        for name, datas in zip(names, found):
-            for data in datas or []:
-                try:
-                    comps = icalendar.Calendar.from_ical(data).walk("VEVENT")
-                except Exception:  # noqa: BLE001 - one unreadable object (a stranger's invitation) must not fail the listing
-                    continue
-                for comp in comps:
-                    if readable_event(comp):
-                        yield name, comp
+        for name, comps in zip(names, found):
+            for comp in comps or []:
+                if readable_event(comp):
+                    yield name, comp
 
     @_reconnecting
     def find_free_time(
-        self, start: str, end: str, duration_minutes: int, *, calendar: str | None = None, timezone_name: str | None = None,
+        self, start: str | None, end: str | None, duration_minutes: int, *, calendar: str | None = None, timezone_name: str | None = None,
         day_start: str = "09:00", day_end: str = "18:00", weekdays: list[str] | None = None, include_travel: bool = True,
         limit: int = 20,
     ) -> dict[str, Any]:
         tz = get_tz(timezone_name or self.s.default_timezone)
-        s_val, _ = parse_when(start, tz)
-        e_val, e_is_date = parse_when(end, tz)
-        s_dt = _as_dt(s_val, tz)
-        e_dt = _as_dt(e_val, tz) + (timedelta(days=1) if e_is_date else timedelta())
         now = datetime.now(tz)
+        s_dt = _as_dt(parse_range_bound(start, tz)[0], tz) if start else now
+        if end:
+            e_val, e_is_date = parse_range_bound(end, tz)
+            e_dt = _as_dt(e_val, tz) + (timedelta(days=1) if e_is_date else timedelta())
+        else:
+            e_dt = max(s_dt, now) + timedelta(days=14)                   # default: two weeks from the start (or from now)
         s_dt = max(s_dt, now.replace(second=0, microsecond=0))          # never offer a slot in the past
         if e_dt <= s_dt:
             raise CalendarError("The range is entirely in the past, or end is not after start.")
@@ -1284,6 +1507,7 @@ class CalendarService:
             "notice": UNTRUSTED_NOTICE,
             "now": datetime.now(tz).replace(microsecond=0).isoformat(),
             "timezone": str(tz),
+            "range": {"start": s_dt.isoformat(), "end": e_dt.isoformat()},
             "duration_minutes": int(duration_minutes),
             "hours": f"{day_start}-{day_end}",
             "free_slots": [{"start": a.isoformat(), "end": b.isoformat(), "minutes": int((b - a).total_seconds() // 60)}
@@ -1306,9 +1530,7 @@ class CalendarService:
         """iCloud answers UID-filtered REPORT queries (caldav's event_by_uid) with 412, so try the resource named
         after the UID first; that is how iCloud and this connector store events."""
         try:
-            obj = cal.event_by_url(f"{str(cal.url).rstrip('/')}/{quote(uid, safe='@')}.ics")
-            obj.load()
-            return obj
+            return cal.event_by_url(f"{str(cal.url).rstrip('/')}/{quote(uid, safe='@')}.ics")   # one GET; its ETag guards the write
         except caldav.error.DAVError:
             return None
 

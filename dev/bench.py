@@ -8,6 +8,9 @@
 Counts are the numbers to compare between versions: on localhost a round trip costs almost nothing, so time alone hides what
 a real network charges for every login, command and request. --latency-ms puts that cost back, so timings become meaningful too.
 
+'bytes' is the text the model reads (the result's text parts); 'wire bytes' is the whole JSON-RPC response body as the SDK
+serializes it (text parts plus any structuredContent copy and the envelope), so what a connection carries compares honestly too.
+
 Live mode never sends mail, never writes contacts, and writes to the calendar only inside --scratch-calendar. The report
 contains tool names and numbers only, never message, event or contact content.
 """
@@ -201,7 +204,7 @@ def parts_of(res) -> list[str]:
 
 
 def parsed(res):
-    """The result as JSON: a list result arrives as one text part per item."""
+    """The result as JSON (older versions sent a list result as one text part per item)."""
     items = []
     for t in parts_of(res):
         try:
@@ -211,8 +214,15 @@ def parsed(res):
     return items[0] if len(items) == 1 else items
 
 
+def wire_bytes(res) -> int:
+    """The JSON-RPC response body for this result, serialized as the SDK sends it (result dumped without None fields)."""
+    import pydantic_core
+    result = res.model_dump(by_alias=True, mode="json", exclude_none=True) if hasattr(res, "model_dump") else {}
+    return len(pydantic_core.to_json({"jsonrpc": "2.0", "id": 1, "result": result}))
+
+
 def payload_of(res) -> tuple[int, int]:
-    """(bytes of the result as the client receives it, characters inside notice/hint/note fields)."""
+    """(bytes of the result text the model reads, characters inside notice/hint/note fields)."""
     size = sum(len(t.encode()) for t in parts_of(res))
     notice, stack = 0, [parsed(res)]
     while stack:
@@ -244,26 +254,28 @@ class Bench:
 
     async def measure(self, name, steps, fresh=False, mcp=None):
         """Run a chain of (tool, args-or-callable) steps `runs` times; one row with medians over the runs."""
-        times, sizes, notices, deltas = [], [], [], []
+        times, sizes, wires, notices, deltas = [], [], [], [], []
         for _ in range(self.runs):
             srv = self.server() if fresh or mcp is None else mcp
             before = self.m.snapshot()
-            t0, size, notice, prev = time.perf_counter(), 0, 0, None
+            t0, size, wire, notice, prev = time.perf_counter(), 0, 0, 0, None
             for tool, args in steps:
                 a = args(prev) if callable(args) else args
                 if a is None:
                     continue
                 res, prev = await self.call(srv, tool, a)
                 b, n = payload_of(res)
-                size, notice = size + b, notice + n
+                size, wire, notice = size + b, wire + wire_bytes(res), notice + n
             times.append(time.perf_counter() - t0)
             sizes.append(size)
+            wires.append(wire)
             notices.append(notice)
             deltas.append(self.m.snapshot() - before)
         keys = sorted({k for d in deltas for k in d})
         row = {"scenario": name, "median_s": statistics.median(times),
                "p90_s": sorted(times)[max(0, int(len(times) * 0.9 + 0.5) - 1)],
-               "bytes": int(statistics.median(sizes)), "notice_chars": int(statistics.median(notices))}
+               "bytes": int(statistics.median(sizes)), "wire_bytes": int(statistics.median(wires)),
+               "notice_chars": int(statistics.median(notices))}
         row.update({k: statistics.median([d.get(k, 0) for d in deltas]) for k in keys})
         self.rows.append(row)
         print(f"  {name}: {row['median_s']:.3f} s", file=sys.stderr)
@@ -292,7 +304,8 @@ class Bench:
                 deltas[steps[1][0]] += Counter({k: v for k, v in bg.items() if k.startswith("background_")})
         for tool, _ in steps:
             self.rows.append({"scenario": f"{tool} x{calls}, {gap:g} s apart (totals)", "median_s": statistics.median(times[tool]),
-                              "p90_s": max(times[tool]), "bytes": 0, "notice_chars": 0, **deltas[tool]})
+                              "p90_s": max(times[tool]), "bytes": 0, "wire_bytes": 0, "notice_chars": 0,
+                              **deltas[tool]})
 
 
 async def run(args, settings, meter: Meter) -> list[dict]:
@@ -347,10 +360,11 @@ def table(rows: list[dict], title: str) -> str:
               "bridge_jobs"]
     counts += ["background_" + c for c in counts]
     shown = [c for c in counts if any(r.get(c) for r in rows)]
-    head = ["scenario", "median s", "p90 s", "bytes", "notice chars"] + [c.replace("_", " ") for c in shown]
+    head = ["scenario", "median s", "p90 s", "bytes", "wire bytes", "notice chars"] + [c.replace("_", " ") for c in shown]
     out = [f"### {title}", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in rows:
-        cells = [r["scenario"], f"{r['median_s']:.3f}", f"{r['p90_s']:.3f}", str(r["bytes"]), str(r["notice_chars"])]
+        cells = [r["scenario"], f"{r['median_s']:.3f}", f"{r['p90_s']:.3f}", str(r["bytes"]), str(r.get("wire_bytes", 0)),
+                 str(r["notice_chars"])]
         cells += [f"{r.get(c, 0) / 1024:.0f}" if c.endswith("kb_in") else f"{r.get(c, 0):g}" for c in shown]
         out.append("| " + " | ".join(cells) + " |")
     return "\n".join(out) + "\n"

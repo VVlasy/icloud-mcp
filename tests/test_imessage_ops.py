@@ -157,6 +157,25 @@ def test_long_messages_and_paging(run):
         run("imessage_read", {"chat_id": "chat900", "exclude": "chat900"})
 
 
+def test_a_one_message_read_gives_the_chat_record_the_chat_list_gives(run, tmp_path):
+    """The server resolves a send target with imessage_read(limit=1): the same chat_id, name, group and participants as
+    imessage_chats, for any chat (archived, or one with no messages yet that the chat list leaves out), and hidden ones stay hidden."""
+    fields = ("chat_id", "name", "group", "participants")
+    listed = run("imessage_chats", {"limit": 1000, "include_archived": True})["chats"]
+    assert len(listed) == 3
+    for c in listed:
+        assert {k: run("imessage_read", {"chat_id": c["chat_id"], "limit": 1})["chat"][k] for k in fields} == {k: c[k] for k in fields}
+    db = sqlite3.connect(tmp_path / "chat.db")
+    db.execute("insert into chat values (7, 'any;+;chat950', 'chat950', 'Empty', 'iMessage', 43, 0)")
+    db.executemany("insert into chat_handle_join values (?,?)", [(7, 2), (7, 3)])
+    db.commit()
+    assert "chat950" not in [c["chat_id"] for c in run("imessage_chats", {"limit": 1000, "include_archived": True})["chats"]]
+    one = run("imessage_read", {"chat_id": "chat950", "limit": 1})
+    assert one["chat"]["participants"] == ["+31600000002", "anna@example.org"] and one["messages"] == []
+    with pytest.raises(RuntimeError, match="no conversation"):
+        run("imessage_read", {"chat_id": "chat950", "limit": 1, "exclude": "chat950"})
+
+
 def test_search_ignores_case_and_accents_and_honours_the_window(run):
     hits = run("imessage_search", {"query": "cafe"})["matches"]
     assert [h["chat_id"] for h in hits] == ["chat900"] and hits[0]["chat_name"] == "Hiking crew"

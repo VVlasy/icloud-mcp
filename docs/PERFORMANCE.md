@@ -12,8 +12,10 @@ that claims to make something faster records its numbers here, measured the same
   On localhost a round trip is almost free, so without it the timings hide exactly what the network charges for.
 - `python dev/bench.py --live --env <server .env> [--scratch-calendar NAME]` measures a real account: read-only tools only, plus
   create/update/delete of one event inside the named scratch calendar. It never sends mail and never writes contacts.
-- `python dev/tool_surface.py` measures the text an agent receives before doing anything: tool descriptions, parameter schemas and
-  the instructions.
+- `python dev/tool_surface.py` measures the text an agent receives before doing anything: tool descriptions, parameter schemas,
+  the whole `tools/list` result and the instructions.
+- In the bench tables `bytes` is the result text the model reads (comparable with older runs); `wire bytes` is the whole JSON-RPC
+  response body, which also counts a structuredContent copy where one is sent.
 
 **Read the counts first.** Round trips (TCP connects, logins, IMAP commands, CalDAV and CardDAV requests) are what a real network
 charges for, and they are exact. Local timings are noisy and small.
@@ -316,3 +318,71 @@ About 21 tools arrive across these two releases (drafts and folders, calendars, 
 The parameter-schema budget in `tests/test_tool_surface.py` goes from 38,000 to 52,000 characters and the instructions cap in
 `tests/test_instructions.py` from 6,500 to 8,000. Clients that load too much can still use `TOOLS=essential` or an area preset.
 After the mail drafts and folders PR: 71 tools, 40,283 schema characters, instructions 6,393.
+
+## Results sent once, compact
+
+Each tool result is now serialized once, in the worker thread after cleaning, as one compact JSON text block: no indented copy
+plus a structuredContent duplicate, no outputSchema on any tool, and no block per list item (`MCP_STRUCTURED_CONTENT=true` adds
+structuredContent back for a client that needs it). Tool descriptions lose their docstring indentation, and the HTTP transport
+answers each request with a plain JSON body instead of an event stream (`MCP_JSON_RESPONSE`, default true; the tool timeout is
+then capped at 90 s, below Cloudflare's 100 s). With every area on (`dev/tool_surface.py`): description characters 23,662 to
+21,682, the `tools/list` result 93,182 to 82,035 bytes. Bench figures follow.
+
+## 0.13 speed pass: before and after
+
+Same harness (`dev/bench.py --local --latency-ms 40`, 3 runs), 0.12.1 against this branch. `bytes` is the text the model reads, `wire bytes` the whole tool result as sent.
+
+#### before (0.12.1)
+
+| scenario | median s | p90 s | bytes | wire bytes | notice chars | tcp connects | imap commands | imap kb in | caldav requests | carddav requests |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mail_search_messages 20 | 0.150 | 0.200 | 9958 | 17432 | 85 | 0 | 3 | 12 | 0 | 0 |
+| mail_search_messages 20 + get_messages 10 | 0.392 | 0.417 | 30576 | 58065 | 249 | 0 | 7 | 55 | 0 | 0 |
+| mail_search_messages all_folders | 0.367 | 0.544 | 10903 | 19213 | 85 | 0 | 19 | 33 | 0 | 0 |
+| mail_get_attachment (300 KB pdf) | 0.338 | 0.351 | 419779 | 837211 | 170 | 0 | 7 | 424 | 0 | 0 |
+| calendar_list_calendars (cold) | 1.737 | 2.033 | 491 | 1247 | 0 | 9 | 0 | 0 | 9 | 0 |
+| calendar_list_calendars (warm) | 0.001 | 0.171 | 491 | 1247 | 0 | 0 | 0 | 0 | 0 | 0 |
+| calendar_list_events 7 days | 0.247 | 0.248 | 7691 | 14638 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days | 0.328 | 0.340 | 12442 | 23571 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days, fields=summary | 0.329 | 0.364 | 13266 | 25008 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_find_free_time 14 days | 0.265 | 0.285 | 2498 | 4841 | 85 | 5 | 0 | 0 | 5 | 0 |
+| contacts_search_contacts (cold) | 0.586 | 0.591 | 8559 | 14866 | 72 | 5 | 0 | 0 | 0 | 5 |
+| contacts_search_contacts (warm) | 0.002 | 0.003 | 8559 | 14866 | 72 | 0 | 0 | 0 | 0 | 0 |
+| calendar create + update + delete | 0.849 | 0.851 | 1454 | 3226 | 0 | 12 | 0 | 0 | 12 | 0 |
+
+#### after
+
+| scenario | median s | p90 s | bytes | wire bytes | notice chars | tcp connects | imap commands | imap kb in | caldav requests | carddav requests |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mail_search_messages 20 | 0.090 | 0.133 | 4652 | 5409 | 85 | 0 | 2 | 12 | 0 | 0 |
+| mail_search_messages 20 + get_messages 10 | 0.272 | 0.275 | 20714 | 22977 | 249 | 0 | 5 | 55 | 0 | 0 |
+| mail_search_messages all_folders | 0.229 | 0.231 | 5555 | 6446 | 85 | 0 | 12 | 33 | 0 | 0 |
+| mail_get_attachment (300 KB pdf) | 0.232 | 0.235 | 414452 | 415340 | 170 | 0 | 5 | 424 | 0 | 0 |
+| calendar_list_calendars (cold) | 0.257 | 0.258 | 312 | 465 | 0 | 3 | 0 | 0 | 3 | 0 |
+| calendar_list_calendars (warm) | 0.001 | 0.001 | 312 | 465 | 0 | 0 | 0 | 0 | 0 | 0 |
+| calendar_list_events 7 days | 0.230 | 0.241 | 5078 | 5835 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days | 0.253 | 0.270 | 8244 | 9407 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_list_events 30 days, fields=summary | 0.259 | 0.338 | 8244 | 9407 | 85 | 5 | 0 | 0 | 5 | 0 |
+| calendar_find_free_time 14 days | 0.234 | 0.243 | 2016 | 2323 | 85 | 5 | 0 | 0 | 5 | 0 |
+| contacts_search_contacts (cold) | 0.592 | 0.605 | 3331 | 3978 | 72 | 5 | 0 | 0 | 0 | 5 |
+| contacts_search_contacts (warm) | 0.002 | 0.002 | 3331 | 3978 | 72 | 0 | 0 | 0 | 0 | 0 |
+| calendar create + update + delete | 0.674 | 0.679 | 1185 | 1656 | 0 | 10 | 0 | 0 | 10 | 0 |
+
+### Live check (27 September 2026)
+
+`dev/bench.py --live` against a real iCloud account from the Netherlands, read-only, 5 runs each, 0.12.1 against this branch
+(run from a separate copy; nothing deployed):
+
+| | 0.12.1 | this branch |
+|---|---|---|
+| `calendar_list_calendars`, cold | 3.09 s, 11 requests | 1.42 s, 5 requests |
+| `mail_search_messages` 20 | 0.92 s, 3 IMAP commands | 0.74 s, 2 |
+| search + `mail_get_messages` 10 | 2.20 s, 7 commands | 1.94 s, 5 |
+| `mail_search_messages all_folders` | 1.85 s, 17 commands | 1.51 s, 11 |
+| 10 calendar reads over 3 minutes, p90 | 5.1 s | 2.8 s |
+| mail search result sent to the client | 20.7 KB | 7.9 KB (-62 %) |
+| `contacts_search_contacts`, cold | 1.76 s | 1.75 s, result less than half the size |
+
+iCloud answers `STATUS (... HIGHESTMODSEQ)`, so a quiet `mail_list_changes` poll is one command (0.17 s). The one-PROPFIND
+calendar list with Basic credentials sent up front works on iCloud. The local stack's request counts differ from iCloud's
+(Radicale needs no principal discovery round trips); compare live numbers with live numbers.

@@ -6,8 +6,10 @@ import dataclasses
 import icalendar
 import pytest
 
+from caldav_fakes import principal_of
 from icloud_mcp.cal import CalendarError, CalendarService, build_event, get_tz, parse_attendees
 from icloud_mcp.config import Settings
+from icloud_mcp.mailbulk import expand_uid_set
 from icloud_mcp.server import build_instructions, create_server
 
 
@@ -61,7 +63,7 @@ class FakeCal:
 
 def _svc(s, monkeypatch, names):
     cals = [FakeCal(n) for n in names]
-    principal = type("P", (), {"calendars": lambda self: cals})()
+    principal = principal_of(cals)
 
     @contextlib.contextmanager
     def fake_principal(self):
@@ -127,18 +129,21 @@ def test_calendar_facts_are_cached_between_calls_and_expire(s, monkeypatch):
     class CountingCal(FakeCal):
         def get_supported_components(self):
             calls["components"] += 1
-            return ["VEVENT"]
+            return ["VTODO"]
 
-    cals = [CountingCal("Calendar"), CountingCal("Work")]
-    principal = type("P", (), {"calendars": lambda self: cals})()
+    cals = [CountingCal("Calendar"), CountingCal("Work"), CountingCal("Reminders"), CountingCal("Odd")]
+    kinds = {"Calendar": ["VEVENT"], "Work": None, "Reminders": ["VTODO"], "Odd": object()}   # None: no set given, any component
+    principal = principal_of(cals, components=lambda c: kinds[c.name])
     svc = CalendarService(s)
     for _ in range(3):
         assert [svc._cal_name(c) for c in svc._event_calendars(principal)] == ["Calendar", "Work"]
-    assert calls["components"] == 2                               # once per calendar, not once per call
+    assert principal.client.requests == [("https://caldav.example/1/principal/", 0), ("https://caldav.example/1/calendars/", 1)]
+    assert calls["components"] == 1                               # read from the list; only the set that did not parse is asked
     import icloud_mcp.cal as calmod
     monkeypatch.setattr(calmod.time, "monotonic", lambda t0=calmod.time.monotonic(): t0 + 10_000)
     svc._event_calendars(principal)
-    assert calls["components"] == 4                               # refreshed after the cache lifetime
+    assert principal.client.requests[2:] == [("https://caldav.example/1/calendars/", 1)]   # refreshed after its lifetime: one PROPFIND
+    assert calls["components"] == 1                               # a component set never changes, so it is not asked again
 
 
 # ------------------------------------------------------------------ mail: recipients are never silently dropped
@@ -175,6 +180,11 @@ def test_instructions_carry_the_mail_workflow(s):
 
 
 # ------------------------------------------------------------------ iCloud has no IMAP MOVE: move/delete must still work, safely
+def uids_of(seq):
+    """What the server reads from a uid argument: a uid set such as b"3:5,9", or a plain list."""
+    return expand_uid_set(seq, 10 ** 6) if isinstance(seq, (bytes, str)) else list(seq)
+
+
 class _MoveIMAP:
     def __init__(self, caps):
         self.caps, self.log = set(caps), []
@@ -186,16 +196,16 @@ class _MoveIMAP:
         self.log.append(("select", f))
 
     def move(self, uids, dst):
-        self.log.append(("move", list(uids), dst))
+        self.log.append(("move", uids_of(uids), dst))
 
     def copy(self, uids, dst):
-        self.log.append(("copy", list(uids), dst))
+        self.log.append(("copy", uids_of(uids), dst))
 
     def add_flags(self, uids, flags, silent=False):
-        self.log.append(("flag", list(uids), list(flags)))
+        self.log.append(("flag", uids_of(uids), list(flags)))
 
     def expunge(self, uids=None):
-        self.log.append(("expunge", list(uids) if uids is not None else None))
+        self.log.append(("expunge", uids_of(uids) if uids is not None else None))
 
 
 def _mail_with(s, monkeypatch, caps):

@@ -551,9 +551,12 @@ Everything is an environment variable. [`.env.example`](https://github.com/epine
 | `MCP_PUBLIC_URL`, `MCP_OWNER_PASSWORD` | required when hosted | Public https address; owner password (12+ characters) |
 | `MCP_HOST`, `MCP_PORT`, `MCP_EXTRA_ALLOWED_HOSTS` | 127.0.0.1 (0.0.0.0 in the Docker image), 8000, empty | Bind address and extra allowed `Host` headers |
 | `MCP_STATELESS` | true | No server-side MCP sessions, so a restart never breaks a connected client ("Missing session ID") |
-| `TOOL_TIMEOUT_SECONDS` | 60 | A tool call running longer is abandoned with an error that names the slow step |
+| `TOOL_TIMEOUT_SECONDS` | 60 | A tool call running longer is abandoned with an error that names the slow step (at most 90 while `MCP_JSON_RESPONSE` is on, below Cloudflare's 100 s limit) |
+| `MCP_JSON_RESPONSE` | true | Answer each request with one plain JSON body instead of an event stream; `false` if a client has trouble with it |
+| `MCP_STRUCTURED_CONTENT` | false | Also send each result as `structuredContent`, for a client that wants it (results are otherwise sent once, as compact JSON text) |
 | `IMAP_POOL_SIZE`, `IMAP_IDLE_SECONDS` | 3, 600 | Logged-in mail connections kept for reuse (0 = log in on every call), and how long they are kept warm after the last call |
 | `CALDAV_POOL_SIZE`, `CALDAV_KEEPALIVE_SECONDS` | 4, 600 | Calendar connections kept for reuse, and how long they are kept warm after the last call (0 = no keep-alive) |
+| `CALDAV_AUTH` | auto | `basic` sends Basic credentials with the first request instead of waiting for a 401 (only over https or to this computer); `auto` does that for iCloud and a local server, and negotiates (Basic or Digest) with others |
 | `WARMUP_ON_START` | true | Sign in to mail, calendar and contacts in the background right after start, so the first call is fast |
 | `TOOL_WORKERS` | 8 | Tool calls that can run at the same time |
 | `OWNER_ADDRESSES` | (none) | More addresses that are yours (aliases), so invitations to them count as yours |

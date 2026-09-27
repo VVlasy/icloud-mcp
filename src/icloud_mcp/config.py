@@ -11,6 +11,16 @@ from urllib.parse import urlparse
 # and local clients such as Codex CLI (127.0.0.1, localhost). Every sign-in still needs the owner password.
 DEFAULT_REDIRECT_HOSTS = "claude.ai,claude.com,chatgpt.com,chat.openai.com,localhost,127.0.0.1"
 
+# Network timeouts in seconds, shared by IMAP, SMTP, CalDAV and CardDAV. The read timeout bounds each read (inactivity), not a
+# whole request, so a large REPORT or mailbox fetch is not cut short. A read retried after a dead pooled connection (callctx) costs
+# at most READ + CONNECT + READ, which has to stay under the default TOOL_TIMEOUT_SECONDS (tests/test_imap_pool.py checks it).
+CONNECT_TIMEOUT = 8.0            # TCP connect and TLS handshake (for IMAP and SMTP also the greeting)
+READ_TIMEOUT = 25.0
+PROBE_TIMEOUT = 3.0              # a NOOP on a pooled IMAP or SMTP connection: one round trip, or the path is dead
+DAV_PING_TIMEOUT = (3.0, 5.0)    # (connect, read) of the CalDAV keep-alive PROPFIND
+LOGOUT_TIMEOUT = 2.0             # the courtesy LOGOUT of a healthy IMAP session being closed
+
+
 def _str(name: str, default: str = "") -> str:
     v = os.environ.get(name)
     return default if v is None or v.strip() == "" else v.strip()
@@ -151,6 +161,7 @@ class Settings:
     imap_idle_seconds: int = 600  # IMAP_IDLE_SECONDS: a pooled connection unused for longer is closed instead of reused
     caldav_pool_size: int = 4     # CALDAV_POOL_SIZE: CalDAV connections kept for reuse (calendars are read in parallel)
     caldav_keepalive_seconds: int = 600   # CALDAV_KEEPALIVE_SECONDS: keep pooled CalDAV connections warm this long after the last call (0 = off)
+    caldav_auth: str = "auto"    # CALDAV_AUTH: 'basic' = Basic up front (https or loopback only); 'auto' = so for iCloud and loopback
     enable_maps: bool = False     # ENABLE_MAPS: Apple Maps travel times and place search via the Mac helper (needs BRIDGE_TOKEN)
     enable_imessage: bool = False  # ENABLE_IMESSAGE: read and search the owner's own iMessage history via the Mac helper
     enable_health: bool = False    # ENABLE_HEALTH: daily Apple Health figures from the owner's iPhone exports, via the Mac helper
@@ -164,6 +175,7 @@ class Settings:
     imessage_send_allowlist: tuple[str, ...] = ()  # IMESSAGE_SEND_ALLOWLIST: who may receive; empty = nobody, "*" = anyone
     warmup_on_start: bool = True  # WARMUP_ON_START: log in to mail, calendar and contacts in the background right after start
     tool_workers: int = 8         # TOOL_WORKERS: threads that run tool calls, so parallel calls do not queue behind each other
+                                  # (Mac helper tools use a pool of their own, min(TOOL_WORKERS, 6), so they never hold these)
     agent_notes_file: str = ""    # AGENT_NOTES_FILE: the owner's own rules for agents, appended to the instructions (never shipped)
     invite_allowlist: tuple[str, ...] = ()   # INVITE_ALLOWLIST: addresses/domains that may be invited when invites are on (empty = anyone)
     max_attendees: int = 10                 # MAX_ATTENDEES: most guests one event may carry through the connector
@@ -174,6 +186,8 @@ class Settings:
     shortcuts_allow: tuple[str, ...] = ()   # SHORTCUTS_ALLOW: exact Shortcut names the assistant may run (the Mac keeps its own list too)
     admin_port: int = 0           # ADMIN_PORT: loopback-only admin API for the menu bar app (0 = off); never the tunnelled port
     overrides_active: tuple[str, ...] = ()  # which OVERRIDABLE settings come from DATA_DIR/overrides.json (names only)
+    json_response: bool = True    # MCP_JSON_RESPONSE: answer each POST with one JSON body instead of an SSE stream
+    structured_content: bool = False  # MCP_STRUCTURED_CONTENT: also send each result as structuredContent (for a client that needs it)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -242,6 +256,7 @@ class Settings:
             imap_idle_seconds=max(30, _int("IMAP_IDLE_SECONDS", 600)),
             caldav_pool_size=max(1, min(_int("CALDAV_POOL_SIZE", 4), 8)),
             caldav_keepalive_seconds=max(0, _int("CALDAV_KEEPALIVE_SECONDS", 600)),
+            caldav_auth=_str("CALDAV_AUTH", "auto").lower(),
             enable_maps=_bool("ENABLE_MAPS", False),
             enable_imessage=_bool("ENABLE_IMESSAGE", False),
             enable_health=_bool("ENABLE_HEALTH", False),
@@ -265,6 +280,8 @@ class Settings:
             shortcuts_allow=tuple(n.strip() for n in _str("SHORTCUTS_ALLOW").split(";" if ";" in _str("SHORTCUTS_ALLOW") else ",") if n.strip()),
             admin_port=max(0, _int("ADMIN_PORT", 0)),
             overrides_active=tuple(OVERRIDABLE[k] for k in sorted(overrides)),
+            json_response=_bool("MCP_JSON_RESPONSE", True),
+            structured_content=_bool("MCP_STRUCTURED_CONTENT", False),
         )
 
     # ------------------------------------------------------------------
@@ -273,6 +290,12 @@ class Settings:
         """Every address that is the owner: the account address, the Apple ID, the mail logins and OWNER_ADDRESSES."""
         return {a.strip().lower() for a in (self.email_address, self.username, self.imap_username, self.smtp_username,
                                             *self.owner_addresses) if a and "@" in a}
+
+    @property
+    def effective_tool_timeout(self) -> int:
+        """TOOL_TIMEOUT_SECONDS, but at most 90 s over HTTP with JSON responses: then no byte goes out until the tool finishes,
+        and Cloudflare gives up on an origin that has sent nothing for 100 s (524)."""
+        return min(self.tool_timeout, 90) if self.json_response and not self.local_mode else self.tool_timeout
 
     @property
     def bridge_enabled(self) -> bool:

@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 import icalendar
 import pytest
 
-from icloud_mcp.cal import CalendarError, build_event, event_to_dict, get_tz, parse_when
+from icloud_mcp.cal import CalendarError, _as_dt, build_event, event_to_dict, get_tz, parse_range_bound, parse_when
 
 LOCAL_TZ = get_tz("Europe/Berlin")
 
@@ -69,6 +69,26 @@ def test_parse_when():
     assert not is_date and v.tzinfo is not None and v.utcoffset() == timedelta(hours=2)
 
 
+def test_read_ranges_take_relative_days_in_the_owners_timezone():
+    ams = get_tz("Europe/Amsterdam")
+    late = datetime(2026, 10, 24, 23, 59, tzinfo=ams)                       # the evening before the clocks go back
+    assert parse_range_bound("today", ams, now=late) == (date(2026, 10, 24), True)          # 23:59 is still today
+    assert parse_range_bound(" Tomorrow ", ams, now=late) == (date(2026, 10, 25), True)
+    assert parse_range_bound("+1d", ams, now=late) == parse_range_bound("tomorrow", ams, now=late)
+    assert parse_range_bound("yesterday", ams, now=late)[0] == parse_range_bound("-1d", ams, now=late)[0] == date(2026, 10, 23)
+    assert parse_range_bound("+800d", ams, now=late)[0] == date(2026, 10, 24) + timedelta(days=800)
+    day = parse_range_bound("tomorrow", ams, now=late)[0]                   # the DST day is 25 hours long
+    first, after = _as_dt(day, ams), _as_dt(day + timedelta(days=1), ams)
+    assert (first.isoformat(), after.isoformat()) == ("2026-10-25T00:00:00+02:00", "2026-10-26T00:00:00+01:00")
+    assert after.timestamp() - first.timestamp() == 25 * 3600
+    utc_evening = datetime(2026, 9, 27, 22, 30, tzinfo=get_tz("UTC"))      # 00:30 the next day in Amsterdam
+    assert parse_range_bound("today", ams, now=utc_evening)[0] == date(2026, 9, 28)
+    assert parse_range_bound("2026-09-21T09:00", LOCAL_TZ) == parse_when("2026-09-21T09:00", LOCAL_TZ)   # ISO as before
+    for bad in ("next week", "+801d", "+1000d", "+5", "1d", "tomorrow morning", "today+1d"):
+        with pytest.raises(CalendarError):
+            parse_range_bound(bad, ams, now=late)
+
+
 # ---------------------------------------------------------------- uid lookup on iCloud
 class _Obj:
     def __init__(self, uid, url="u"):
@@ -96,10 +116,7 @@ class _ICloudLikeCal:
         import caldav
         name = href.rsplit("/", 1)[-1].removesuffix(".ics")
         if name not in self.by_name:
-            class _Missing:
-                def load(self_inner):
-                    raise caldav.error.NotFoundError("404")
-            return _Missing()
+            raise caldav.error.NotFoundError("404")          # as caldav does: event_by_url is the GET (Event(...).load())
         return self.by_name[name]
 
     def events(self):
@@ -133,6 +150,43 @@ def test_find_by_uid_reports_missing_events(monkeypatch):
     from icloud_mcp.cal import CalendarError
     with pytest.raises(CalendarError, match="No event with uid"):
         _svc(monkeypatch, _ICloudLikeCal({}))._find(None, "nope", None)
+
+
+def test_by_href_is_one_get_and_a_miss_is_none():
+    gets = []
+
+    class Cal:
+        url = "https://caldav.icloud.com/1/calendars/ABC/"
+
+        def event_by_url(self, href):
+            import caldav
+            gets.append(href)
+            if "gone" in href:
+                raise caldav.error.NotFoundError("404")
+            return _Obj("abc@icloud-mcp", href)
+    from icloud_mcp.cal import CalendarService
+    assert CalendarService._by_href(Cal(), "abc@icloud-mcp").url.endswith("/ABC/abc@icloud-mcp.ics") and len(gets) == 1
+    assert CalendarService._by_href(Cal(), "gone") is None and len(gets) == 2
+
+
+def test_pick_takes_a_short_id_a_full_url_or_a_name_and_never_guesses(monkeypatch):
+    import os
+    from icloud_mcp.cal import CalendarError, CalendarService
+    from icloud_mcp.config import Settings
+    os.environ.update(ICLOUD_USERNAME="me@icloud.com", ICLOUD_APP_PASSWORD="aaaabbbbccccdddd")
+    svc = CalendarService(Settings.from_env())
+    cal = lambda name, cid: type("C", (), {"name": name, "url": f"https://caldav.icloud.com/1/calendars/{cid}/"})()   # noqa: E731
+    home, work, odd = cal("Home", "home"), cal("Work", "A1B2-C3"), cal("home2", "x-home2")
+    monkeypatch.setattr(svc, "_event_calendars", lambda p: [home, work, odd])
+    assert [svc._cal_id(c) for c in (home, work)] == ["home", "A1B2-C3"]
+    assert svc._pick(None, "a1b2-c3") == [work]                                  # the id from calendar_list_calendars, any case
+    assert svc._pick(None, "https://caldav.icloud.com/1/calendars/A1B2-C3/") == [work]   # an old full-URL id still works
+    assert svc._pick(None, " WORK ") == [work] and svc._pick(None, "home") == [home]     # a name, any case; name and id agree
+    with pytest.raises(CalendarError, match="No calendar named"):
+        svc._pick(None, "C3")                                                    # only a whole segment matches, not a suffix
+    monkeypatch.setattr(svc, "_event_calendars", lambda p: [home, work, cal("Trips", "home2"), odd])
+    with pytest.raises(CalendarError, match="name of one calendar and the id of another"):
+        svc._pick(None, "home2")
 
 
 def test_addr_uses_email_param_when_icloud_rewrites_the_address_to_a_principal_path():

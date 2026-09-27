@@ -12,6 +12,8 @@ from __future__ import annotations
 import base64
 import contextlib
 import email
+import errno
+import functools
 import html as html_lib
 import imaplib
 import json
@@ -26,20 +28,22 @@ from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email import policy
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, getaddresses, make_msgid, parsedate_to_datetime
 from typing import Any, Iterator
 
 import html2text
-from imapclient import IMAPClient
+from imapclient import IMAPClient, SocketTimeout
 
 from . import callctx
-from .config import Settings
+from .config import CONNECT_TIMEOUT, LOGOUT_TIMEOUT, PROBE_TIMEOUT, READ_TIMEOUT, Settings
 from .keepalive import TICKER
-from .matching import fuzzy_match_all, norm, similar_enough
+from .matching import fuzzy_match_all, keyed, norm, similar_keyed
 from .safety import HIDDEN_NOTICE, HIDDEN_TEXT_WARNING, compact, confirm_problem, hidden_text, strip_hidden_html, warnings_for
 from .safety import confirm_token as make_confirm_token
-from .mailbulk import bulk_view
+from .mailbulk import bulk_view, uid_chunks, uid_set
 from . import mailparts
 from .outbox import Outbox, OutboxFull, QueuedMessage
 
@@ -145,6 +149,60 @@ def _hdr(msg: email.message.Message, name: str) -> str | None:
         return None if v is None else " ".join(str(v).split())
     except Exception:  # malformed header
         return None
+
+
+_ENCODED_RUN = re.compile(r"=\?[!-~]+?\?[bBqQ]\?[!-~]*?\?=(?:\s+=\?[!-~]+?\?[bBqQ]\?[!-~]*?\?=)*")
+
+
+def _decode_words(value: str) -> str:
+    """RFC 2047 encoded words decoded; the raw value when they do not decode (unknown charset, bad bytes, malformed)."""
+    if "=?" not in value:
+        return value
+    if not value.isascii():             # raw UTF-8 around encoded words, which decode_header cannot take: each run by itself
+        return _ENCODED_RUN.sub(lambda m: _decode_words(m.group()), value)
+    try:
+        return str(make_header(decode_header(value)))
+    except (LookupError, HeaderParseError, ValueError):       # ValueError: UnicodeDecodeError inside an encoded word
+        return value
+
+
+class _Headers:
+    """A fetched header block (summaries, people, awaiting replies), parsed once. compat32 on the block decoded as UTF-8 costs
+    about an eighth of policy.default and reads raw 8-bit (UTF-8) headers the same way; parsed as bytes they would turn into
+    U+FFFD. Values are unfolded. Addresses are split on the raw value before anything is decoded, so an encoded comma cannot
+    split one, and only display names and Subject are RFC 2047-decoded. Each address header and Subject is worked out once."""
+
+    __slots__ = ("_msg", "_memo")
+
+    def __init__(self, block: bytes | None):
+        self._msg = email.message_from_string((block or b"").decode("utf-8", "replace"), policy=policy.compat32)
+        self._memo: dict[str, Any] = {}
+
+    def get(self, name: str, default: Any = None) -> Any:
+        v = self._msg.get(name)
+        return default if v is None else "".join(str(v).splitlines())
+
+    def __getitem__(self, name: str) -> str | None:
+        return self.get(name)
+
+    def text(self, name: str) -> str | None:
+        """Like _hdr: whitespace collapsed; Subject decoded."""
+        if name not in self._memo:
+            v = self.get(name)
+            self._memo[name] = None if v is None else " ".join((_decode_words(v) if name == "Subject" else v).split())
+        return self._memo[name]
+
+    def addrs(self, name: str) -> list[tuple[str, str]]:
+        """Like parse_addrs(msg.get_all(name)): (display name, address) pairs."""
+        key = "addrs " + name
+        if key not in self._memo:
+            raw = ["".join(str(v).splitlines()) for v in self._msg.get_all(name) or []]
+            self._memo[key] = [(_decode_words(n).strip(), a.strip()) for n, a in getaddresses(raw) if a and "@" in a]
+        return self._memo[key]
+
+    def names(self) -> str:
+        """As _names: the display names in From, Reply-To and To."""
+        return " ".join(n for h in ("From", "Reply-To", "To") for n, _ in self.addrs(h) if n)
 
 
 def _iso_date(msg: email.message.Message, fallback: datetime | None = None) -> str | None:
@@ -547,12 +605,21 @@ def _flag_view(flags: tuple[Any, ...]) -> dict[str, Any]:
     }
 
 
+_CHANGED_KEYS = ("uid", "subject", "from", "date", "unread", "flagged", "answered", "safety_warnings")   # a 'changed' item
+
 _IMAP_PING_SECONDS = 300.0    # keep-alive: NOOP a pooled IMAP session idle this long
 _FOLDERS_SECONDS = 60.0       # the folder LIST
 _SMTP_IDLE_SECONDS = 60.0     # a logged-in SMTP connection unused for longer is closed rather than reused
 _LEAN_ABOVE = 64 * 1024       # mail_get_messages leaves out attachment contents when a message carries more than this of them
 _STRUCTURES_KEPT = 5000       # message structures remembered from searches (they never change for a uid)
 _FILTER_SCAN = 500            # people_only / since_hours check at most this many of the newest candidates
+
+
+def _booking_body(n: Any) -> bool:
+    """The leaves mail_extract_bookings reads (extract.py): text bodies, calendar data and .ics files (a name may be split over
+    RFC 2231 continuations or RFC 2047-encoded, hence 'contains'), and attached messages, which it looks inside."""
+    return (n.ctype in (*mailparts.BODY_TEXT, "text/calendar", "application/ics", "message/rfc822")
+            or ".ics" in n.filename.lower())
 
 
 def _instant(iso: str | None) -> datetime | None:
@@ -562,6 +629,11 @@ def _instant(iso: str | None) -> datetime | None:
     except ValueError:
         return None
     return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _sent_at(m: dict[str, Any]) -> datetime:
+    """Sort key for summaries by the instant they were sent; ISO strings with different offsets do not sort as text."""
+    return _instant(m.get("date")) or datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _keeper(people_only: bool, cutoff: datetime | None) -> Any:
@@ -619,6 +691,41 @@ def _mail_transport(exc: BaseException | None) -> bool:
     return False
 
 
+_PATH_ERRNOS = {errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH}
+
+
+def _path_dead(exc: BaseException | None) -> bool:
+    """True when the network path failed (a timeout, host or network unreachable), so every idle session over it is dead too.
+    EOF, BYE or a reset is one session's end (usually its expiry) and says nothing about the others."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, TimeoutError) or (isinstance(exc, OSError) and exc.errno in _PATH_ERRNOS):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _set_smtp_timeout(server: smtplib.SMTP, seconds: float) -> None:
+    sock = getattr(server, "sock", None)                     # None in test fakes
+    if sock is not None:
+        sock.settimeout(seconds)
+
+
+def _set_timeout(c: IMAPClient, seconds: float) -> None:
+    """The socket timeout for this session's next reads and writes (test fakes have no socket)."""
+    sock = getattr(c, "socket", None)
+    if sock is not None:
+        sock().settimeout(seconds)
+
+
+@functools.cache
+def _tls_context() -> ssl.SSLContext:
+    """One default TLS context for every IMAP and SMTP connection: building one costs about 24 ms. It is never changed after
+    creation; the host name is still checked per connection. A CA-store update takes effect after a restart."""
+    return ssl.create_default_context()
+
+
 # Read-only calls on a pooled connection that turns out to be dead are retried once on a new one (callctx.retry_once_if_safe).
 _retrying = callctx.retry_once_if_safe(_mail_transport)
 
@@ -639,16 +746,20 @@ class MailService:
         self._folders: tuple[float, list[tuple[Any, Any, str]]] | None = None   # (read at, LIST result)
         self._structures: OrderedDict[tuple[str, int, int], Any] = OrderedDict()   # (folder, uidvalidity, uid) -> mailparts.Node
         self._structures_lock = threading.Lock()
+        self._status_modseq = True          # False once STATUS left HIGHESTMODSEQ out with CONDSTORE enabled: EXAMINE instead
         self._smtp_lock = threading.Lock()
         self._smtp: tuple[smtplib.SMTP, float] | None = None                     # (logged-in connection, last used)
+        self._contexts_lock = threading.Lock()
+        self._contexts: dict[tuple[str, str, Any], dict[str, Any]] = {}  # (id, sha256, uidvalidity) -> a queued item's original, memory only
 
     # -- connections ---------------------------------------------------------
     def _login(self) -> IMAPClient:
         s = self.s
-        ctx = ssl.create_default_context()
+        ctx = _tls_context()
         try:
             use_ssl = s.imap_security == "ssl"
-            c = IMAPClient(s.imap_host, port=s.imap_port, ssl=use_ssl, **({"ssl_context": ctx} if use_ssl else {}), timeout=30)
+            c = IMAPClient(s.imap_host, port=s.imap_port, ssl=use_ssl, **({"ssl_context": ctx} if use_ssl else {}),
+                           timeout=SocketTimeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT))
             if s.imap_security == "starttls":
                 c.starttls(ctx)
             c.login(s.imap_username, s.app_password)
@@ -658,7 +769,8 @@ class MailService:
 
     def _checkout(self) -> IMAPClient | None:
         """A pooled connection that still answers, or None. Connections idle too long are closed; ones idle for more than
-        30 seconds are checked with a NOOP first (iCloud drops idle sessions without telling us)."""
+        30 seconds are checked with a short NOOP first (iCloud drops idle sessions without telling us). A probe that timed out
+        means the network path is gone: every idle session is closed and the call logs in afresh, instead of waiting on each."""
         while True:
             with self._pool_lock:
                 if not self._pool:
@@ -669,23 +781,50 @@ class MailService:
                 self._discard(c)
                 continue
             if idle > 30:
-                try:
-                    c.noop()
-                except Exception:  # noqa: BLE001 - a dead session is simply replaced
-                    self._discard(c)
+                failure = self._probe(c)
+                if failure is not None:                  # a session whose probe failed is never reused
+                    self._kill(c)
+                    if _path_dead(failure):
+                        self._flush()
+                        return None
                     continue
             return c
 
-    def _checkin(self, c: IMAPClient) -> None:
-        """Return a connection to the pool with no folder selected. UNSELECT, never CLOSE: CLOSE would permanently expunge every
-        message flagged \\Deleted in the folder, and moves and deletes here only ever expunge the exact messages they handled."""
+    @staticmethod
+    def _probe(c: IMAPClient) -> Exception | None:
+        """NOOP with PROBE_TIMEOUT, then the normal read timeout again. None when the session answered, else the failure."""
         try:
-            if getattr(getattr(c, "_imap", None), "state", "SELECTED") == "SELECTED":   # unknown state counts as selected
+            _set_timeout(c, PROBE_TIMEOUT)
+            c.noop()
+            _set_timeout(c, READ_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 - the caller decides between this session and the whole path
+            return e
+        return None
+
+    def _flush(self) -> None:
+        """Close every idle pooled session without LOGOUT: the path they share is dead. Sessions in use are not touched."""
+        with self._pool_lock:
+            dead, self._pool = self._pool, []
+        for c, _ in dead:
+            self._kill(c)
+
+    def _checkin(self, c: IMAPClient) -> None:
+        """Return a connection to the pool with no folder open read-write. UNSELECT, never CLOSE: CLOSE would permanently expunge
+        every message flagged \\Deleted in the folder, and moves and deletes here only ever expunge the exact messages they handled.
+        A folder opened read-only (EXAMINE) stays open: nothing can be expunged through it and the next SELECT or EXAMINE replaces
+        it, which saves a round trip on every read. _ensure_unselected covers the commands that need no folder open."""
+        try:
+            imap = getattr(c, "_imap", None)
+            if getattr(imap, "state", "SELECTED") == "SELECTED":          # unknown state counts as selected read-write
                 if not c.has_capability("UNSELECT"):
                     raise MailError("The server cannot UNSELECT, so this connection is not reused.")
-                c.unselect_folder()
-        except Exception:  # noqa: BLE001 - anything unexpected: do not reuse this session
-            self._discard(c)
+                if not getattr(imap, "is_readonly", False):
+                    c.unselect_folder()
+        except Exception as e:  # noqa: BLE001 - anything unexpected: do not reuse this session
+            if _mail_transport(e):
+                self._kill(c)
+            else:
+                self._discard(c)
             return
         with self._pool_lock:
             if len(self._pool) < self.s.imap_pool_size:
@@ -709,11 +848,15 @@ class MailService:
                 self._pool = [(c, t) for c, t in self._pool if now - t < _IMAP_PING_SECONDS]
         for c, _ in stale:
             self._discard(c)
-        for c, _ in due:
-            try:
-                c.noop()
-            except Exception:  # noqa: BLE001 - a dead session is simply not put back
-                self._discard(c)
+        for i, (c, _) in enumerate(due):
+            failure = self._probe(c)
+            if failure is not None:                      # a dead session is simply not put back
+                self._kill(c)
+                if _path_dead(failure):                  # nor is any other: the path is gone, so no one waits on them
+                    for other, _ in due[i + 1:]:
+                        self._kill(other)
+                    self._flush()
+                    return
                 continue
             with self._pool_lock:
                 keep = len(self._pool) < self.s.imap_pool_size
@@ -723,9 +866,27 @@ class MailService:
                 self._discard(c)
 
     @staticmethod
+    def _ensure_unselected(c: IMAPClient) -> None:
+        """Close a folder a pooled connection left open read-only (UNSELECT, never CLOSE): ENABLE is only legal with no folder
+        open, STATUS should not name the open folder, and RENAME or DELETE of the open folder is server-dependent."""
+        if getattr(getattr(c, "_imap", None), "state", None) == "SELECTED" and c.has_capability("UNSELECT"):
+            c.unselect_folder()
+
+    @staticmethod
     def _discard(c: IMAPClient) -> None:
-        with contextlib.suppress(Exception):
+        """LOGOUT a session being closed, waiting at most LOGOUT_TIMEOUT for the answer."""
+        try:
+            _set_timeout(c, LOGOUT_TIMEOUT)
             c.logout()
+        except Exception:  # noqa: BLE001 - imaplib leaves the socket open when LOGOUT fails
+            MailService._kill(c)
+
+    @staticmethod
+    def _kill(c: IMAPClient) -> None:
+        """Close a session without LOGOUT, by shutting its socket down (never IMAP CLOSE): after a timeout or reset a LOGOUT
+        would only wait for an answer that is not coming."""
+        with contextlib.suppress(Exception):
+            c.shutdown()
 
     def close_pool(self) -> None:
         with self._pool_lock:
@@ -737,22 +898,28 @@ class MailService:
     def imap(self, fresh: bool = False) -> Iterator[IMAPClient]:
         """A logged-in IMAP connection. It comes from a small pool when possible (IMAP_POOL_SIZE, default 2), which saves a TLS
         handshake and login (about a second against iCloud) on every call. Each connection is used by one call at a time. A call
-        that fails leaves its connection out of the pool, since its state is unknown. fresh=True always logs in anew."""
-        fresh, self._tl.fresh = fresh or self._tl.fresh, False
-        reuse = self.s.imap_pool_size > 0 and not fresh
+        that fails leaves its connection out of the pool, since its state is unknown. fresh=True always logs in anew and logs out
+        after; the new session a read retry opens (callctx) goes back to the pool like any other."""
+        explicit, retry, self._tl.fresh = fresh, self._tl.fresh, False
+        pool_after = self.s.imap_pool_size > 0 and not explicit
         self._last_activity = time.monotonic()
-        c = self._checkout() if reuse else None
+        c = None if explicit or retry or self.s.imap_pool_size == 0 else self._checkout()
         self._tl.reused = c is not None
         if c is None:
             callctx.stage("IMAP sign-in")
             c = self._login()
-        ok = False
+        ok = dead = False
         try:
             yield c
             ok = True
+        except BaseException as e:
+            dead = _mail_transport(e)
+            raise
         finally:
-            if ok and reuse:
+            if ok and pool_after:
                 self._checkin(c)
+            elif dead:
+                self._kill(c)
             else:
                 self._discard(c)
 
@@ -760,13 +927,37 @@ class MailService:
         """The folder LIST, kept for a minute: folders rarely change, and every all-folders search and folder lookup needs it.
         Creating a folder here clears it; one made in the Mail app appears within the minute."""
         now = time.monotonic()
-        with self._folders_lock:
-            if self._folders and now - self._folders[0] < _FOLDERS_SECONDS:
-                return self._folders[1]
+        if (kept := self._cached_list()) is not None:
+            return kept
         folders = list(c.list_folders())
         with self._folders_lock:
             self._folders = (now, folders)
         return folders
+
+    def _cached_list(self) -> list[tuple[Any, Any, str]] | None:
+        """The kept folder LIST while it is fresh, without a connection; None when it has to be read again."""
+        with self._folders_lock:
+            if self._folders and time.monotonic() - self._folders[0] < _FOLDERS_SECONDS:
+                return self._folders[1]
+        return None
+
+    def prewarm(self) -> None:
+        """Warm-up: one pooled login, the folder LIST and the special folders' names (no STATUS: the counts would be thrown
+        away), then the rest of the pool logged in at once, so a first all-folders search finds its connections ready. At most
+        IMAP_POOL_SIZE sessions in all; a spare that fails to log in is left out, and the first call that needs it logs in."""
+        with self.imap() as c:
+            self._list(c)
+            for alias in ("sent", "drafts", "trash", "junk", "archive"):
+                with contextlib.suppress(MailError):           # not there: nothing is kept, the call that names it looks again
+                    self.resolve_folder(c, alias)
+        spare = max(0, self.s.imap_pool_size - 1)
+        if not spare:
+            return
+        with ThreadPoolExecutor(max_workers=spare, thread_name_prefix="imap-prewarm") as pool:
+            opened = [pool.submit(self._login) for _ in range(spare)]
+        for f in opened:
+            with contextlib.suppress(Exception):
+                self._checkin(f.result())
 
     def resolve_folder(self, c: IMAPClient, name: str) -> str:
         key = (name or "INBOX").strip().lower()
@@ -777,12 +968,18 @@ class MailService:
         if key in self._folder_cache:
             return self._folder_cache[key]
         flag, fallbacks = _SPECIAL[key]
-        found = None
-        with contextlib.suppress(Exception):
-            found = c.find_special_folder(flag)
+        # The cached LIST first (no round trip once warm): the special-use flag, then the usual names, iCloud's first.
+        # find_special_folder sends its own LIST (and more) and is left for names under a namespace prefix such as INBOX.Sent.
+        folders = self._list(c)
+        want = flag.lower()
+        found = next((f[2] for f in folders
+                      if want in {(bytes(x) if isinstance(x, (bytes, bytearray)) else str(x).encode()).lower() for x in f[0]}), None)
         if not found:
-            existing = {f[2] for f in self._list(c)}
+            existing = {f[2] for f in folders}
             found = next((fb for fb in fallbacks if fb in existing), None)
+        if not found:
+            with contextlib.suppress(Exception):
+                found = c.find_special_folder(flag)
         if not found:
             raise MailError(f"Could not locate the '{name}' folder on the server. Call mail_list_folders for the exact folder names.")
         self._folder_cache[key] = found
@@ -803,6 +1000,7 @@ class MailService:
     @_retrying
     def list_folders(self) -> list[dict[str, Any]]:
         with self.imap() as c:
+            self._ensure_unselected(c)
             out = []
             for flags, _delim, name in self._list(c):
                 fl = [f.decode() if isinstance(f, bytes) else str(f) for f in flags]
@@ -870,7 +1068,8 @@ class MailService:
             if not d:
                 continue
             hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-            hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
+            hdr = _Headers(d.get(hkey))
+            frm = hdr.addrs("From")
             has_att = "attachment" in repr(d.get(b"BODYSTRUCTURE", "")).lower()
             self._remember(folder, uidvalidity, uid, d.get(b"BODYSTRUCTURE"))
             out.append(compact(
@@ -878,19 +1077,26 @@ class MailService:
                     "uid": uid,
                     **({"folder": folder} if per_message_uidvalidity else {}),        # a one-folder result names it once, above
                     **({"uidvalidity": uidvalidity} if uidvalidity is not None and per_message_uidvalidity else {}),
-                    "message_id": _hdr(hdr, "Message-ID"),
-                    "subject": _hdr(hdr, "Subject") or "(no subject)",
-                    "from": addrs_json(parse_addrs(hdr.get_all("From", []))),
-                    "to": addrs_json(parse_addrs(hdr.get_all("To", []))),
-                    "cc": addrs_json(parse_addrs(hdr.get_all("Cc", []))),
+                    "message_id": hdr.text("Message-ID"),
+                    "subject": hdr.text("Subject") or "(no subject)",
+                    "from": addrs_json(frm),
+                    "to": addrs_json(hdr.addrs("To")),
+                    "cc": addrs_json(hdr.addrs("Cc")),
                     "date": _iso_date(hdr, d.get(b"INTERNALDATE")),
                     "size": d.get(b"RFC822.SIZE"),
                     "has_attachments": has_att,
                     **_flag_view(d.get(b"FLAGS", ())),
-                    **bulk_view(hdr),
-                    "safety_warnings": warnings_for(_hdr(hdr, "Subject"), _names(hdr)),   # a subject or display name can carry it too
+                    **bulk_view(hdr, sender=frm[0][1] if frm else None),
+                    "safety_warnings": warnings_for(hdr.text("Subject"), hdr.names()),   # a subject or display name can carry it too
                 }, keep=("uid", "folder", "subject", "from", "date", "unread", "flagged")))   # empty fields left out
         return out
+
+    def _listed(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Summaries as search and list_changes return them: without 'size', which nothing reads, and without 'to' when every
+        recipient is the owner (most received mail), about a quarter of the bytes. _summaries keeps both for its other callers."""
+        own = self.s.own_addresses
+        return [{k: v for k, v in m.items() if k != "size" and not (k == "to" and all(r["email"].lower() in own for r in v))}
+                for m in rows]
 
     def _floor_since(self, since: str | None) -> str | None:
         """MAIL_MAX_AGE_DAYS: a search never reaches further back than the owner allows (the task-scoped access the guidance asks
@@ -942,13 +1148,13 @@ class MailService:
             out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "folder": folder, **({"uidvalidity": uv} if uv is not None else {})}
             if keep is None:
                 page = uids[offset : offset + limit]
-                return {**out, "total_matches": len(uids), "offset": offset, "returned": len(page),
-                        "messages": self._summaries(c, folder, page, uv, per_message_uidvalidity=False),   # uidvalidity once, above
+                rows = self._summaries(c, folder, page, uv, per_message_uidvalidity=False)      # uidvalidity once, above
+                return {**out, "total_matches": len(uids), "offset": offset, "returned": len(page), "messages": self._listed(rows),
                         "complete": True}
             # people_only / since_hours look at each message's summary: the newest _FILTER_SCAN candidates are checked
             found = [m for m in self._summaries(c, folder, uids[:_FILTER_SCAN], uv, per_message_uidvalidity=False) if keep(m)]
             page = found[offset : offset + limit]
-            return {**out, "total_matches": len(found), "offset": offset, "returned": len(page), "messages": page,
+            return {**out, "total_matches": len(found), "offset": offset, "returned": len(page), "messages": self._listed(page),
                     "complete": len(uids) <= _FILTER_SCAN,
                     **({"note": f"Only the newest {_FILTER_SCAN} candidates were checked; narrow the search to see older ones."}
                        if len(uids) > _FILTER_SCAN else {})}
@@ -989,25 +1195,78 @@ class MailService:
         charset = None if all(isinstance(x, (date,)) or str(x).isascii() for x in crit) else "UTF-8"
         return crit, charset
 
+    @staticmethod
+    def _enable_condstore(c: IMAPClient) -> None:
+        """ENABLE CONDSTORE once per connection: iCloud leaves HIGHESTMODSEQ out of EXAMINE without it, and rejects SELECT
+        (CONDSTORE). The mark goes on the connection only once ENABLE was sent with no folder open, the one state it is legal in."""
+        if getattr(c, "_condstore_enabled", False):
+            return
+        MailService._ensure_unselected(c)
+        if getattr(getattr(c, "_imap", None), "state", "AUTH") != "AUTH":
+            return
+        with contextlib.suppress(Exception):          # iCloud applies ENABLE without sending ENABLED back
+            c.enable("CONDSTORE")
+            c._condstore_enabled = True
+
+    def _change_state(self, c: IMAPClient, folder: str) -> tuple[Any, Any, Any, Any, Any] | None:
+        """(uidvalidity, highestmodseq, uidnext, messages, unseen) from one STATUS, with no folder opened; None when the server
+        leaves HIGHESTMODSEQ out (the caller then EXAMINEs). A server that leaves it out even with CONDSTORE enabled is not asked
+        again, so its polls pay no extra round trip."""
+        if not self._status_modseq:
+            return None
+        self._ensure_unselected(c)                        # STATUS on the open folder may answer from a stale view
+        callctx.stage(f"IMAP STATUS {folder}")
+        try:
+            st = c.folder_status(folder, ["MESSAGES", "UNSEEN", "UIDVALIDITY", "UIDNEXT", "HIGHESTMODSEQ"]) or {}
+        except Exception as e:  # noqa: BLE001 - a refused STATUS (missing folder, unknown item) is left to EXAMINE to explain
+            if _mail_transport(e):
+                raise
+            return None
+        state = (st.get(b"UIDVALIDITY"), st.get(b"HIGHESTMODSEQ"), st.get(b"UIDNEXT"), st.get(b"MESSAGES"), st.get(b"UNSEEN"))
+        if None in state[:3]:
+            if state[1] is None and getattr(c, "_condstore_enabled", False):
+                self._status_modseq = False
+            return None
+        return state
+
+    def _examine_state(self, c: IMAPClient, folder: str) -> tuple[Any, Any, Any, Any, Any]:
+        """The same counters from EXAMINE (read-only, so the pooled connection may keep it open); the unread count is not in it."""
+        self._enable_condstore(c)
+        callctx.stage(f"IMAP EXAMINE {folder}")
+        info = c.select_folder(folder, readonly=True) or {}
+        return info.get(b"UIDVALIDITY"), info.get(b"HIGHESTMODSEQ"), info.get(b"UIDNEXT"), info.get(b"EXISTS"), None
+
     @_retrying
     def changes(self, folder: str = "INBOX", since: str | None = None, *, limit: int = 50) -> dict[str, Any]:
         """What changed in a folder since a token from the previous call: new messages, and messages whose flags (read, flagged,
         answered) changed. Uses IMAP CONDSTORE (a per-message change counter), so nothing is re-read. The token carries the
-        folder's uidvalidity; if the server renumbered the folder, the answer says to start over instead of guessing."""
+        folder's uidvalidity; if the server renumbered the folder, the answer says to start over instead of guessing.
+        One STATUS answers the first call and a poll with nothing new; only a poll with changes opens the folder, and then runs
+        one SEARCH and one FETCH."""
         limit = max(1, min(int(limit), 200))
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            with contextlib.suppress(Exception):          # iCloud applies ENABLE without sending ENABLED back
-                c.enable("CONDSTORE")
-            info = c.select_folder(folder, readonly=True) or {}
-            uv, modseq, uidnext = (info.get(b"UIDVALIDITY"), info.get(b"HIGHESTMODSEQ"), info.get(b"UIDNEXT"))
+            state = self._change_state(c, folder)
+            examined = state is None
+            if examined:
+                state = self._examine_state(c, folder)
+            uv, modseq, uidnext, messages, unseen = state
             if modseq is None or uv is None or uidnext is None:
                 raise MailError("This mail server does not report changes (no CONDSTORE); use mail_search_messages with since instead.")
-            token = f"v2:{folder}:{int(uv)}:{int(modseq)}:{int(uidnext)}"
-            base = {"notice": UNTRUSTED_NOTICE, "folder": folder, "uidvalidity": int(uv), "token": token}
+
+            def base_of(uv: Any, modseq: Any, uidnext: Any) -> dict[str, Any]:
+                return {"notice": UNTRUSTED_NOTICE, "folder": folder, "uidvalidity": int(uv),
+                        "token": f"v2:{folder}:{int(uv)}:{int(modseq)}:{int(uidnext)}"}
+
+            def start_over(base: dict[str, Any]) -> dict[str, Any]:
+                return {**base, "start_over": True, "note": "The server renumbered this folder since that token, so changes cannot be "
+                                                            "listed. Use this new token from now on and search the folder normally."}
+
+            base = base_of(uv, modseq, uidnext)
             if not since:
-                unread = len(c.search(["UNSEEN"]))
-                return {**base, "first_call": True, "messages": info.get(b"EXISTS"), "unread": unread,
+                if unseen is None:
+                    unseen = len(c.search(["UNSEEN"]))
+                return {**base, "first_call": True, "messages": messages, "unread": unseen,
                         "note": "Keep this token and pass it as 'since' next time to get only what changed."}
             try:
                 version, rest = since.split(":", 1)
@@ -1020,15 +1279,30 @@ class MailService:
             if old_folder != folder:
                 raise MailError(f"That token belongs to the folder '{old_folder}', not '{folder}'. Use each folder's own token.")
             if old_uv != int(uv):
-                return {**base, "start_over": True, "note": "The server renumbered this folder since that token, so changes cannot be "
-                                                            "listed. Use this new token from now on and search the folder normally."}
-            new = sorted((u for u in c.search(["UID", f"{old_next}:*"]) if u >= old_next), reverse=True)
-            changed = sorted((u for u in c.search(["MODSEQ", str(old_modseq + 1)]) if u < old_next), reverse=True) \
-                if int(modseq) > old_modseq else []
+                return start_over(base)
+            if int(modseq) == old_modseq and int(uidnext) == old_next:     # no flag changed and no uid handed out: nothing to list
+                return {**base, "new_count": 0, "changed_count": 0, "new": [], "changed": []}
+            if not examined:
+                uv2, modseq2, uidnext2, _, _ = self._examine_state(c, folder)
+                if None not in (uv2, modseq2, uidnext2):                   # the newer counters: the SEARCH below starts from them
+                    uv, modseq, uidnext, base = uv2, modseq2, uidnext2, base_of(uv2, modseq2, uidnext2)
+                if uv2 is not None and int(uv2) != old_uv:                 # renumbered between STATUS and EXAMINE
+                    return start_over(base)
+            since_mod = ["MODSEQ", str(old_modseq + 1)]
+            if int(uidnext) == old_next:                   # no uid handed out: flag changes only, and no "n:*" quirk to filter
+                hits = c.search(since_mod)
+            else:                                          # new uids by UID, so new mail is found whatever modseq it was given
+                hits = c.search(["OR", "UID", f"{old_next}:*", *since_mod])
+                if hits and max(hits) < old_next:          # the new mail is gone again: "n:*" then names the top uid, changed or not
+                    hits = c.search(since_mod) if int(modseq) > old_modseq else []
+            new = sorted((u for u in hits if u >= old_next), reverse=True)
+            changed = sorted((u for u in hits if u < old_next), reverse=True)
+            rows = {m["uid"]: m for m in self._listed(
+                self._summaries(c, folder, new[:limit] + changed[:limit], int(uv), per_message_uidvalidity=False))}
             out = {**base, "new_count": len(new), "changed_count": len(changed),
-                   "new": self._summaries(c, folder, new[:limit], int(uv), per_message_uidvalidity=False),
-                   "changed": [{k: m.get(k) for k in ("uid", "subject", "from", "date", "unread", "flagged", "answered")}
-                               for m in self._summaries(c, folder, changed[:limit], int(uv), per_message_uidvalidity=False)]}
+                   "new": [rows[u] for u in new[:limit] if u in rows],
+                   "changed": [{k: v for k, v in rows[u].items() if k in _CHANGED_KEYS and v is not None}   # warnings kept, no nulls
+                               for u in changed[:limit] if u in rows]}
             if len(new) > limit or len(changed) > limit:
                 out["note"] = f"Only the newest {limit} of each are listed; use mail_search_messages for the rest."
             return out
@@ -1040,9 +1314,12 @@ class MailService:
         found: list[dict[str, Any]] = []
         per_folder: dict[str, int] = {}
         skipped: list[str] = []
-        with self.imap() as c:
-            names = [name for flags, _delim, name in self._list(c)
-                     if not {"\\Noselect", "\\NonExistent"} & {f.decode() if isinstance(f, bytes) else str(f) for f in flags}]
+        listed = self._cached_list()                        # fresh: no connection checked out just for the names
+        if listed is None:
+            with self.imap() as c:
+                listed = self._list(c)
+        names = [name for flags, _delim, name in listed
+                 if not {"\\Noselect", "\\NonExistent"} & {f.decode() if isinstance(f, bytes) else str(f) for f in flags}]
 
         def one(name: str) -> tuple[str, int, list[dict[str, Any]]] | None:
             for attempt in (0, 1):
@@ -1068,8 +1345,8 @@ class MailService:
                     if hits or keep is None:
                         per_folder[name] = got[1] if keep is None else len(hits)
                     found += hits
-        found.sort(key=lambda m: m.get("date") or "", reverse=True)
-        page = found[offset : offset + limit]
+        found.sort(key=_sent_at, reverse=True)          # by instant: dates carry their senders' own offsets
+        page = self._listed(found[offset : offset + limit])
         out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "folder": "(all folders)", "total_matches": sum(per_folder.values()),
                                "matches_per_folder": per_folder, "offset": offset, "returned": len(page), "messages": page}
         out["complete"] = not skipped
@@ -1089,18 +1366,33 @@ class MailService:
         raw = d.get(b"BODY[]") or b""
         return raw, d.get(b"FLAGS", ()), d.get(b"INTERNALDATE"), uv
 
+    def _fetch_readable(self, c: IMAPClient, folder: str, uid: int, *, readonly: bool = True, uidvalidity: int | None = None,
+                        want_body: Any = None) -> tuple[bytes, tuple[Any, ...], datetime | None, int | None, bool]:
+        """(message bytes, flags, internal date, uidvalidity, is_skeleton) of one message to read or quote. When a search
+        remembered its structure under the uidvalidity the caller passed (so no extra round trip), _fetch_lean fetches a message
+        with large attachments as a skeleton (want_body: which leaves keep their bodies). Otherwise one whole fetch, as before."""
+        if uidvalidity is None or self._recall(folder, uidvalidity, uid) is None:
+            return (*self._fetch_raw(c, folder, uid, readonly=readonly, uidvalidity=uidvalidity), False)
+        uv = self._select(c, folder, readonly=readonly, expect=uidvalidity)
+        got = self._fetch_lean(c, folder, uv, [uid], want_body).get(uid)
+        if got is None:                                   # gone meanwhile: the plain path gives the usual answer
+            return (*self._fetch_raw(c, folder, uid, readonly=readonly, uidvalidity=uidvalidity), False)
+        raw, flags, internal, skeleton = got
+        return raw, flags, internal, uv, skeleton
+
     @_retrying
     def get_message(self, folder: str, uid: int, *, include_html: bool = False, mark_read: bool = False,
                     uidvalidity: int | None = None, show_hidden: bool = False) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, flags, internal, uv = self._fetch_raw(c, folder, uid, readonly=not mark_read, uidvalidity=uidvalidity)
+            raw, flags, internal, uv, skeleton = self._fetch_readable(c, folder, uid, readonly=not mark_read, uidvalidity=uidvalidity)
             if mark_read:
                 self._tl.mutated = True
                 c.add_flags([uid], [SEEN])
                 flags = tuple(flags) + (SEEN.encode(),)
         return {"notice": UNTRUSTED_NOTICE, **self._message_view(folder, uid, raw, flags, internal, body_chars=self.s.max_body_chars,
-                                                                 include_html=include_html, uidvalidity=uv, show_hidden=show_hidden)}
+                                                                 include_html=include_html, uidvalidity=uv, show_hidden=show_hidden,
+                                                                 skeleton=skeleton)}
 
     @_retrying
     def get_messages(self, folder: str, uids: list[int], *, body_chars: int | None = None, uidvalidity: int | None = None) -> dict[str, Any]:
@@ -1122,17 +1414,18 @@ class MailService:
                 missing.append(uid)
                 continue
             raw, flags, internal, skeleton = d
-            messages.append(self._message_view(folder, uid, raw, flags, internal, body_chars=limit, skeleton=skeleton))
+            messages.append(self._message_view(folder, uid, raw, flags, internal, body_chars=limit, skeleton=skeleton, name_folder=False))
         out: dict[str, Any] = {"notice": UNTRUSTED_NOTICE, "folder": folder, **({"uidvalidity": uv} if uv is not None else {}),
                                "returned": len(messages), "messages": messages}
         out["complete"] = not missing
         if missing:
             out["missing_uids"] = missing
-        if any(m["text_truncated"] for m in messages):
+        if any(m.get("text_truncated") for m in messages):
             out["hint"] = f"Bodies are cut at {limit} characters each; read one in full with mail_get_message."
         return out
 
-    def _fetch_lean(self, c: IMAPClient, folder: str, uv: int | None, uids: list[int]) -> dict[int, tuple[bytes, tuple[Any, ...], Any, bool]]:
+    def _fetch_lean(self, c: IMAPClient, folder: str, uv: int | None, uids: list[int],
+                    want_body: Any = None) -> dict[int, tuple[bytes, tuple[Any, ...], Any, bool]]:
         """uid -> (message bytes, flags, internal date, is_skeleton) for messages to read. A message carrying more than
         _LEAN_ABOVE bytes of non-text parts (PDFs, images) comes as a skeleton: every header and the text bodies, without the
         attachments' contents (mailparts). Everything else, and any skeleton that does not check out, is fetched whole.
@@ -1146,7 +1439,7 @@ class MailService:
                 if roots[uid] is None and bs:
                     with contextlib.suppress(Exception):              # unusual structure: fetched whole below
                         roots[uid] = mailparts.tree(bs)
-        want_body = lambda n: n.ctype in mailparts.BODY_TEXT                  # noqa: E731
+        want_body = want_body or (lambda n: n.ctype in mailparts.BODY_TEXT)
         plans: dict[tuple[str, ...], list[int]] = {}
         for uid in uids:
             root, items = roots.get(uid), ("BODY.PEEK[]",)
@@ -1174,21 +1467,23 @@ class MailService:
 
     def _message_view(self, folder: str, uid: int, raw: bytes, flags: tuple[Any, ...], internal: datetime | None, *,
                       body_chars: int, include_html: bool = False, uidvalidity: int | None = None,
-                      skeleton: bool = False, show_hidden: bool = False) -> dict[str, Any]:
+                      skeleton: bool = False, show_hidden: bool = False, name_folder: bool = True) -> dict[str, Any]:
+        """One message as read tools return it; empty fields left out. name_folder=False when the result names the folder and
+        its uidvalidity once, above (mail_get_messages)."""
         msg = email.message_from_bytes(raw, policy=policy.default)
         if skeleton:
             msg._icloud_skeleton = True
         text, htm = extract_bodies(msg, html_chars=body_chars * 8)
         truncated = False
-        if text and len(text) > body_chars:
-            text, truncated = text[:body_chars], True
-        out: dict[str, Any] = {
+        if text:
+            text = text.replace("\r\n", "\n")                  # before the cut, so body_chars counts what is returned
+            if len(text) > body_chars:
+                text, truncated = text[:body_chars], True
+        out: dict[str, Any] = compact({
             "uid": uid,
-            "folder": folder,
-            **({"uidvalidity": uidvalidity} if uidvalidity is not None else {}),
+            **({"folder": folder, **({"uidvalidity": uidvalidity} if uidvalidity is not None else {})} if name_folder else {}),
             "message_id": _hdr(msg, "Message-ID"),
-            "in_reply_to": _hdr(msg, "In-Reply-To"),
-            "references": _hdr(msg, "References"),
+            "in_reply_to": _hdr(msg, "In-Reply-To"),                  # References is left out: long on real threads, never needed
             "subject": _hdr(msg, "Subject") or "(no subject)",
             "from": addrs_json(parse_addrs(msg.get_all("From", []))),
             "reply_to": addrs_json(parse_addrs(msg.get_all("Reply-To", []))),
@@ -1200,9 +1495,9 @@ class MailService:
             **({"safety_warnings": w} if (w := warnings_for(_hdr(msg, "Subject"), _names(msg), text if text is not None else
                                                            (html_to_text(htm) if htm else None))
                                           + ([HIDDEN_TEXT_WARNING] if htm and hidden_text(htm)[1] else [])) else {}),
-            "attachments": list_attachments(msg),
+            "attachments": [compact(a, keep=("index", "filename", "content_type", "size")) for a in list_attachments(msg)],
             **_flag_view(flags),
-        }
+        }, keep=("uid", "subject", "from", "date", "text", "unread"))
         if include_html and htm is not None:
             out["html"] = strip_hidden_html(htm)[0][: body_chars * 2]
         if show_hidden:
@@ -1218,7 +1513,7 @@ class MailService:
 
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _flags, _internal, uv = self._fetch_raw(c, folder, uid, uidvalidity=uidvalidity)
+            raw, _flags, _internal, uv, _ = self._fetch_readable(c, folder, uid, uidvalidity=uidvalidity, want_body=_booking_body)
         out = extract(raw)
         found = warnings_for(out.get("subject"), json.dumps(out.get("items"), ensure_ascii=False))
         return {"notice": UNTRUSTED_NOTICE, "folder": folder, "uid": uid, **({"uidvalidity": uv} if uv is not None else {}), **out,
@@ -1286,13 +1581,17 @@ class MailService:
     def get_thread(self, folder: str, uid: int, *, uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _, _, uv = self._fetch_raw(c, folder, uid, uidvalidity=uidvalidity)
-            msg = email.message_from_bytes(raw, policy=policy.default)
-            refs = (_hdr(msg, "References") or "").split()
-            own = _hdr(msg, "Message-ID")
-            root = (refs[0] if refs else None) or _hdr(msg, "In-Reply-To") or own
+            uv = self._select(c, folder, expect=uidvalidity)
+            # Only the three threading headers (BODY.PEEK: nothing is marked read), not the whole message.
+            d = c.fetch([uid], ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES)]"]).get(uid)
+            if not d:
+                raise MailError(f"No message with uid {uid} in '{folder}'. Run mail_search_messages again: the message may have been "
+                                "moved, or the folder renumbered (its uidvalidity changed).")
+            hdr = _Headers(next((v for k, v in d.items() if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), b""))
+            refs = (hdr.text("References") or "").split()
+            root = (refs[0] if refs else None) or hdr.text("In-Reply-To") or hdr.text("Message-ID")
             if not root:
-                return {"root_message_id": None, "messages": self._summaries(c, folder, [uid], uv)}
+                return {"notice": UNTRUSTED_NOTICE, "root_message_id": None, "messages": self._summaries(c, folder, [uid], uv)}
             folders = [folder]
             for alias in ("INBOX", "sent"):
                 with contextlib.suppress(MailError):
@@ -1301,12 +1600,13 @@ class MailService:
                         folders.append(f)
             found: list[dict[str, Any]] = []
             for f in folders:
-                uv = self._select(c, f)
+                if f != folder:                           # the source folder is still open, its uidvalidity checked above
+                    uv = self._select(c, f)
                 uids = c.search(["OR", ["HEADER", "References", root], ["HEADER", "Message-ID", root]])
                 found += self._summaries(c, f, sorted(uids), uv)
             seen_ids, unique = set(), []
-            for m in sorted(found, key=lambda m: m.get("date") or ""):
-                key = m["message_id"] or (m["folder"], m["uid"])
+            for m in sorted(found, key=_sent_at):
+                key = m.get("message_id") or (m["folder"], m["uid"])
                 if key in seen_ids:
                     continue
                 seen_ids.add(key)
@@ -1334,10 +1634,10 @@ class MailService:
                     data = c.fetch(uids[i:i + 250], ["INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (FROM TO CC)]"])
                     for d in data.values():
                         hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-                        hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
+                        hdr = _Headers(d.get(hkey))
                         when = d.get(b"INTERNALDATE")
                         for header, field in (("From", "from_them"), ("To", "to_them"), ("Cc", "to_them")):
-                            for name, addr in parse_addrs(hdr.get_all(header, [])):
+                            for name, addr in hdr.addrs(header):
                                 a = addr.lower()
                                 if a == me:
                                     continue
@@ -1347,6 +1647,12 @@ class MailService:
                                     p["names"][name] += 1
                                 if isinstance(when, datetime) and (p["last"] is None or when > p["last"]):
                                     p["last"] = when
+        # What find_correspondents compares a query with, worked out once per scan (so it expires with this cache entry)
+        for addr, p in people.items():
+            local, _, domain = addr.partition("@")
+            words = [w for name in p["names"] for w in norm(name).split()] + re.split(r"[._+\-]+", norm(local)) + [w for w in norm(domain).split(".")]
+            p["_words"], p["_word_set"], p["_norm_addr"] = words, set(words), norm(addr)
+            p["_keyed"] = [keyed(w) for w in words if w]
         return people, scanned
 
     @_retrying
@@ -1362,20 +1668,20 @@ class MailService:
                 hit = self._people_cache[search_all_history] = (time.monotonic(), people, scanned)
         _, people, scanned = hit
         found = []
+        query = [keyed(t) for t in tokens]                                   # normalised and keyed once per call
         for addr, p in people.items():
-            local, _, domain = addr.partition("@")
-            words = [w for name in p["names"] for w in norm(name).split()] + re.split(r"[._+\-]+", norm(local)) + [w for w in norm(domain).split(".")]
+            words = p["_words"]
             exact_scores, approximate = [], False
-            for tok in tokens:
+            for tok, tok_keyed in zip(tokens, query):
                 best = 0.0
-                if any(w == tok for w in words):
+                if tok in p["_word_set"]:
                     best = 1.0
-                elif any(len(tok) >= 3 and w.startswith(tok) for w in words):
+                elif len(tok) >= 3 and any(w.startswith(tok) for w in words):
                     best = 0.9
-                elif len(tok) >= 3 and tok in norm(addr):
+                elif len(tok) >= 3 and tok in p["_norm_addr"]:
                     best = 0.8
                 else:
-                    fuzzy = max((similar_enough(tok, w) for w in words), default=0.0)
+                    fuzzy = max((similar_keyed(tok_keyed, w) for w in p["_keyed"]), default=0.0)
                     if fuzzy:
                         best, approximate = fuzzy, True
                 if best == 0.0:
@@ -1425,9 +1731,11 @@ class MailService:
 
     def _smtp_open(self) -> smtplib.SMTP:
         s = self.s
-        ctx = ssl.create_default_context()
-        server = smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=30) if s.smtp_security == "ssl" else smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=30)
+        ctx = _tls_context()
+        server = (smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=CONNECT_TIMEOUT) if s.smtp_security == "ssl"
+                  else smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=CONNECT_TIMEOUT))
         try:
+            _set_smtp_timeout(server, READ_TIMEOUT)     # the connect timeout covered the handshake and greeting; now reads
             server.ehlo()
             if s.smtp_security == "starttls":
                 server.starttls(context=ctx)
@@ -1439,11 +1747,14 @@ class MailService:
             raise
         return server
 
-    def _smtp_drop(self) -> None:
+    def _smtp_drop(self, quit: bool = True) -> None:
+        """Close the kept connection. quit=False closes it at once: on an idle, dead or failed connection QUIT would only wait
+        for a reply (a round trip at best, the read timeout at worst)."""
         conn, self._smtp = self._smtp, None
         if conn is not None:
-            with contextlib.suppress(Exception):
-                conn[0].quit()
+            if quit:
+                with contextlib.suppress(Exception):
+                    conn[0].quit()
             with contextlib.suppress(Exception):
                 conn[0].close()
 
@@ -1460,9 +1771,11 @@ class MailService:
                     alive = False
                     if time.monotonic() - last <= _SMTP_IDLE_SECONDS:
                         with contextlib.suppress(Exception):
+                            _set_smtp_timeout(conn, PROBE_TIMEOUT)
                             alive = conn.noop()[0] == 250
+                            _set_smtp_timeout(conn, READ_TIMEOUT)
                     if not alive:
-                        self._smtp_drop()
+                        self._smtp_drop(quit=False)
                 if self._smtp is None:
                     self._smtp = (self._smtp_open(), time.monotonic())
                 conn = self._smtp[0]
@@ -1479,7 +1792,7 @@ class MailService:
                 self._smtp_drop()
                 raise MailError(f"Sender address refused ({e.smtp_code}): the From address must be your iCloud address or one of its aliases.") from e
             except (smtplib.SMTPException, OSError) as e:
-                self._smtp_drop()
+                self._smtp_drop(quit=False)                  # a dead or broken connection: QUIT would only wait
                 raise MailError(f"SMTP send failed: {e}. Check Sent before trying again: the message may have gone out. Run icloud_check_health to see which service is failing.") from e
 
     def _summary_of(self, msg: EmailMessage) -> dict[str, Any]:
@@ -1490,7 +1803,25 @@ class MailService:
             "cc": addrs_json(parse_addrs(msg.get_all("Cc", []))),
         }
 
-    def _deliver(self, c: IMAPClient, msg: EmailMessage, *, draft: bool, followup: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _queue_checked(self, msg: EmailMessage, followup: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Queue a message for the owner's approval, after the same gates as a send (ALLOW_SEND, recipient cap, allowlist).
+        Takes no IMAP connection: nothing here reads or writes the mailbox."""
+        if not self.s.allow_send:
+            raise MailError("Sending is disabled on this server (ALLOW_SEND=false). Use draft=true to save a draft instead.")
+        recipients = self._check_recipients(msg)
+        try:
+            q = self.outbox.add(msg.as_bytes(policy=policy.SMTP), recipients, followup)
+        except OutboxFull as e:
+            raise MailError(str(e)) from e
+        return {"status": "queued_for_owner_approval", "sent": False, "outbox_id": q.id, "recipients": recipients,
+                "expires_in_seconds": self.s.outbox_ttl, "approve_at": f"{self.s.public_url}/outbox",
+                "notice": OWNER_APPROVAL_NOTICE, **self._summary_of(msg)}
+
+    def _deliver(self, c: IMAPClient, msg: EmailMessage, *, draft: bool, followup: dict[str, Any] | None = None,
+                 selected: tuple[str, int | None] | None = None) -> dict[str, Any]:
+        """selected: (folder, uidvalidity) the caller just opened read-write on c with the uidvalidity checked, if any."""
+        if not draft and self.s.require_approval and not self.s.local_mode:
+            return self._queue_checked(msg, followup)
         raw = msg.as_bytes(policy=policy.SMTP)
         base = self._summary_of(msg)
         if draft:
@@ -1506,19 +1837,13 @@ class MailService:
             c.append(drafts, raw, flags=[DRAFT, SEEN], msg_time=datetime.now(timezone.utc))
             return {"status": "saved_to_drafts_for_owner_approval", "sent": False, "folder": drafts, "recipients": recipients,
                     "notice": OWNER_DRAFT_NOTICE, **base}
-        if self.s.require_approval:
-            try:
-                q = self.outbox.add(raw, recipients, followup)
-            except OutboxFull as e:
-                raise MailError(str(e)) from e
-            return {"status": "queued_for_owner_approval", "sent": False, "outbox_id": q.id, "recipients": recipients,
-                    "expires_in_seconds": self.s.outbox_ttl, "approve_at": f"{self.s.public_url}/outbox",
-                    "notice": OWNER_APPROVAL_NOTICE, **base}
-        return self._send_and_file(c, msg, raw, recipients, followup, base)
+        return self._send_and_file(c, msg, raw, recipients, followup, base, selected=selected)
 
     def _send_and_file(self, c: IMAPClient, msg: EmailMessage, raw: bytes, recipients: list[str], followup: dict[str, Any] | None,
-                       base: dict[str, Any]) -> dict[str, Any]:
-        """The only place mail actually leaves: SMTP send, Sent copy, and flagging of the original."""
+                       base: dict[str, Any], *, selected: tuple[str, int | None] | None = None) -> dict[str, Any]:
+        """The only place mail actually leaves: SMTP send, Sent copy, and flagging of the original. The original's folder is
+        selected again unless `selected` says this call already opened exactly that folder and uidvalidity read-write on c
+        (the Sent lookup, APPEND and SMTP in between never change the open folder)."""
         refused = self._smtp_send(msg, recipients)
         result: dict[str, Any] = {"status": "sent", "recipients": recipients, **base}
         if refused:
@@ -1530,9 +1855,11 @@ class MailService:
                 result["saved_to"] = sent
             except Exception as e:  # noqa: BLE001
                 result["warning"] = f"Message was sent but could not be copied to the Sent folder: {e}"
+        reselect = bool(followup) and selected != (followup["folder"], followup.get("uidvalidity"))
         if followup and followup.get("action") == "trash":        # a saved draft that was just sent: it goes to Trash
             try:
-                self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
+                if reselect:
+                    self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
                 self._move_messages(c, [followup["uid"]], self.resolve_folder(c, "trash"))
                 result["draft_moved_to_trash"] = True
             except Exception as e:  # noqa: BLE001 - the mail is out; a leftover draft is only untidy
@@ -1540,7 +1867,8 @@ class MailService:
             return result
         if followup:
             try:
-                self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
+                if reselect:
+                    self._select(c, followup["folder"], readonly=False, expect=followup.get("uidvalidity"))
                 c.add_flags([followup["uid"]], [followup["flag"]])
                 if followup["flag"] == ANSWERED:
                     result["original_marked_answered"] = True
@@ -1552,8 +1880,9 @@ class MailService:
                 pass
         return result
 
-    def describe_queued(self, q: QueuedMessage) -> dict[str, Any]:
-        """What the owner reviews before approving: exactly the stored message, envelope included."""
+    def describe_queued(self, q: QueuedMessage, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        """What the owner reviews before approving: exactly the stored message, envelope included. context: this item's entry
+        from approval_contexts when the caller already has it (the page reads every item's at once)."""
         msg = email.message_from_bytes(q.raw, policy=policy.default)
         text, htm = extract_bodies(msg)
         body = text if text is not None else (html_to_text(htm) if htm else "")
@@ -1562,35 +1891,106 @@ class MailService:
             "from": str(msg["From"]), "to": str(msg["To"] or ""), "cc": str(msg["Cc"] or ""), "bcc": str(msg["Bcc"] or ""),
             "envelope_recipients": q.recipients, "subject": str(msg["Subject"] or ""), "body": body,
             "attachments": list_attachments(msg), "is_reply": bool(msg["In-Reply-To"]),
-            **self._approval_context(q),
+            **(context if context is not None else self._approval_context(q)),
         }
 
     def _approval_context(self, q: QueuedMessage) -> dict[str, Any]:
-        """What the owner needs to judge an injected message: the message this one answers or forwards (its sender, subject and
-        the warnings its text carried) and any recipient whose address an agent added to a contact card. Best effort: a
-        failure to read the original never hides the queued item."""
-        out: dict[str, Any] = {}
-        fu = q.followup or {}
-        if fu.get("folder") and fu.get("uid"):
-            try:
-                with self.imap() as c:
-                    folder = self.resolve_folder(c, str(fu["folder"]))
-                    raw, flags, internal, uv = self._fetch_raw(c, folder, int(fu["uid"]), uidvalidity=fu.get("uidvalidity"))
-                view = self._message_view(folder, int(fu["uid"]), raw, flags, internal, body_chars=2000, uidvalidity=uv)
-                out["original"] = {k: view.get(k) for k in ("from", "subject", "date", "safety_warnings", "bulk") if view.get(k)}
-            except Exception as e:  # noqa: BLE001
-                out["original"] = {"unavailable": f"{type(e).__name__}"}
+        return self.approval_contexts([q])[q.id]
+
+    def approval_contexts(self, qs: list[QueuedMessage], *, prune: bool = False) -> dict[str, dict[str, Any]]:
+        """What the owner needs to judge an injected message, per queued item id: the message it answers or forwards (its
+        sender, subject, whether it is bulk mail and the warnings its text carried) and any recipient whose address an agent
+        added to a contact card. Best effort: a failure to read an original never hides the queued item. The originals come
+        from a memory-only memo (the approve check reads the same one as the page); prune=True, given the whole queue, forgets
+        items no longer waiting. Agent-added recipients are worked out afresh every time: an agent may add one at any moment."""
         from .agentlog import agent_added_addresses
-        flagged = [r for r in q.recipients if r.lower() in agent_added_addresses(self.s.data_dir)]
-        if flagged:
-            out["agent_added_recipients"] = flagged
+
+        originals = self._originals(qs)
+        if prune:
+            live = {k for q in qs if (k := self._context_key(q)) is not None}
+            with self._contexts_lock:
+                for k in [k for k in self._contexts if k not in live]:
+                    del self._contexts[k]
+        added = agent_added_addresses(self.s.data_dir)           # one read per page, not one per item
+        out: dict[str, dict[str, Any]] = {}
+        for q in qs:
+            ctx: dict[str, Any] = {}
+            if q.id in originals:
+                ctx["original"] = originals[q.id]
+            if flagged := [r for r in q.recipients if r.lower() in added]:
+                ctx["agent_added_recipients"] = flagged
+            out[q.id] = ctx
         return out
+
+    @staticmethod
+    def _context_key(q: QueuedMessage) -> tuple[str, str, Any] | None:
+        fu = q.followup or {}
+        return (q.id, q.sha256, fu.get("uidvalidity")) if fu.get("folder") and fu.get("uid") else None
+
+    def _originals(self, qs: list[QueuedMessage]) -> dict[str, dict[str, Any]]:
+        """The original's fields per item id: from the memo, else read folder by folder on one pooled connection (one SELECT
+        per folder, one FETCH of the whole messages, the same view as mail_get_message, so the warnings are the same)."""
+        out: dict[str, dict[str, Any]] = {}
+        todo: dict[str, list[QueuedMessage]] = {}
+        with self._contexts_lock:
+            for q in qs:
+                if (key := self._context_key(q)) is None:
+                    continue
+                if key in self._contexts:
+                    out[q.id] = self._contexts[key]
+                else:
+                    todo.setdefault(str(q.followup["folder"]), []).append(q)
+        if not todo:
+            return out
+        try:
+            with self.imap() as c:
+                for folder, group in todo.items():
+                    try:
+                        self._read_originals(c, folder, group, out)
+                    except Exception as e:  # noqa: BLE001 - this folder only; a dead connection ends the whole read
+                        if _mail_transport(e):
+                            raise
+                        for q in group:
+                            out.setdefault(q.id, {"unavailable": type(e).__name__})
+        except Exception as e:  # noqa: BLE001
+            for group in todo.values():
+                for q in group:
+                    out.setdefault(q.id, {"unavailable": type(e).__name__})    # not kept: the next page tries again
+        return out
+
+    def _read_originals(self, c: IMAPClient, folder: str, group: list[QueuedMessage], out: dict[str, dict[str, Any]]) -> None:
+        folder = self.resolve_folder(c, folder)
+        uv = self._select(c, folder)
+        wanted: dict[int, list[QueuedMessage]] = {}
+        for q in group:
+            expect = q.followup.get("uidvalidity")
+            if expect is not None and (uv is None or int(expect) != uv):
+                out[q.id] = {"unavailable": "MailError"}           # renumbered: the uid may name another message now
+            else:
+                wanted.setdefault(int(q.followup["uid"]), []).append(q)
+        data = c.fetch(list(wanted), ["BODY.PEEK[]", "FLAGS", "INTERNALDATE"]) if wanted else {}
+        for uid, items in wanted.items():
+            d = data.get(uid)
+            if not d:
+                for q in items:
+                    out[q.id] = {"unavailable": "MailError"}        # moved or deleted meanwhile
+                continue
+            raw = d.get(b"BODY[]") or b""
+            view = self._message_view(folder, uid, raw, d.get(b"FLAGS", ()), d.get(b"INTERNALDATE"), body_chars=2000, uidvalidity=uv)
+            orig = {k: view[k] for k in ("from", "subject", "date", "safety_warnings") if view.get(k)}
+            if bulk_view(_Headers(raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0])).get("bulk"):
+                orig["bulk"] = True
+            with self._contexts_lock:
+                for q in items:
+                    out[q.id] = self._contexts[self._context_key(q)] = orig
 
     def release(self, item_id: str) -> dict[str, Any]:
         """Send a queued message. Called only from the password-protected approval page, never from an MCP tool."""
         q = self.outbox.claim(item_id)
         if q is None:
             raise MailError("That message is no longer waiting (already released, discarded or expired).")
+        with self._contexts_lock:
+            self._contexts.pop(self._context_key(q), None)
         try:
             if not self.s.allow_send:
                 raise MailError("Sending is disabled on this server (ALLOW_SEND=false).")
@@ -1610,6 +2010,8 @@ class MailService:
             sender=self.sender, to=to_p, cc=cc_p, bcc=bcc_p, subject=subject, text=body, html=body_html,
             signature=self.s.signature, attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
         )
+        if not draft and self.s.allow_send and self.s.require_approval and not self.s.local_mode:
+            return _with_layout(self._queue_checked(msg), body)          # only queued: no mailbox access needed
         with self.imap() as c:
             return _with_layout(self._deliver(c, msg, draft=draft), body)
 
@@ -1617,7 +2019,7 @@ class MailService:
               uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
+            raw, _, _, uv, _ = self._fetch_readable(c, folder, uid, readonly=False, uidvalidity=uidvalidity)   # a skeleton quotes the same
             original = email.message_from_bytes(raw, policy=policy.default)
             msg = build_reply(
                 original, sender=self.sender, body=body, body_html=body_html, reply_all=reply_all, quote=quote,
@@ -1625,7 +2027,7 @@ class MailService:
                 attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
             )
             result = self._deliver(c, msg, draft=draft, followup={"folder": folder, "uid": uid, "flag": ANSWERED,
-                                                          "uidvalidity": uv})
+                                                          "uidvalidity": uv}, selected=(folder, uv))
             result["in_reply_to"] = str(msg["In-Reply-To"])
             return _with_layout(result, body)
 
@@ -1633,7 +2035,10 @@ class MailService:
                 uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
-            raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
+            if include_attachments:                                           # the attachments' bytes go out again
+                raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
+            else:
+                raw, _, _, uv, _ = self._fetch_readable(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
             original = email.message_from_bytes(raw, policy=policy.default)
             to_p = parse_recipients(to, "to")
             if not to_p and not draft:
@@ -1644,7 +2049,7 @@ class MailService:
                 max_attachment_bytes=self.s.max_attachment_bytes,
             )
             return _with_layout(self._deliver(c, msg, draft=draft, followup={"folder": folder, "uid": uid, "flag": "$Forwarded",
-                                                                           "uidvalidity": uv}), note)
+                                                                           "uidvalidity": uv}, selected=(folder, uv)), note)
 
     @_retrying
     def awaiting_reply(self, days: int = 21, limit: int = 20) -> dict[str, Any]:
@@ -1675,13 +2080,13 @@ class MailService:
                 for uid in chunk:
                     d = data.get(uid) or {}
                     hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-                    hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
-                    people = [(n, a) for n, a in parse_addrs(hdr.get_all("To", []) + hdr.get_all("Cc", []))
+                    hdr = _Headers(d.get(hkey))
+                    people = [(n, a) for n, a in hdr.addrs("To") + hdr.addrs("Cc")
                               if a.lower() not in own and not _NOREPLY.match(a)]
                     when = _instant(_iso_date(hdr, d.get(b"INTERNALDATE")))
                     if people and when:
-                        sent.append({"uid": uid, "people": people, "subject": _hdr(hdr, "Subject") or "(no subject)", "at": when,
-                                     "message_id": (_hdr(hdr, "Message-ID") or "").strip()})
+                        sent.append({"uid": uid, "people": people, "subject": hdr.text("Subject") or "(no subject)", "at": when,
+                                     "message_id": (hdr.text("Message-ID") or "").strip()})
             others = [name for flags, _d, name in self._list(c) if name not in skip
                       and not {"\\Noselect", "\\NonExistent"} & {f.decode() if isinstance(f, bytes) else str(f) for f in flags}]
             referenced: set[str] = set()
@@ -1695,10 +2100,10 @@ class MailService:
                         data = c.fetch(uids[i:i + 250], ["INTERNALDATE", "BODY.PEEK[HEADER.FIELDS (FROM DATE IN-REPLY-TO REFERENCES)]"])
                         for d in data.values():
                             hkey = next((k for k in d if isinstance(k, bytes) and k.startswith(b"BODY[HEADER")), None)
-                            hdr = email.message_from_bytes(d.get(hkey, b""), policy=policy.default)
+                            hdr = _Headers(d.get(hkey))
                             referenced.update(re.findall(r"<[^<>\s]+>", f"{hdr.get('In-Reply-To', '')} {hdr.get('References', '')}"))
                             when = _instant(_iso_date(hdr, d.get(b"INTERNALDATE")))
-                            for _, a in parse_addrs(hdr.get_all("From", [])):
+                            for _, a in hdr.addrs("From"):
                                 if when:
                                     heard.setdefault(a.lower(), []).append(when)
                 except Exception as e:  # noqa: BLE001 - one unreadable folder must not sink the rest
@@ -1738,26 +2143,41 @@ class MailService:
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
             self._select(c, folder, readonly=False, expect=uidvalidity)
+            sets = [uid_set(chunk) for chunk in uid_chunks(uids)]      # a long list goes in several commands
             for val, flag in ((read, SEEN), (flagged, FLAGGED)):
-                if val is True:
-                    c.add_flags(uids, [flag])
-                elif val is False:
-                    c.remove_flags(uids, [flag])
+                if val is None:
+                    continue
+                for seq in sets:        # SILENT: the answer is not read, and imapclient cannot map a non-silent one to a uid set
+                    (c.add_flags if val else c.remove_flags)(seq, [flag], silent=True)
         return {"folder": folder, "uids": uids, "read": read, "flagged": flagged}
 
     @staticmethod
-    def _move_messages(c: IMAPClient, uids: list[int], dst: str) -> None:
+    def _move_messages(c: IMAPClient, uids: list[int], dst: str) -> Any:
         """Move messages out of the selected folder. iCloud does not implement IMAP MOVE, so fall back to
         COPY + flag \\Deleted + UID EXPUNGE of exactly these uids (never a plain EXPUNGE, which would also remove
-        unrelated messages that happen to be flagged \\Deleted)."""
+        unrelated messages that happen to be flagged \\Deleted). A long list goes in chunks (mailbulk.uid_chunks), stopping at
+        the first failure. Returns the COPY answer (its [COPYUID ...] says where the messages landed) when one COPY did it all."""
+        chunks = list(uid_chunks(uids))
         if c.has_capability("MOVE"):
-            c.move(uids, dst)
-            return
+            for chunk in chunks:
+                c.move(uid_set(chunk), dst)
+            return None
         if not c.has_capability("UIDPLUS"):
             raise MailError("This mail server supports neither MOVE nor UIDPLUS, so messages cannot be moved safely.")
-        c.copy(uids, dst)                       # if this fails nothing has been changed
-        c.add_flags(uids, [DELETED], silent=True)
-        c.expunge(uids)                         # UID EXPUNGE: only the copied messages
+        res, moved, total = None, 0, sum(map(len, chunks))
+        for chunk in chunks:
+            seq = uid_set(chunk)
+            try:
+                res = c.copy(seq, dst)          # if this fails nothing more has been changed
+                c.add_flags(seq, [DELETED], silent=True)
+                c.expunge(seq)                  # UID EXPUNGE: only the copied messages
+            except Exception as e:  # noqa: BLE001 - never retried: report what already happened
+                if not moved:
+                    raise
+                raise MailError(f"Stopped after moving {moved} of {total} messages to {dst} ({e}). "
+                                "Search again to see what is left.") from e
+            moved += len(chunk)
+        return res if len(chunks) == 1 else None
 
     def move(self, folder: str, uids: list[int], destination: str, *, uidvalidity: int | None = None) -> dict[str, Any]:
         with self.imap() as c:
@@ -1795,7 +2215,8 @@ class MailService:
     # -- saved drafts ----------------------------------------------------------------
     def _load_draft(self, c: IMAPClient, folder: str, uid: int, uidvalidity: int | None) -> tuple[str, EmailMessage, int | None]:
         folder = self.resolve_folder(c, folder)
-        raw, flags, _, uv = self._fetch_raw(c, folder, uid, uidvalidity=uidvalidity)
+        # Read-write (still BODY.PEEK, so no flag changes): sending or replacing the draft then moves it without a second SELECT.
+        raw, flags, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
         is_draft = any((f.decode() if isinstance(f, bytes) else str(f)).lower() == "\\draft" for f in flags)
         if folder != self.resolve_folder(c, "drafts") and not is_draft:
             raise MailError(f"Message {uid} in '{folder}' is not a saved draft. Only drafts (folder Drafts) can be sent or changed "
@@ -1817,7 +2238,8 @@ class MailService:
                 msg["Date"] = formatdate(localtime=True)
             if msg["Message-ID"] is None:
                 msg["Message-ID"] = make_msgid(domain=(self.s.email_address.rsplit("@", 1)[-1] or None))
-            return self._deliver(c, msg, draft=False, followup={"folder": folder, "uid": uid, "uidvalidity": uv, "action": "trash"})
+            return self._deliver(c, msg, draft=False, followup={"folder": folder, "uid": uid, "uidvalidity": uv, "action": "trash"},
+                                 selected=(folder, uv))
 
     def update_draft(self, uid: int, *, folder: str = "Drafts", uidvalidity: int | None = None, to=None, cc=None, bcc=None,
                      subject: str | None = None, body: str | None = None, body_html: str | None = None,
@@ -1848,7 +2270,7 @@ class MailService:
             drafts = self.resolve_folder(c, "drafts")
             resp = c.append(drafts, new.as_bytes(policy=policy.SMTP), flags=[DRAFT, SEEN], msg_time=datetime.now(timezone.utc))
             m = re.search(rb"APPENDUID (\d+) (\d+)", resp if isinstance(resp, bytes) else str(resp).encode())
-            self._select(c, folder, readonly=False, expect=uv)
+            # the draft's folder is still open read-write from _load_draft (checked uidvalidity); APPEND does not change that
             self._move_messages(c, [uid], self.resolve_folder(c, "trash"))
         out = {"status": "draft_updated", "folder": drafts, "old_uid": uid, "old_draft": "moved to Trash", **self._summary_of(new)}
         if m:
@@ -1878,6 +2300,19 @@ class MailService:
             raise MailError(f"'{exact}' has subfolders. Move or delete them first.")
         return exact, sep
 
+    def _forget_folder(self, name: str) -> None:
+        """After a rename or delete: the folder LIST, any alias (sent, trash, ...) that pointed at the old name, and pooled
+        sessions that still have a folder open read-only (it may be this one, and servers may drop such a session)."""
+        with self._folders_lock:
+            self._folders = None
+        for alias in [k for k, v in list(self._folder_cache.items()) if v == name]:
+            self._folder_cache.pop(alias, None)
+        with self._pool_lock:
+            stale = [p for p in self._pool if getattr(getattr(p[0], "_imap", None), "state", "SELECTED") == "SELECTED"]
+            self._pool = [p for p in self._pool if p not in stale]
+        for c, _ in stale:
+            self._discard(c)
+
     def update_folder(self, name: str, new_name: str) -> dict[str, Any]:
         new_name = (new_name or "").strip()
         if not new_name:
@@ -1886,12 +2321,12 @@ class MailService:
             exact, _ = self._changeable_folder(c, name)
             if any(f[2].lower() == new_name.lower() for f in self._list(c)) and new_name.lower() != exact.lower():
                 raise MailError(f"A folder called '{new_name}' already exists.")
+            self._ensure_unselected(c)
             try:
                 c.rename_folder(exact, new_name)
             except Exception as e:  # noqa: BLE001
                 raise MailError(f"Could not rename '{exact}': {e}.") from e
-        with self._folders_lock:
-            self._folders = None
+        self._forget_folder(exact)
         return {"renamed": True, "from": exact, "to": new_name}
 
     def delete_folder(self, name: str, *, confirm_token: str | None = None) -> dict[str, Any]:
@@ -1920,9 +2355,9 @@ class MailService:
                 all_uids = sorted(c.search(["ALL"]))
                 moved = 0
                 try:
-                    for i in range(0, len(all_uids), 250):
-                        self._move_messages(c, all_uids[i:i + 250], trash)
-                        moved += len(all_uids[i:i + 250])
+                    for chunk in uid_chunks(all_uids):
+                        self._move_messages(c, chunk, trash)
+                        moved += len(chunk)
                 except Exception as e:  # noqa: BLE001 - never retried: report what already happened
                     raise MailError(f"Stopped after moving {moved} of {len(all_uids)} messages to Trash ({e}); the folder was not "
                                     "deleted. Call mail_delete_folder again for a new preview of what is left.") from e
@@ -1930,10 +2365,10 @@ class MailService:
                 left = int((c.folder_status(exact, [b"MESSAGES"]) or {}).get(b"MESSAGES") or 0)
                 if left:
                     raise MailError(f"{moved} messages went to Trash, but {left} arrived meanwhile; the folder was kept. Call again for a new preview.")
+            self._ensure_unselected(c)
             try:
                 c.delete_folder(exact)
             except Exception as e:  # noqa: BLE001
                 raise MailError(f"Could not delete '{exact}': {e}.") from e
-        with self._folders_lock:
-            self._folders = None
+        self._forget_folder(exact)
         return {"deleted": True, "folder": exact, **({"messages_moved_to_trash": count} if count else {})}

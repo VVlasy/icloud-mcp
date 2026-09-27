@@ -21,6 +21,14 @@ CHATS = {"chats": [{"chat_id": "anna@example.org", "participants": ["anna@exampl
                    {"chat_id": "bot@example.org", "participants": ["bot@example.org"], "name": ""}]}
 
 
+def read_one(chats, args):
+    """What the Mac's imessage_read answers with limit 1: the chat record (as imessage_chats has it), or the helper's error."""
+    c = next((x for x in chats["chats"] if x["chat_id"] == args["chat_id"]), None)
+    if c is None:
+        raise BridgeError(f"no conversation with chat_id '{args['chat_id']}' (take it from imessage_list_chats)")
+    return {"chat": {**c, "participants": sorted(c["participants"])}, "messages": [], "complete": True}
+
+
 @pytest.fixture
 def s(tmp_path, monkeypatch):
     for k, v in dict(ICLOUD_USERNAME="me@icloud.com", ICLOUD_APP_PASSWORD="aaaa-bbbb-cccc-dddd", DATA_DIR=str(tmp_path),
@@ -37,8 +45,8 @@ class Bridge:
 
     def call(self, op, args=None):
         self.calls.append((op, args))
-        if op == "imessage_chats":
-            return CHATS
+        if op == "imessage_read":
+            return read_one(CHATS, args)
         if self.fail:
             raise self.fail
         return self.send_answer
@@ -127,7 +135,7 @@ def test_the_tool_exists_only_when_sending_is_allowed_and_writable(s):
 async def test_the_outbox_page_shows_and_sends_a_queued_imessage(s, monkeypatch):
     mcp, provider = create_server(s)
     sent = []
-    mcp._icloud_bridge.call = lambda op, a=None: CHATS if op == "imessage_chats" else (sent.append((op, a)) or {"status": "sent"})
+    mcp._icloud_bridge.call = lambda op, a=None: read_one(CHATS, a) if op == "imessage_read" else (sent.append((op, a)) or {"status": "sent"})
     r = json.loads((await mcp.call_tool("imessage_send_message", {"text": "Lunch <b>tomorrow</b>?", "handle": "anna@example.org"})).content[0].text)
     assert r["status"] == "queued_for_owner_approval" and not sent
     app = mcp.streamable_http_app(host="0.0.0.0")
@@ -148,7 +156,7 @@ def test_never_send_and_hidden_match_the_data_however_it_is_written(s, tmp_path)
                      {"chat_id": "chat901", "participants": ["anna@example.org", "+31 6 1234 5678"], "name": "", "group": True}]}
     for never in (("bot@example.org",), ("0612345678",)):
         m, b, box = svc(dataclasses.replace(s, imessage_never_send=never, imessage_send_allowlist=("*",)), tmp_path)
-        b.call = lambda op, a=None, b=b: b.calls.append((op, a)) or odd
+        b.call = lambda op, a=None, b=b: b.calls.append((op, a)) or read_one(odd, a)
         chat = "Bot@Example.ORG" if "@" in never[0] else "chat901"
         with pytest.raises(IMessageError, match="IMESSAGE_NEVER_SEND"):
             m.send("x", chat_id=chat, outbox=box)
@@ -166,3 +174,31 @@ def test_release_checks_who_is_in_the_group_now(s, tmp_path):
     finally:
         CHATS["chats"][1]["participants"].remove("bot@example.org")
     assert not box.pending() and not [op for op, _ in b.calls if op == "imessage_send"]
+
+
+def test_the_target_is_read_as_one_chat_and_a_missing_chat_sends_nothing(s, tmp_path):
+    m, b, box = svc(dataclasses.replace(s, imessage_send_allowlist=("anna@example.org", "+31600000002"),
+                                        imessage_hidden_chats=("+31699999999",)), tmp_path)
+    q = m.send("Hi all", chat_id="chat900", outbox=box)["outbox_id"]
+    assert b.calls[0] == ("imessage_read", {"chat_id": "chat900", "limit": 1, "exclude": "+31699999999"})   # hidden chats stay hidden
+    assert json.loads(box.pending()[0].raw)["to"]["participants"] == [{"handle": "+31600000002"}, {"handle": "anna@example.org"}]
+    with pytest.raises(BridgeError, match="no conversation"):
+        m.send("Hi", chat_id="chat404", outbox=box)                                       # unknown to the Mac: nothing queued
+    assert len(box.pending()) == 1
+    CHATS["chats"][1]["chat_id"] = "chat901"                                              # the chat is gone by the time of approval
+    try:
+        with pytest.raises(IMessageError, match="dropped"):
+            m.release(box, q)
+    finally:
+        CHATS["chats"][1]["chat_id"] = "chat900"
+    assert not box.pending() and not [op for op, _ in b.calls if op == "imessage_send"]  # dropped, not put back
+
+
+def test_the_target_gets_the_same_participants_as_the_chat_list(s, tmp_path):
+    """imessage_read's chat record and imessage_chats' entry come from the same chat_groups() on the Mac: _check_chat and
+    _permit see the same chat_id, name, group and participants either way, at queue time and at release."""
+    m, b, box = svc(dataclasses.replace(s, imessage_send_allowlist=("*",)), tmp_path)
+    for c in CHATS["chats"]:
+        t = m._target(c["chat_id"], None)
+        assert (t["chat_id"], t["name"], t["group"], t["participants"]) == (c["chat_id"], c["name"], c.get("group", False),
+                                                                           sorted(c["participants"]))
