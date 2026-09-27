@@ -506,7 +506,7 @@ case "reminder_move":
     guard target.allowsContentModifications else { fail("the list '\(target.title)' is read-only") }
     guard r.calendar.source.sourceIdentifier == target.source.sourceIdentifier else {
         fail("'\(from)' and '\(target.title)' are in different accounts (\(r.calendar.source.title), \(target.source.title)); "
-             + "EventKit cannot move a reminder between accounts: create a copy with reminders_create, then delete the original")
+             + "EventKit cannot move a reminder between accounts: create a copy with reminders_create_reminder, then delete the original with reminders_delete_reminder")
     }
     r.calendar = target
     saveOrFail(r)

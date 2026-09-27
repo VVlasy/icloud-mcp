@@ -386,3 +386,22 @@ Same harness (`dev/bench.py --local --latency-ms 40`, 3 runs), 0.12.1 against th
 iCloud answers `STATUS (... HIGHESTMODSEQ)`, so a quiet `mail_list_changes` poll is one command (0.17 s). The one-PROPFIND
 calendar list with Basic credentials sent up front works on iCloud. The local stack's request counts differ from iCloud's
 (Radicale needs no principal discovery round trips); compare live numbers with live numbers.
+
+## Next release: full tool descriptions (a deliberate size increase)
+
+Every tool description now follows one template: a first sentence with the verb, the resource and what sets the tool apart;
+then `Use when` / `Not for` (naming the sibling tool to use instead), `Parameters` (only what the schema text does not say:
+sources, omission, interactions, ranges), `Behavior` (side effects, reversibility, gates, limits), `Returns` and `Errors`.
+Results have no output schema, so the description is the only place an agent learns what comes back and how a call fails.
+The descriptions were written against the Tool Definition Quality Score that Glama publishes per tool, and every claim in them
+was checked against the code.
+
+| measure (every area on, `dev/tool_surface.py`) | before | after |
+|---|---|---|
+| description chars | 21,682 | 131,244 |
+| schema chars | 47,213 | 47,213 |
+| `tools/list` result | 82,035 B | 192,589 B |
+
+That is roughly 27,000 more tokens of tool definitions when every area is on, read once per session. Clients that pay for
+every tool on every turn should use `TOOLS` presets (`TOOLS=essential`, `TOOLS=mail,calendar`), which cut the list to the
+tools a task needs. `LIST_BUDGET` in `tests/test_tool_surface.py` moved from 80,000 to 180,000 bytes accordingly.
