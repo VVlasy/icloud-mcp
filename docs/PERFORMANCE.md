@@ -12,8 +12,10 @@ that claims to make something faster records its numbers here, measured the same
   On localhost a round trip is almost free, so without it the timings hide exactly what the network charges for.
 - `python dev/bench.py --live --env <server .env> [--scratch-calendar NAME]` measures a real account: read-only tools only, plus
   create/update/delete of one event inside the named scratch calendar. It never sends mail and never writes contacts.
-- `python dev/tool_surface.py` measures the text an agent receives before doing anything: tool descriptions, parameter schemas and
-  the instructions.
+- `python dev/tool_surface.py` measures the text an agent receives before doing anything: tool descriptions, parameter schemas,
+  the whole `tools/list` result and the instructions.
+- In the bench tables `bytes` is the result text the model reads (comparable with older runs); `wire bytes` is the whole JSON-RPC
+  response body, which also counts a structuredContent copy where one is sent.
 
 **Read the counts first.** Round trips (TCP connects, logins, IMAP commands, CalDAV and CardDAV requests) are what a real network
 charges for, and they are exact. Local timings are noisy and small.
@@ -316,3 +318,12 @@ About 21 tools arrive across these two releases (drafts and folders, calendars, 
 The parameter-schema budget in `tests/test_tool_surface.py` goes from 38,000 to 52,000 characters and the instructions cap in
 `tests/test_instructions.py` from 6,500 to 8,000. Clients that load too much can still use `TOOLS=essential` or an area preset.
 After the mail drafts and folders PR: 71 tools, 40,283 schema characters, instructions 6,393.
+
+## Results sent once, compact
+
+Each tool result is now serialized once, in the worker thread after cleaning, as one compact JSON text block: no indented copy
+plus a structuredContent duplicate, no outputSchema on any tool, and no block per list item (`MCP_STRUCTURED_CONTENT=true` adds
+structuredContent back for a client that needs it). Tool descriptions lose their docstring indentation, and the HTTP transport
+answers each request with a plain JSON body instead of an event stream (`MCP_JSON_RESPONSE`, default true; the tool timeout is
+then capped at 90 s, below Cloudflare's 100 s). With every area on (`dev/tool_surface.py`): description characters 23,662 to
+21,682, the `tools/list` result 93,182 to 82,035 bytes. Bench figures follow.

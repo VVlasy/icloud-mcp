@@ -332,7 +332,7 @@ def test_a_tool_call_with_no_helper_says_so_plainly(s):
             await mcp.call_tool("reminders_list_lists", {})
         status = await mcp.call_tool("icloud_get_helper_status", {})
         return status.content[0].text
-    assert '"online": false' in asyncio.run(go())
+    assert json.loads(asyncio.run(go()))["online"] is False
 
 
 def test_reminders_list_passes_the_new_arguments_and_shapes_the_answer(s):

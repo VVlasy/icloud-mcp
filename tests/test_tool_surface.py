@@ -10,6 +10,7 @@ from icloud_mcp.config import Settings
 from icloud_mcp.server import create_server, slim_schema
 
 SCHEMA_BUDGET = 52000       # raised for 0.9.0 and 0.10.0 (about 21 new tools), see docs/PERFORMANCE.md
+LIST_BUDGET = 80000         # the whole tools/list result; 87,818 B before results lost their outputSchema and docstrings their indent
 
 
 @pytest.fixture
@@ -47,6 +48,16 @@ def test_every_schema_is_valid_and_the_total_stays_in_budget(mcp):
         assert not list(leftovers(tool.input_schema)), (tool.name, list(leftovers(tool.input_schema)))
         total += len(text)
     assert total <= SCHEMA_BUDGET, total
+
+
+def test_no_output_schema_and_no_docstring_indent(mcp):
+    """Results are one compact JSON text, so an outputSchema would only describe a structuredContent copy that is never sent."""
+    from mcp.types import ListToolsResult
+    tools = asyncio.run(mcp.list_tools())
+    for tool in tools:
+        assert tool.output_schema is None, tool.name
+        assert not [line for line in (tool.description or "").splitlines()[1:] if line[:1].isspace()], tool.name
+    assert len(ListToolsResult(tools=tools).model_dump_json(by_alias=True, exclude_none=True).encode()) <= LIST_BUDGET
 
 
 def test_slimming_keeps_meaning():

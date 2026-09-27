@@ -6,6 +6,7 @@ They exercise the real IMAP/SMTP/CalDAV code paths but NOT iCloud itself (see RE
 import base64
 import contextlib
 import email
+import json
 import pathlib
 import socket
 import time
@@ -385,8 +386,8 @@ async def test_tools_via_mcp_layer(settings, inbox, cal):
 
     mcp, _ = create_server(settings)
     res = await mcp.call_tool("mail_search_messages", {"folder": "INBOX", "limit": 5})
-    payload = res.structured_content if hasattr(res, "structured_content") and res.structured_content else res
-    assert "messages" in str(payload)
+    assert len(res.content) == 1 and res.structured_content is None               # one compact JSON text, no structured copy
+    assert "messages" in json.loads(res.content[0].text)
     with pytest.raises(Exception, match="No message with uid"):
         await mcp.call_tool("mail_get_message", {"folder": "INBOX", "uid": 99999})
     res = await mcp.call_tool("calendar_list_calendars", {})

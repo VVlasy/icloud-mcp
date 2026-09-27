@@ -176,6 +176,8 @@ class Settings:
     shortcuts_allow: tuple[str, ...] = ()   # SHORTCUTS_ALLOW: exact Shortcut names the assistant may run (the Mac keeps its own list too)
     admin_port: int = 0           # ADMIN_PORT: loopback-only admin API for the menu bar app (0 = off); never the tunnelled port
     overrides_active: tuple[str, ...] = ()  # which OVERRIDABLE settings come from DATA_DIR/overrides.json (names only)
+    json_response: bool = True    # MCP_JSON_RESPONSE: answer each POST with one JSON body instead of an SSE stream
+    structured_content: bool = False  # MCP_STRUCTURED_CONTENT: also send each result as structuredContent (for a client that needs it)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -268,6 +270,8 @@ class Settings:
             shortcuts_allow=tuple(n.strip() for n in _str("SHORTCUTS_ALLOW").split(";" if ";" in _str("SHORTCUTS_ALLOW") else ",") if n.strip()),
             admin_port=max(0, _int("ADMIN_PORT", 0)),
             overrides_active=tuple(OVERRIDABLE[k] for k in sorted(overrides)),
+            json_response=_bool("MCP_JSON_RESPONSE", True),
+            structured_content=_bool("MCP_STRUCTURED_CONTENT", False),
         )
 
     # ------------------------------------------------------------------
@@ -276,6 +280,12 @@ class Settings:
         """Every address that is the owner: the account address, the Apple ID, the mail logins and OWNER_ADDRESSES."""
         return {a.strip().lower() for a in (self.email_address, self.username, self.imap_username, self.smtp_username,
                                             *self.owner_addresses) if a and "@" in a}
+
+    @property
+    def effective_tool_timeout(self) -> int:
+        """TOOL_TIMEOUT_SECONDS, but at most 90 s over HTTP with JSON responses: then no byte goes out until the tool finishes,
+        and Cloudflare gives up on an origin that has sent nothing for 100 s (524)."""
+        return min(self.tool_timeout, 90) if self.json_response and not self.local_mode else self.tool_timeout
 
     @property
     def bridge_enabled(self) -> bool:

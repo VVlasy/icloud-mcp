@@ -76,6 +76,29 @@ async def test_no_token_is_still_rejected_in_stateless_mode(s):
     assert r.status_code == 401
 
 
+async def test_a_tool_call_is_answered_with_one_plain_json_body(s):
+    assert s.json_response is True                                             # the shipped default
+    token = await token_for(make_app(s))
+    call = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "icloud_get_time", "arguments": {}}}
+    r, data = await rpc(make_app(s), token, call)
+    assert r.status_code == 200 and r.headers["content-type"].startswith("application/json")
+    content = data["result"]["content"]
+    assert len(content) == 1 and "weekday" in json.loads(content[0]["text"]) and "structuredContent" not in data["result"]
+    r, data = await rpc(make_app(s), token, {**call, "params": {"name": "icloud_get_time", "arguments": {"timezone": "Mars/Base"}}})
+    assert r.status_code == 200 and data["result"]["isError"] is True                 # errors stay is_error text results
+    r, _ = await rpc(make_app(s), "not-a-real-token", call)
+    assert r.status_code == 401
+
+
+def test_json_responses_cap_the_tool_timeout_below_cloudflares_limit(s, monkeypatch):
+    monkeypatch.setenv("TOOL_TIMEOUT_SECONDS", "150")
+    create_server(Settings.from_env())
+    assert server_mod._tool_timeout == 90.0
+    monkeypatch.setenv("MCP_JSON_RESPONSE", "false")                          # event stream: headers go out at once, no cap
+    create_server(Settings.from_env())
+    assert server_mod._tool_timeout == 150.0
+
+
 async def test_a_hung_tool_call_becomes_an_error_not_a_hang(s, monkeypatch):
     monkeypatch.setattr(server_mod, "_tool_timeout", 0.3)
     def slow():
