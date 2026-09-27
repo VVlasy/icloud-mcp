@@ -387,7 +387,7 @@ iCloud answers `STATUS (... HIGHESTMODSEQ)`, so a quiet `mail_list_changes` poll
 calendar list with Basic credentials sent up front works on iCloud. The local stack's request counts differ from iCloud's
 (Radicale needs no principal discovery round trips); compare live numbers with live numbers.
 
-## 0.12.2: full tool descriptions (a deliberate size increase)
+## Next release: full tool descriptions (a deliberate size increase)
 
 Every tool description now follows one template: a first sentence with the verb, the resource and what sets the tool apart;
 then `Use when` / `Not for` (naming the sibling tool to use instead), `Parameters` (only what the schema text does not say:
@@ -398,9 +398,9 @@ was checked against the code.
 
 | measure (every area on, `dev/tool_surface.py`) | before | after |
 |---|---|---|
-| description chars | 21,682 | 124,823 |
+| description chars | 21,682 | 124,910 |
 | schema chars | 47,213 | 47,213 |
-| `tools/list` result | 82,035 B | 185,726 B |
+| `tools/list` result | 82,035 B | 185,930 B |
 
 That is roughly 26,000 more tokens of tool definitions when every area is on, read once per session. Clients that pay for
 every tool on every turn should use `TOOLS` presets (`TOOLS=essential`, `TOOLS=mail,calendar`), which cut the list to the

@@ -10,7 +10,7 @@ from icloud_mcp.config import Settings
 from icloud_mcp.server import create_server, slim_schema
 
 SCHEMA_BUDGET = 52000       # raised for 0.9.0 and 0.10.0 (about 21 new tools), see docs/PERFORMANCE.md
-LIST_BUDGET = 180000        # the whole tools/list result: 0.12.2 gave every tool a full description (use, parameters, behavior,
+LIST_BUDGET = 180000        # the whole tools/list result: the full-description change gave every tool a full description (use, parameters, behavior,
                             # returns, errors) for agents and registry scoring, 80,000 before; see docs/PERFORMANCE.md
 
 
