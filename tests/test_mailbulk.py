@@ -199,6 +199,26 @@ def test_a_mailto_unsubscribe_waiting_for_approval_says_so(box, monkeypatch):
     assert r["unsubscribed"] is False and "approval" in r["waiting"]
 
 
+def test_the_message_is_marked_read_once_an_unsubscribe_was_carried_out(box, monkeypatch):
+    svc, mb = box
+
+    def seen(uid):
+        return "\\Seen" in mb.folders["INBOX"][uid]["flags"]
+    r = mailbulk.unsubscribe(svc, "INBOX", 1, post=lambda u: {"status": 200}, check_url=lambda u: None)
+    assert r["marked_read"] and seen(1)
+    r = mailbulk.unsubscribe(svc, "INBOX", 2, post=lambda u: {"status": 500}, check_url=lambda u: None)  # tried, the sender failed
+    assert r["unsubscribed"] is False and r["marked_read"] and seen(2)
+    monkeypatch.setattr(MailService, "send", lambda self, **kw: {"status": "queued_for_owner_approval", "sent": False})
+    assert mailbulk.unsubscribe(svc, "INBOX", 5)["marked_read"] and seen(5)
+
+
+def test_a_refusal_leaves_the_message_unread(box):
+    svc, mb = box
+    for folder, uid in (("Junk", 1), ("INBOX", 3)):
+        r = mailbulk.unsubscribe(svc, folder, uid, post=lambda u: pytest.fail("posted"), check_url=lambda u: None)
+        assert r["unsubscribed"] is False and "marked_read" not in r and "\\Seen" not in mb.folders[folder][uid]["flags"]
+
+
 # ------------------------------------------------------------------ bulk actions
 def test_a_bulk_action_needs_a_preview_and_its_token(box):
     svc, mb = box

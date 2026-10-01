@@ -842,9 +842,11 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 """Unsubscribe from the mailing list a message came from: the List-Unsubscribe header's one-click request (RFC 8058)
                 or unsubscribe email (sent the normal way, so approval rules apply). When the sender only has an unsubscribe web
                 page (in the header, or the unsubscribe link in the body) and the server allows it, the first call returns a
-                preview (sender, website, link text) and a confirm_token: show the owner, and only with their yes call again with
-                the token; the server then opens that page and clicks through up to three confirmation steps on the same
-                site. No other link is ever followed, and mail in Junk is refused. Only when the user asked to unsubscribe from this sender."""
+                preview (sender, website, link text, the email address a form would get) and a confirm_token: show the owner,
+                and only with their yes call again with the token; the server then opens that page and clicks through up to three
+                confirmation steps on the same site, entering only the address this sender mailed (a Hide My Email alias as
+                itself) where a form asks for it. No other link is ever followed, and mail in Junk is refused. The message is
+                marked read once the unsubscribe is carried out. Only when the user asked to unsubscribe from this sender."""
                 return mailbulk.unsubscribe(mail, folder, uid, uidvalidity=uidvalidity, confirm_token=confirm_token)
 
     # -------------------------------------------------------------- calendar

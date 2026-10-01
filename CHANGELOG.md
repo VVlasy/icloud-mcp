@@ -3,8 +3,19 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
-## 0.13.1
+## 0.14.0
 
+- **Unsubscribe forms that ask for your email address.** When an unsubscribe page wants the address typed in (and often
+  repeated), the server now enters the one address that sender mailed: with Hide My Email the alias itself, taken from
+  iCloud's `X-ICLOUD-HME` header and only when it matches the message's recipient; never the address the alias forwards to,
+  which would undo the alias. Without an alias, one of your own addresses the message was sent to directly (add other
+  aliases to `OWNER_ADDRESSES`). The preview names that address (`email_for_forms`) and the `confirm_token` covers it. At
+  most two empty email fields are filled ("email", "repeat email"); a form with a CAPTCHA (reCAPTCHA, hCaptcha, Turnstile,
+  Friendly Captcha), any other field to type, a password or a file is still left for you, and hidden fields are never filled.
+- **The message is marked read when you unsubscribe from it.** Once `mail_unsubscribe_from_list` carries an unsubscribe
+  out (one-click request sent, unsubscribe email sent or queued for approval, web page opened), whatever the sender's answer,
+  the message gets `\Seen` and the result says `marked_read`. A preview or a refusal (Junk, no unsubscribe option, sending
+  off) leaves it as it was.
 - **Czech unsubscribe pages that say "Odhlášení proběhlo úspěšně" count as done.** The noun alone is still treated as a
   heading, not a result, but with a finished verb (proběhlo, bylo úspěšné / dokončeno / provedeno) or "jste se
   odhlásili" the page is recognised as a finished unsubscribe. Before, such a page (Exponea, seen on Planeo) was reported

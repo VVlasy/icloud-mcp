@@ -14,6 +14,10 @@ it to the user, and only a call with the preview's confirm_token opens it. What 
   asks for nothing the user would have to type (an empty email box, a required field). Optional fields (a "why are you leaving"
   survey) go empty; one "unsubscribe from all" box is ticked when its label clearly says so. Bodies are read up to a cap (counted
   after decompression), the whole visit has one time limit, and pages are only returned as short text, with the path taken.
+- form_address: the one address a form that asks for an email may be given, the address this sender mailed: a Hide My Email
+  alias as itself (never the address it forwards to, which would undo the alias), or one of the owner's addresses the message was
+  sent to directly. The preview names it and the token covers it. At most two empty email fields ("email", "repeat email") are
+  filled; a form with a CAPTCHA, or any other field to type, is left for the user.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import re
 import socket
 import time
 import zlib
+from email.utils import getaddresses
 from html.parser import HTMLParser
 from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -46,6 +51,11 @@ _DONE = re.compile(
     r"unsubscribed|been removed|no longer receive|odhl[aá][sš]en(?![ií]\b)(?!í)|odhl[aá][sš]eni\b|abgemeldet|d[ée]sinscrit|"
     r"dado de baja|wypisan|nebudete.{0,40}?dost[aá]vat|"
     r"odhl[aá][sš]en[ií]\s+(?:prob[eě]hl|byl[oa]?\s+(?:[uú]sp[eě][sš]n|dokon[cč]en|proveden))|\bodhl[aá]sil[aiy]?\b")
+# A text box for an email address, by its name, id, placeholder, autocomplete or label attribute.
+_EMAIL_FIELD = re.compile(r"e-?mail|\bmail\b", re.I)
+# A CAPTCHA in a form (reCAPTCHA, hCaptcha, Cloudflare Turnstile, Friendly Captcha): never solved, the form is left for the user.
+_CAPTCHA = re.compile(r"g-recaptcha|h-captcha|cf-turnstile|frc-captcha", re.I)
+MAX_EMAIL_FIELDS = 2      # "email" and "repeat email"
 
 MAX_REDIRECTS = 5
 MAX_CLICKS = 3
@@ -125,6 +135,30 @@ def find_link(html: str | None, plain: str | None) -> dict[str, str] | None:
     return best
 
 
+def form_address(to_cc: list[str], hme: list[str], own: set[str]) -> tuple[str | None, str]:
+    """The address an unsubscribe form may be given, the one this sender mailed: (address, how it was found) or (None, why not).
+
+    to_cc are the message's To and Cc headers, hme its X-ICLOUD-HME headers ("p=<alias>; d=<site>; f=<forwarded to>; ..."). With
+    Hide My Email the alias is used, and only when it is the message's recipient; the forwarding address (f=) never is, since
+    handing it to the sender would undo the alias. Without it, one of the owner's addresses the message was sent to directly."""
+    rcpts = {a.strip().lower() for _, a in getaddresses(to_cc) if "@" in a}
+    aliases = set()
+    for h in hme:
+        params = dict(p.strip().split("=", 1) for p in h.split(";") if "=" in p)
+        if alias := params.get("p", "").strip().lower():
+            aliases.add(alias)
+    if aliases:
+        if len(aliases) == 1 and aliases <= rcpts:
+            return next(iter(aliases)), "the Hide My Email alias this message was sent to"
+        return None, "the message's Hide My Email header does not match its recipient"
+    mine = rcpts & {a.lower() for a in own}
+    if len(mine) == 1:
+        return next(iter(mine)), "your address this message was sent to"
+    if mine:
+        return None, "the message was sent to more than one of your addresses"
+    return None, "the message was not sent to one of your known addresses (aliases can be added to OWNER_ADDRESSES)"
+
+
 # ------------------------------------------------------------------ opening it
 def public_web(url: str) -> str | None:
     """Why a URL may not be opened, or None when it is a public http(s) address (every resolved address is global)."""
@@ -189,7 +223,7 @@ class _Forms(HTMLParser):
         a = {k.lower(): (v or "") for k, v in attrs}
         if tag == "form":
             self._form = {"action": a.get("action", ""), "method": (a.get("method") or "get").lower(), "fields": [],
-                          "boxes": [], "submits": [], "needs_input": None}
+                          "boxes": [], "submits": [], "needs_input": None, "email_fields": 0, "captcha": False}
             self.forms.append(self._form)
             return
         if tag == "label":
@@ -198,6 +232,8 @@ class _Forms(HTMLParser):
         f = self._form
         if f is None:
             return
+        if "data-sitekey" in a or _CAPTCHA.search(a.get("class", "")) or _CAPTCHA.search(a.get("name", "")):
+            f["captcha"] = True
         required = "required" in a
         if tag == "input":
             kind = (a.get("type") or "text").lower()
@@ -215,10 +251,18 @@ class _Forms(HTMLParser):
                     f.setdefault("required_radios", set()).add(box["name"])
             elif kind not in ("button", "reset"):
                 empty = not a.get("value")
-                if kind != "hidden" and empty and (required or kind == "email"):
-                    f["needs_input"] = f["needs_input"] or ("an email address" if kind == "email" else "a required field")
-                if a.get("name"):
-                    f["fields"].append((a["name"], a.get("value", "")))
+                hint = " ".join(a.get(k, "") for k in ("name", "id", "placeholder", "autocomplete", "aria-label"))
+                if kind != "hidden" and empty and (kind == "email" or kind == "text" and _EMAIL_FIELD.search(hint)):
+                    if a.get("name"):
+                        f["fields"].append((a["name"], None))     # the address for this sender goes here (see _pick_form)
+                        f["email_fields"] += 1
+                    else:
+                        f["needs_input"] = f["needs_input"] or "an email address"
+                else:
+                    if kind != "hidden" and empty and required:
+                        f["needs_input"] = f["needs_input"] or "a required field"
+                    if a.get("name"):
+                        f["fields"].append((a["name"], a.get("value", "")))
         elif tag == "button":
             kind = (a.get("type") or "submit").lower()
             self._button = {"name": a.get("name", ""), "value": a.get("value", ""), "text": "", "submit": kind == "submit"}
@@ -280,9 +324,9 @@ def _site(host: str | None) -> str:
     return ".".join(labels[-2:])
 
 
-def _pick_form(html: str, page_text: str, *, first: bool) -> tuple[dict[str, Any] | None, str | None]:
+def _pick_form(html: str, page_text: str, *, first: bool, email: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
     """The one form to submit on this page, or (None, why not). The first click needs a page about unsubscribing; later clicks
-    (a confirm, a survey) also accept a continue/send button."""
+    (a confirm, a survey) also accept a continue/send button. Empty email fields get `email` (see form_address), or stop it."""
     if first and not _UNSUB.search(_norm(page_text)):
         return None, "the page does not say anything about unsubscribing"
     p = _Forms()
@@ -302,9 +346,15 @@ def _pick_form(html: str, page_text: str, *, first: bool) -> tuple[dict[str, Any
     if len(matches) > 1:
         return None, "more than one form could be the next step"
     form, button = matches[0]
+    if form["captcha"]:
+        return None, "the form has a CAPTCHA, which the user has to solve"
     if form["needs_input"]:
         return None, f"the form asks for {form['needs_input']}, which the user has to fill in"
-    data = list(form["fields"])
+    if form["email_fields"] > MAX_EMAIL_FIELDS:
+        return None, f"the form asks for more than {MAX_EMAIL_FIELDS} email addresses"
+    if form["email_fields"] and not email:
+        return None, "the form asks for an email address, which the user has to fill in"
+    data = [(k, email if v is None else v) for k, v in form["fields"]]
     boxes = form["boxes"]
     data += [(b["name"], b["value"]) for b in boxes if b["checked"] and b["name"]]
     every = [b for b in boxes if not b["checked"] and b["name"] and _ALL.search(_norm(b["label"]))]
@@ -320,7 +370,8 @@ def _pick_form(html: str, page_text: str, *, first: bool) -> tuple[dict[str, Any
         return None, "the form asks for a required choice, which the user has to make"
     data += [(button["name"], button["value"])] if button["name"] else []
     return {"action": form["action"], "method": form["method"], "data": data, "button": button["text"].strip()[:60],
-            **({"ticked": ticked["label"].strip()[:80]} if ticked else {})}, None
+            **({"ticked": ticked["label"].strip()[:80]} if ticked else {}),
+            **({"entered": email} if form["email_fields"] else {})}, None
 
 
 def _read(response: Any, deadline: float) -> tuple[str, bool]:
@@ -386,8 +437,9 @@ def _request(client: Any, method: str, url: str, check: Callable[[str], str | No
 
 
 def open_link(url: str, *, to_text: Callable[[str], str], check: Callable[[str], str | None] | None = None,
-              transport: Any = None) -> dict[str, Any]:
-    """Open an unsubscribe page and click through its confirmation steps (at most MAX_CLICKS). to_text turns HTML into text."""
+              transport: Any = None, email: str | None = None) -> dict[str, Any]:
+    """Open an unsubscribe page and click through its confirmation steps (at most MAX_CLICKS). to_text turns HTML into text;
+    email (from form_address, confirmed by the owner) goes into a form's empty email fields, without it such a form is not sent."""
     check = check or public_web
     deadline = time.monotonic() + MAX_SECONDS
     # trust_env=False: a proxy from the environment would make its own connection and skip the pinned, checked address.
@@ -409,7 +461,7 @@ def open_link(url: str, *, to_text: Callable[[str], str], check: Callable[[str],
         for click in range(MAX_CLICKS):
             if not (is_html and 200 <= status < 300) or _DONE.search(_norm(text)):
                 break
-            form, why = _pick_form(body, text, first=click == 0)
+            form, why = _pick_form(body, text, first=click == 0, email=email)
             if not form:
                 if why:
                     out["stopped"] = f"No form was submitted: {why}." if click == 0 else f"Stopped after {click} click(s): {why}."
@@ -437,6 +489,7 @@ def open_link(url: str, *, to_text: Callable[[str], str], check: Callable[[str],
                 break
             text = to_text(body) if is_html else body
             steps.append({"clicked": form["button"], **({"ticked": form["ticked"]} if "ticked" in form else {}),
+                          **({"entered_email": form["entered"]} if "entered" in form else {}),
                           "then": urlsplit(final).hostname, "status": status})
         else:
             if not _DONE.search(_norm(text)):
