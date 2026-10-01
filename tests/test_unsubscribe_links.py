@@ -384,6 +384,44 @@ def test_form_redirected_on_the_same_site_is_followed():
     assert r["looks_unsubscribed"] and r["clicks"] == 1
 
 
+# ------------------------------------------------------------------ consent boxes
+EXPONEA_CONSENT = """<h2>Odhlášení z odběru e-mailů pro <b>quiet_fox.7k@icloud.com</b></h2>
+    <p>Mrzí nás, že se chcete odhlásit. ... proč si již nepřejete dostávat naše e-maily.</p>
+    <form method="post">
+    <label><input type="checkbox" name="property chodi_casto" checked> E-maily mi chodí příliš často</label>
+    <label><input type="checkbox" name="property nebavi_me"> Obsah e-mailů mě nebaví</label>
+    <label>Mám jiný důvod: <input type="text" name="property_text ostatni"></label>
+    <label><input type="checkbox" name="category email" value="grant" checked> Souhlas se zasíláním e-mailů
+      <small>Souhlas pro zasílání marketingových e-mailů, které obsahují speciální nabídky a slevové akce.</small></label>
+    <button type="submit">ODHLÁSIT</button></form>"""
+
+
+def test_exponea_consent_box_is_unticked_before_sending():
+    """Bloomreach/Exponea (Planeo): sending "category email=grant" with ODHLÁSIT would keep the consent."""
+    posts = []
+
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html=EXPONEA_CONSENT)
+        posts.append(httpx.QueryParams(req.content.decode()).multi_items())
+        return httpx.Response(200, html="<h1>Odhlášení proběhlo úspěšně!</h1>" + EXPONEA_CONSENT.replace(" checked> Souhlas", "> Souhlas"))
+    r = _open(h)
+    assert posts == [[("property_text ostatni", ""), ("property chodi_casto", "on")]]
+    assert r["looks_unsubscribed"] and r["steps"][1]["unticked"][0].startswith("souhlas se zasíláním e-mailů")
+
+
+def test_only_consent_boxes_are_unticked():
+    html = """<p>Unsubscribe</p><form method="post">
+        <label><input type="checkbox" name="news" value="1" checked> I agree to receive newsletters</label>
+        <label><input type="checkbox" name="all" value="1" checked> Unsubscribe from all mailing lists</label>
+        <label><input type="checkbox" name="topic" value="deals" checked> Weekly deals</label>
+        <label><input type="radio" name="freq" value="never" checked> Never</label>
+        <button>Unsubscribe</button></form>"""
+    form, _ = unsublink._pick_form(html, "unsubscribe", first=True)
+    assert form["data"] == [("all", "1"), ("topic", "deals"), ("freq", "never")]
+    assert form["unticked"] == ["i agree to receive newsletters"]
+
+
 # ------------------------------------------------------------------ forms that ask for the email address
 def test_form_address_is_the_alias_never_the_address_it_forwards_to():
     address, how = unsublink.form_address([f"Hide My Email <{ALIAS}>"], [HME], {OWNER})
@@ -488,8 +526,9 @@ class _Conn:
 
 
 class _Mail:
-    def __init__(self, raw: bytes, allow: bool = True):
-        self.raw, self.s = raw, SimpleNamespace(allow_unsubscribe_links=allow, allow_send=False, own_addresses={OWNER})
+    def __init__(self, raw: bytes, allow: bool = True, confirm: bool = True):
+        self.raw, self.s = raw, SimpleNamespace(allow_unsubscribe_links=allow, allow_send=False, own_addresses={OWNER},
+                                                unsubscribe_links_confirm=confirm)
         self.marked = []
 
     @contextmanager
@@ -588,3 +627,14 @@ def test_unknown_recipient_means_no_email_is_entered(monkeypatch):
     assert prev["email_for_forms"]["address"] is None and "OWNER_ADDRESSES" in prev["email_for_forms"]["why_none"]
     mailbulk.unsubscribe(mail, "INBOX", 1, confirm_token=prev["confirm_token"])
     assert seen["email"] is None
+
+
+def test_without_confirmation_the_first_call_opens_the_page(monkeypatch):
+    seen = _capture_visit(monkeypatch)
+    mail = _Mail(_message(PLANEO_FOOTER, {"To": f"Hide My Email <{ALIAS}>", "X-ICLOUD-HME": HME}), confirm=False)
+    done = mailbulk.unsubscribe(mail, "INBOX", 1)
+    assert done["unsubscribed"] and "needs_confirmation" not in done and seen["email"] == ALIAS
+    assert done["page"]["host"] == "cdn.example-esp.com" and done["email_for_forms"]["address"] == ALIAS
+    assert done["marked_read"] and mail.marked == [("INBOX", (1,), True)]
+    with pytest.raises(Exception, match="confirm_token"):          # a token, when given, still has to match
+        mailbulk.unsubscribe(mail, "INBOX", 1, confirm_token="1.0000000000000000")

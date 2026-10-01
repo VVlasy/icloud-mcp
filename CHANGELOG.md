@@ -3,6 +3,17 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
+## 0.15.0
+
+- **Fix: consent boxes are unticked before an unsubscribe form is sent.** Some unsubscribe pages show the marketing consent as
+  a ticked box next to the unsubscribe button (Bloomreach/Exponea: "Souhlas se zasíláním e-mailů", sent as
+  `category email=grant`). Sending the form with it ticked, as 0.13 and 0.14 did, tells the sender to keep the consent. A
+  ticked box whose label is a consent to receive mail (cs, en, de, pl wording) or whose value is `grant` is now left out, and
+  the step says what was `unticked`. Boxes whose own label says unsubscribe, and survey reasons, are sent as they were.
+- **`UNSUBSCRIBE_LINKS_CONFIRM=false` skips the preview.** With `ALLOW_UNSUBSCRIBE_LINKS=true`, the first
+  `mail_unsubscribe_from_list` call then opens the unsubscribe page straight away; the result still names the website and
+  the address entered. Default `true` (preview and `confirm_token` first) is unchanged.
+
 ## 0.14.0
 
 - **Unsubscribe forms that ask for your email address.** When an unsubscribe page wants the address typed in (and often

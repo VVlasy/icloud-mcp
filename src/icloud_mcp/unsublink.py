@@ -12,8 +12,10 @@ it to the user, and only a call with the preview's confirm_token opens it. What 
   unsubscribing; every one only when the page has exactly one form with exactly one matching button, the form posts to the same
   site as the first page that loaded (a redirect that would re-send it elsewhere is refused), it was not submitted before, and it
   asks for nothing the user would have to type (an empty email box, a required field). Optional fields (a "why are you leaving"
-  survey) go empty; one "unsubscribe from all" box is ticked when its label clearly says so. Bodies are read up to a cap (counted
-  after decompression), the whole visit has one time limit, and pages are only returned as short text, with the path taken.
+  survey) go empty; one "unsubscribe from all" box is ticked when its label clearly says so, and a ticked consent box ("Souhlas se
+  zasíláním e-mailů", a consent category sent as "grant") is unticked, since sending it would keep the mail coming. Bodies are read
+  up to a cap (counted after decompression), the whole visit has one time limit, and pages are only returned as short text, with
+  the path taken.
 - form_address: the one address a form that asks for an email may be given, the address this sender mailed: a Hide My Email
   alias as itself (never the address it forwards to, which would undo the alias), or one of the owner's addresses the message was
   sent to directly. The preview names it and the token covers it. At most two empty email fields ("email", "repeat email") are
@@ -51,6 +53,10 @@ _DONE = re.compile(
     r"unsubscribed|been removed|no longer receive|odhl[aá][sš]en(?![ií]\b)(?!í)|odhl[aá][sš]eni\b|abgemeldet|d[ée]sinscrit|"
     r"dado de baja|wypisan|nebudete.{0,40}?dost[aá]vat|"
     r"odhl[aá][sš]en[ií]\s+(?:prob[eě]hl|byl[oa]?\s+(?:[uú]sp[eě][sš]n|dokon[cč]en|proveden))|\bodhl[aá]sil[aiy]?\b")
+# A ticked box that keeps the mail coming: a consent ("Souhlas se zasíláním e-mailů", "I agree to receive newsletters") or a
+# Bloomreach/Exponea consent category (value "grant"). Sent ticked with the unsubscribe button, it tells the sender to keep
+# sending, so on an unsubscribe form it is unticked. A box whose own label says unsubscribe is never one of these.
+_KEEP = re.compile(r"souhlas|consent|einwillig|zgod|\bopt[- ]?in\b|(?<!un)subscri|zas[ií]l[aá]n|dost[aá]vat|receive|newsletter")
 # A text box for an email address, by its name, id, placeholder, autocomplete or label attribute.
 _EMAIL_FIELD = re.compile(r"e-?mail|\bmail\b", re.I)
 # A CAPTCHA in a form (reCAPTCHA, hCaptcha, Cloudflare Turnstile, Friendly Captcha): never solved, the form is left for the user.
@@ -356,7 +362,10 @@ def _pick_form(html: str, page_text: str, *, first: bool, email: str | None = No
         return None, "the form asks for an email address, which the user has to fill in"
     data = [(k, email if v is None else v) for k, v in form["fields"]]
     boxes = form["boxes"]
-    data += [(b["name"], b["value"]) for b in boxes if b["checked"] and b["name"]]
+    ticked_boxes = [b for b in boxes if b["checked"] and b["name"]]
+    unticked = [b for b in ticked_boxes if b["kind"] == "checkbox" and not _UNSUB.search(_norm(b["label"]))
+                and (b["value"].lower() == "grant" or _KEEP.search(_norm(b["label"])))]
+    data += [(b["name"], b["value"]) for b in ticked_boxes if b not in unticked]
     every = [b for b in boxes if not b["checked"] and b["name"] and _ALL.search(_norm(b["label"]))]
     ticked = None
     if len(every) == 1:
@@ -371,6 +380,7 @@ def _pick_form(html: str, page_text: str, *, first: bool, email: str | None = No
     data += [(button["name"], button["value"])] if button["name"] else []
     return {"action": form["action"], "method": form["method"], "data": data, "button": button["text"].strip()[:60],
             **({"ticked": ticked["label"].strip()[:80]} if ticked else {}),
+            **({"unticked": [_norm(b["label"])[:80] or b["name"] for b in unticked]} if unticked else {}),
             **({"entered": email} if form["email_fields"] else {})}, None
 
 
@@ -489,6 +499,7 @@ def open_link(url: str, *, to_text: Callable[[str], str], check: Callable[[str],
                 break
             text = to_text(body) if is_html else body
             steps.append({"clicked": form["button"], **({"ticked": form["ticked"]} if "ticked" in form else {}),
+                          **({"unticked": form["unticked"]} if "unticked" in form else {}),
                           **({"entered_email": form["entered"]} if "entered" in form else {}),
                           "then": urlsplit(final).hostname, "status": status})
         else:
