@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import time
 import tracemalloc
 from contextlib import contextmanager
@@ -20,6 +21,9 @@ PLANEO_FOOTER = """<html><body>
 <p>Odesílatelem tohoto e-mailu je firma FAST ČR, a.s.<br>
 Pokud si již nepřejete dostávat naše výhodné nabidky, klikněte
 <a href="https://cdn.example-esp.com/e/unsub/click">sem</a>.</p></body></html>"""
+OWNER = "owner@me.test"                    # the owner's real address, which an alias forwards to
+ALIAS = "quiet_fox.7k@icloud.com"          # a Hide My Email alias, the only address that sender has
+HME = f"p={ALIAS}; d=www.planeo.test; f={OWNER}; r=to; s=info@planeo.test"   # as iCloud adds it to alias deliveries
 
 
 # ------------------------------------------------------------------ find_link
@@ -67,8 +71,8 @@ def _ok(_url):
     return None
 
 
-def _open(handler, url="https://esp.test/e/unsub/click", check=_ok):
-    return unsublink.open_link(url, to_text=html_to_text, check=check, transport=httpx.MockTransport(handler))
+def _open(handler, url="https://esp.test/e/unsub/click", check=_ok, **kw):
+    return unsublink.open_link(url, to_text=html_to_text, check=check, transport=httpx.MockTransport(handler), **kw)
 
 
 def test_get_that_unsubscribes_directly():
@@ -206,6 +210,34 @@ def test_czech_noun_is_not_success():
         assert not unsublink._DONE.search(unsublink._norm(page)), page
     for page in ("Byli jste odhlášeni.", "E-mail byl odhlášen z odběru", "Jste odhlášena.", "Úspěšně odhlášeno"):
         assert unsublink._DONE.search(unsublink._norm(page)), page
+
+
+def test_czech_noun_with_a_finished_verb_is_success():
+    for page in ("Odhlášení proběhlo úspěšně!", "Odhlášení bylo úspěšné.", "Odhlášení bylo dokončeno", "Úspěšně jste se odhlásili."):
+        assert unsublink._DONE.search(unsublink._norm(page)), page
+    for page in ("Odhlášení proběhne po potvrzení.", "Po úspěšném odhlášení vám přestanou chodit e-maily.",
+                 "Ještě jste se neodhlásili.", "Chcete se odhlásit?"):
+        assert not unsublink._DONE.search(unsublink._norm(page)), page
+
+
+def test_success_page_that_repeats_the_survey_form_is_done():
+    """Exponea (Planeo): after ODHLÁSIT the page says it worked and shows the optional reason form again underneath."""
+    form = """<form method="post" action="/unsubscribe"><input type="hidden" name="token" value="t1">
+        <p>Důvod odhlášení (nepovinné):</p>
+        <label><input type="radio" name="reason" value="many"> Příliš mnoho e-mailů</label>
+        <label><input type="radio" name="reason" value="dull"> Nezajímavý obsah</label>
+        <label><input type="checkbox" name="consent" value="1"> Souhlasím se zpracováním důvodu</label>
+        <button type="submit">ODHLÁSIT</button></form>"""
+    posts = []
+
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html=f"<h1>Odhlášení z odběru</h1>{form}")
+        posts.append(dict(httpx.QueryParams(req.content.decode())))
+        return httpx.Response(200, html=f"<h1>Odhlášení proběhlo úspěšně!</h1>{form}")
+    r = _open(h)
+    assert r["looks_unsubscribed"] and r["clicks"] == 1 and "stopped" not in r
+    assert posts == [{"token": "t1"}]                  # no reason picked, consent left unticked
 
 
 def test_site_helper():
@@ -352,6 +384,89 @@ def test_form_redirected_on_the_same_site_is_followed():
     assert r["looks_unsubscribed"] and r["clicks"] == 1
 
 
+# ------------------------------------------------------------------ forms that ask for the email address
+def test_form_address_is_the_alias_never_the_address_it_forwards_to():
+    address, how = unsublink.form_address([f"Hide My Email <{ALIAS}>"], [HME], {OWNER})
+    assert address == ALIAS and "Hide My Email" in how
+
+
+def test_form_address_refuses_an_alias_that_is_not_the_recipient():
+    # a stale or forged header never lets another address through, least of all the owner's real one
+    assert unsublink.form_address([OWNER], [HME], {OWNER})[0] is None
+    assert unsublink.form_address([ALIAS], [HME, f"p=other.9z@icloud.com; f={OWNER}"], {OWNER})[0] is None
+
+
+def test_form_address_without_hide_my_email():
+    assert unsublink.form_address(["Owner <Owner@Me.test>"], [], {OWNER})[0] == OWNER
+    address, why = unsublink.form_address(["newsletter@planeo.test"], [], {OWNER})   # Bcc'd or a list address
+    assert address is None and "OWNER_ADDRESSES" in why
+    address, why = unsublink.form_address([OWNER, "alias@me.test"], [], {OWNER, "alias@me.test"})
+    assert address is None and "more than one" in why
+
+
+def test_email_form_gets_the_address():
+    seen = {}
+
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html="""<h1>Unsubscribe</h1><p>Enter your email address to unsubscribe.</p>
+                <form method="post" action="/unsub"><input type="hidden" name="list" value="9">
+                <input type="email" name="email" required><button>Unsubscribe</button></form>""")
+        seen["data"] = httpx.QueryParams(req.content.decode()).multi_items()
+        return httpx.Response(200, html="<p>You have been unsubscribed.</p>")
+    r = _open(h, email=ALIAS)
+    assert r["looks_unsubscribed"] and r["steps"][1]["entered_email"] == ALIAS
+    assert seen["data"] == [("list", "9"), ("email", ALIAS)]
+
+
+def test_text_boxes_for_the_email_and_its_repeat_are_both_filled():
+    seen = {}
+
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html="""<h1>Odhlášení z odběru</h1><form method="post" action="/o">
+                <input type="text" name="EmailAddress" placeholder="Váš e-mail" required>
+                <input name="confirm_field" placeholder="Zopakujte e-mail"><button>Odhlásit</button></form>""")
+        seen["data"] = dict(httpx.QueryParams(req.content.decode()))
+        return httpx.Response(200, html="<p>Byli jste odhlášeni.</p>")
+    r = _open(h, email=ALIAS)
+    assert r["looks_unsubscribed"] and seen["data"] == {"EmailAddress": ALIAS, "confirm_field": ALIAS}
+
+
+def test_three_email_boxes_are_left_for_the_user():
+    html = """<p>Unsubscribe</p><form method="post"><input type="email" name="a"><input type="email" name="b">
+        <input type="email" name="c"><button>Unsubscribe</button></form>"""
+    form, why = unsublink._pick_form(html, "unsubscribe", first=True, email=ALIAS)
+    assert form is None and "more than 2" in why
+
+
+def test_captcha_form_is_left_for_the_user():
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html="""<p>Unsubscribe</p><form method="post" action="/u">
+                <input type="email" name="email"><div class="g-recaptcha" data-sitekey="k"></div><button>Unsubscribe</button></form>""")
+        raise AssertionError("must not post")
+    r = _open(h, email=ALIAS)
+    assert r["clicks"] == 0 and "CAPTCHA" in r["stopped"]
+    for widget in ('<input type="hidden" name="cf-turnstile-response">', '<button class="h-captcha" data-sitekey="k">Go</button>'):
+        html = f'<p>Unsubscribe</p><form method="post">{widget}<button>Unsubscribe</button></form>'
+        assert "CAPTCHA" in unsublink._pick_form(html, "unsubscribe", first=True)[1]
+
+
+def test_email_and_another_box_to_type_still_stops():
+    html = """<p>Unsubscribe</p><form method="post"><input type="email" name="email">
+        <input type="text" name="name" required><button>Unsubscribe</button></form>"""
+    form, why = unsublink._pick_form(html, "unsubscribe", first=True, email=ALIAS)
+    assert form is None and "required field" in why
+
+
+def test_hidden_email_field_is_never_filled():
+    html = """<p>Unsubscribe</p><form method="post"><input type="hidden" name="email" value="">
+        <button>Unsubscribe</button></form>"""
+    form, _ = unsublink._pick_form(html, "unsubscribe", first=True, email=ALIAS)
+    assert ("email", "") in form["data"] and "entered" not in form
+
+
 # ------------------------------------------------------------------ mailbulk two-step flow
 def _message(html: str, headers: dict[str, str] | None = None) -> bytes:
     m = EmailMessage()
@@ -374,7 +489,8 @@ class _Conn:
 
 class _Mail:
     def __init__(self, raw: bytes, allow: bool = True):
-        self.raw, self.s = raw, SimpleNamespace(allow_unsubscribe_links=allow, allow_send=False)
+        self.raw, self.s = raw, SimpleNamespace(allow_unsubscribe_links=allow, allow_send=False, own_addresses={OWNER})
+        self.marked = []
 
     @contextmanager
     def imap(self):
@@ -388,6 +504,9 @@ class _Mail:
 
     def _fetch_raw(self, c, folder, uid, uidvalidity=None):
         return self.raw, (), None, 7
+
+    def mark(self, folder, uids, *, read=None, flagged=None, uidvalidity=None):
+        self.marked.append((folder, tuple(uids), read))
 
 
 def test_off_by_default_says_so():
@@ -431,3 +550,41 @@ def test_junk_is_still_refused():
 def test_no_unsubscribe_link_in_body():
     r = mailbulk.unsubscribe(_Mail(_message('<a href="https://x.test/">Shop</a>')), "INBOX", 1)
     assert not r["unsubscribed"] and "no link" in r["reason"]
+
+
+def _capture_visit(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(unsublink, "public_web", lambda url: None)        # no DNS in tests
+    monkeypatch.setattr(unsublink, "open_link",
+                        lambda url, **kw: seen.update(url=url, **kw) or {"opened": True, "looks_unsubscribed": True})
+    return seen
+
+
+def test_preview_names_the_alias_and_the_visit_enters_only_it(monkeypatch):
+    seen = _capture_visit(monkeypatch)
+    mail = _Mail(_message(PLANEO_FOOTER, {"To": f"Hide My Email <{ALIAS}>", "X-ICLOUD-HME": HME}))
+    prev = mailbulk.unsubscribe(mail, "INBOX", 1)
+    assert prev["email_for_forms"]["address"] == ALIAS and ALIAS in prev["next"]
+    assert mail.marked == []                         # a preview changes nothing
+    done = mailbulk.unsubscribe(mail, "INBOX", 1, confirm_token=prev["confirm_token"])
+    assert done["unsubscribed"] and seen["email"] == ALIAS
+    assert done["marked_read"] and mail.marked == [("INBOX", (1,), True)]
+    assert OWNER not in json.dumps(prev) + json.dumps(done) + json.dumps(seen, default=str)
+
+
+def test_confirm_token_covers_the_address(monkeypatch):
+    _capture_visit(monkeypatch)
+    to_alias = _Mail(_message(PLANEO_FOOTER, {"To": ALIAS, "X-ICLOUD-HME": HME}))
+    to_owner = _Mail(_message(PLANEO_FOOTER, {"To": OWNER}))
+    prev = mailbulk.unsubscribe(to_alias, "INBOX", 1)
+    with pytest.raises(Exception, match="confirm_token"):
+        mailbulk.unsubscribe(to_owner, "INBOX", 1, confirm_token=prev["confirm_token"])
+
+
+def test_unknown_recipient_means_no_email_is_entered(monkeypatch):
+    seen = _capture_visit(monkeypatch)
+    mail = _Mail(_message(PLANEO_FOOTER, {"To": "newsletter@planeo.test"}))
+    prev = mailbulk.unsubscribe(mail, "INBOX", 1)
+    assert prev["email_for_forms"]["address"] is None and "OWNER_ADDRESSES" in prev["email_for_forms"]["why_none"]
+    mailbulk.unsubscribe(mail, "INBOX", 1, confirm_token=prev["confirm_token"])
+    assert seen["email"] is None
