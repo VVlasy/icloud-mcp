@@ -1,6 +1,9 @@
 """Unsubscribing through a web page: link detection, the two-step confirm, and the page visit."""
 from __future__ import annotations
 
+import gzip
+import time
+import tracemalloc
 from contextlib import contextmanager
 from email.message import EmailMessage
 from types import SimpleNamespace
@@ -238,6 +241,115 @@ def test_page_is_read_up_to_the_cap():
         return httpx.Response(200, html="<p>" + "x" * (unsublink.MAX_PAGE_BYTES * 3) + "</p>")
     r = _open(h)
     assert r["opened"] and len(r["page_text"]) <= unsublink.PAGE_TEXT_CHARS
+
+
+def test_repeated_field_names_are_all_sent_in_page_order():
+    seen = {}
+
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html="""<p>Unsubscribe from these lists:</p><form method="post" action="/u">
+                <input type="hidden" name="id" value="7">
+                <input type="checkbox" name="list" value="news" checked><input type="checkbox" name="list" value="deals" checked>
+                <button>Unsubscribe</button></form>""")
+        seen["body"], seen["type"] = req.content.decode(), req.headers["content-type"]
+        return httpx.Response(200, html="<p>You have been unsubscribed.</p>")
+    r = _open(h)
+    assert r["looks_unsubscribed"] and seen["type"] == "application/x-www-form-urlencoded"
+    assert httpx.QueryParams(seen["body"]).multi_items() == [("id", "7"), ("list", "news"), ("list", "deals")]
+
+
+def test_connection_goes_to_the_checked_address_under_the_real_name():
+    seen = {"hops": []}
+
+    def h(req):
+        seen["hops"].append((req.url.host, req.headers["host"], req.extensions.get("sni_hostname")))
+        if req.method == "GET":
+            return httpx.Response(200, headers={"set-cookie": "csrf=1; Path=/"},
+                                  html='<p>Unsubscribe?</p><form method="post" action="/u2"><button>Unsubscribe</button></form>')
+        seen["cookie"] = req.headers.get("cookie")
+        return httpx.Response(200, html="<p>You have been unsubscribed.</p>")
+    pinned = unsublink._Pinned(inner=httpx.MockTransport(h), resolve=lambda host, port: (None, "93.184.216.34"))
+    r = unsublink.open_link("https://news.shop.test/u", to_text=html_to_text, check=_ok, transport=pinned)
+    assert r["looks_unsubscribed"] and r["steps"][0]["opened"] == "news.shop.test"
+    assert seen["hops"] == [("93.184.216.34", "news.shop.test", "news.shop.test")] * 2
+    assert seen["cookie"] == "csrf=1"                  # cookies stay with the name, not the address
+
+
+def test_name_that_resolves_private_at_connect_time_is_refused():
+    """DNS rebinding: the check saw a public address, the connection would get a private one."""
+    def h(req):
+        raise AssertionError("must not connect")
+    pinned = unsublink._Pinned(inner=httpx.MockTransport(h), resolve=lambda host, port: unsublink._public_address("127.0.0.1", port))
+    r = unsublink.open_link("https://rebind.test/u", to_text=html_to_text, check=_ok, transport=pinned)
+    assert not r["opened"] and "private" in r["reason"]
+
+
+def test_slow_page_is_cut_off_by_the_time_limit(monkeypatch):
+    monkeypatch.setattr(unsublink, "MAX_SECONDS", 0.3)
+
+    class Drip(httpx.SyncByteStream):
+        def __iter__(self):
+            while True:
+                time.sleep(0.05)
+                yield b"<p>x</p>"
+
+    def h(req):
+        return httpx.Response(200, headers={"content-type": "text/html"}, stream=Drip())
+    start = time.monotonic()
+    r = _open(h)
+    assert not r["opened"] and "longer than" in r["reason"] and time.monotonic() - start < 2
+
+
+def test_compressed_page_is_capped_after_unpacking():
+    bomb = gzip.compress(b"<html><body><p>Unsubscribe</p>" + b"x" * (64 * 1024 * 1024))
+
+    def h(req):
+        assert req.headers["accept-encoding"] == "identity"
+        return httpx.Response(200, headers={"content-type": "text/html", "content-encoding": "gzip"},
+                              stream=httpx.ByteStream(bomb))   # streamed, as from the network (content= is unpacked up front)
+    tracemalloc.start()
+    try:
+        r = _open(h)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert r["opened"] and peak < 16 * 1024 * 1024
+
+
+def test_unknown_compression_is_not_read():
+    def h(req):
+        return httpx.Response(200, headers={"content-type": "text/html", "content-encoding": "br"},
+                              stream=httpx.ByteStream(b"\x8b\x00\x01"))
+    r = _open(h)
+    assert not r["opened"] and "DecodingError" in r["reason"]
+
+
+def test_form_redirected_to_another_site_is_not_resent():
+    calls = []
+
+    def h(req):
+        calls.append((req.method, req.url.host))
+        if req.method == "GET":
+            return httpx.Response(200, html='<p>Unsubscribe</p><form method="post" action="/x"><input type="hidden" name="t" '
+                                            'value="1"><button>Unsubscribe</button></form>')
+        if req.url.host == "esp.test":
+            return httpx.Response(307, headers={"location": "https://collector.evil.test/c"})
+        raise AssertionError("must not re-send the form")
+    r = _open(h)
+    assert calls == [("GET", "esp.test"), ("POST", "esp.test")] and "another site" in r["stopped"]
+
+
+def test_form_redirected_on_the_same_site_is_followed():
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html='<p>Unsubscribe</p><form method="post" action="/x"><button>Unsubscribe</button></form>')
+        if req.url.path == "/x":
+            return httpx.Response(307, headers={"location": "https://www.esp.test/y"})
+        assert req.method == "POST" and req.url.host == "www.esp.test"
+        return httpx.Response(200, html="<p>You have been unsubscribed.</p>")
+    r = _open(h)
+    assert r["looks_unsubscribed"] and r["clicks"] == 1
 
 
 # ------------------------------------------------------------------ mailbulk two-step flow

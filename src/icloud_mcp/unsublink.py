@@ -6,21 +6,27 @@ it to the user, and only a call with the preview's confirm_token opens it. What 
 - find_link: only a link whose own text, or the text just before it ("... nepřejete si dostávat ..., klikněte sem"), says
   unsubscribe in one of the supported languages. The last such link wins (unsubscribe links sit in the footer). Any other link in
   the body is never a candidate, so a message cannot get the server to open an arbitrary URL.
-- open_link: GET with redirects followed by hand, every hop checked to be a public http(s) address. Then up to MAX_CLICKS forms are
-  submitted, one per page, until the page says the address was removed. The first only on a page about unsubscribing; every one
-  only when the page has exactly one form with exactly one matching button, the form posts to the same site as the first page
-  that loaded, it was not submitted before, and it asks for nothing the user would have to type (an empty email box, a required
-  field). Optional fields (a "why are you leaving" survey) go empty; one "unsubscribe from all" box is ticked when its label
-  clearly says so. Bodies are read up to a cap and only returned as short text, with the path taken.
+- open_link: GET with redirects followed by hand, every hop checked to be a public http(s) address, and the connection made to the
+  address that was checked (so a name cannot resolve to a public address for the check and a private one for the visit). Then up
+  to MAX_CLICKS forms are submitted, one per page, until the page says the address was removed. The first only on a page about
+  unsubscribing; every one only when the page has exactly one form with exactly one matching button, the form posts to the same
+  site as the first page that loaded (a redirect that would re-send it elsewhere is refused), it was not submitted before, and it
+  asks for nothing the user would have to type (an empty email box, a required field). Optional fields (a "why are you leaving"
+  survey) go empty; one "unsubscribe from all" box is ticked when its label clearly says so. Bodies are read up to a cap (counted
+  after decompression), the whole visit has one time limit, and pages are only returned as short text, with the path taken.
 """
 from __future__ import annotations
 
 import ipaddress
 import re
 import socket
+import time
+import zlib
 from html.parser import HTMLParser
 from typing import Any, Callable
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
+
+import httpx
 
 # "Unsubscribe" in the wording newsletters actually use (cs, en, de, fr, es, pl, sk). Matched on lowercased, space-collapsed text.
 _UNSUB = re.compile(
@@ -42,6 +48,7 @@ _DONE = re.compile(
 MAX_REDIRECTS = 5
 MAX_CLICKS = 3
 MAX_PAGE_BYTES = 512 * 1024
+MAX_SECONDS = 45          # the whole visit, every page and form together: a server that sends a byte at a time cannot hold it
 PAGE_TEXT_CHARS = 1500
 _UA = "Mozilla/5.0 (compatible; icloud-mcp unsubscribe; owner-confirmed)"
 
@@ -124,15 +131,44 @@ def public_web(url: str) -> str | None:
         return "only http and https addresses are opened"
     if parts.username or parts.password:
         return "the address carries credentials"
+    return _public_address(parts.hostname, parts.port or (443 if parts.scheme.lower() == "https" else 80))[0]
+
+
+def _public_address(host: str, port: int) -> tuple[str | None, str | None]:
+    """(why not, None), or (None, the address to connect to) when every address the name resolves to is global."""
     try:
-        infos = socket.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme.lower() == "https" else 80),
-                                   proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError:
-        return "the address does not resolve"
+        return "the address does not resolve", None
     for info in infos:
         if not ipaddress.ip_address(info[4][0]).is_global:
-            return "the address points into a private or local network"
-    return None
+            return "the address points into a private or local network", None
+    return None, infos[0][4][0]
+
+
+class _Pinned(httpx.BaseTransport):
+    """Connects to the address it has just checked, not to whatever the name resolves to a moment later (DNS rebinding). The Host
+    header, the TLS server name and the certificate check keep the real name; connections are not reused across names."""
+
+    def __init__(self, inner: httpx.BaseTransport | None = None,
+                 resolve: Callable[[str, int], tuple[str | None, str | None]] | None = None) -> None:
+        self._inner = inner or httpx.HTTPTransport(limits=httpx.Limits(max_keepalive_connections=0))
+        self._resolve = resolve or _public_address
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        url = request.url
+        why, ip = self._resolve(url.host, url.port or (443 if url.scheme == "https" else 80))
+        if why or not ip:
+            raise PermissionError(f"{url.host}: {why}")
+        request.url = url.copy_with(host=ip)
+        request.extensions = {**request.extensions, "sni_hostname": url.host}
+        try:
+            return self._inner.handle_request(request)
+        finally:
+            request.url = url               # cookies are kept for the real name
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 class _Forms(HTMLParser):
@@ -285,13 +321,28 @@ def _pick_form(html: str, page_text: str, *, first: bool) -> tuple[dict[str, Any
             **({"ticked": ticked["label"].strip()[:80]} if ticked else {})}, None
 
 
-def _read(response: Any) -> tuple[str, bool]:
-    """The body as text, at most MAX_PAGE_BYTES of it, and whether it was HTML."""
+def _read(response: Any, deadline: float) -> tuple[str, bool]:
+    """The body as text, at most MAX_PAGE_BYTES of it, and whether it was HTML. The cap counts unpacked bytes, so a small compressed
+    body cannot unpack into a large one in memory; compression other than gzip or deflate is not read."""
+    enc = response.headers.get("content-encoding", "").strip().lower()
+    if response.is_stream_consumed:                          # built in memory (a test transport): httpx has unpacked it already
+        chunks, unpack = iter([response.content]), None
+    elif enc in ("gzip", "x-gzip", "deflate"):
+        chunks, unpack = response.iter_raw(), zlib.decompressobj(zlib.MAX_WBITS | 32)   # a gzip or a zlib header, whichever
+    elif enc in ("", "identity"):
+        chunks, unpack = response.iter_raw(), None
+    else:
+        raise httpx.DecodingError(f"the page was sent compressed as {enc}", request=response.request)
     buf = bytearray()
-    for chunk in response.iter_bytes():
-        buf += chunk
-        if len(buf) >= MAX_PAGE_BYTES:
-            break
+    try:
+        for chunk in chunks:
+            buf += unpack.decompress(chunk, MAX_PAGE_BYTES - len(buf)) if unpack else chunk
+            if len(buf) >= MAX_PAGE_BYTES:
+                break
+            if time.monotonic() > deadline:
+                raise TimeoutError
+    except zlib.error as e:
+        raise httpx.DecodingError("the compressed page is damaged", request=response.request) from e
     ctype = response.headers.get("content-type", "")
     charset = response.charset_encoding or "utf-8"
     try:
@@ -301,25 +352,33 @@ def _read(response: Any) -> tuple[str, bool]:
     return text, "html" in ctype.lower() or text.lstrip()[:15].lower().startswith(("<!doctype", "<html"))
 
 
-def _request(client: Any, method: str, url: str, check: Callable[[str], str | None],
+def _request(client: Any, method: str, url: str, check: Callable[[str], str | None], deadline: float,
              data: list[tuple[str, str]] | None = None) -> tuple[str, int, str, bool]:
-    """One request with redirects followed by hand, each hop checked. Returns (final_url, status, body, is_html)."""
+    """One request with redirects followed by hand, each hop checked. Returns (final_url, status, body, is_html). A redirect that
+    keeps a form's POST (307, 308) has to stay on the form's site; any other redirect drops the form's fields."""
     for _ in range(MAX_REDIRECTS + 1):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
         if why := check(url):
             raise PermissionError(f"{urlsplit(url).hostname or url}: {why}")
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"timeout": min(15.0, left)}
         if data is not None:
-            if method == "POST":
-                kwargs["data"] = dict(data) if len({k for k, _ in data}) == len(data) else data
+            if method == "POST":            # encoded here: a form can repeat a name (several ticked boxes), kept in page order
+                kwargs["content"] = urlencode(data).encode()
+                kwargs["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
             else:
                 kwargs["params"] = data
         with client.stream(method, url, **kwargs) as r:
             if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
-                url = urljoin(url, r.headers["location"])
-                if r.status_code in (301, 302, 303):
+                nxt = urljoin(url, r.headers["location"])
+                if r.status_code in (301, 302, 303) or method != "POST":
                     method, data = "GET", None
+                elif _site(urlsplit(nxt).hostname) != _site(urlsplit(url).hostname):
+                    raise PermissionError(f"{urlsplit(nxt).hostname}: a redirect would send the form on to another site")
+                url = nxt
                 continue
-            body, is_html = _read(r)
+            body, is_html = _read(r, deadline)
             return url, r.status_code, body, is_html
     raise PermissionError(f"more than {MAX_REDIRECTS} redirects")
 
@@ -327,14 +386,17 @@ def _request(client: Any, method: str, url: str, check: Callable[[str], str | No
 def open_link(url: str, *, to_text: Callable[[str], str], check: Callable[[str], str | None] | None = None,
               transport: Any = None) -> dict[str, Any]:
     """Open an unsubscribe page and click through its confirmation steps (at most MAX_CLICKS). to_text turns HTML into text."""
-    import httpx
-
     check = check or public_web
-    with httpx.Client(timeout=15, follow_redirects=False, headers={"User-Agent": _UA}, transport=transport) as client:
+    deadline = time.monotonic() + MAX_SECONDS
+    # trust_env=False: a proxy from the environment would make its own connection and skip the pinned, checked address.
+    with httpx.Client(timeout=15, follow_redirects=False, headers={"User-Agent": _UA, "Accept-Encoding": "identity"},
+                      transport=transport if transport is not None else _Pinned(), trust_env=False) as client:
         try:
-            final, status, body, is_html = _request(client, "GET", url, check)
+            final, status, body, is_html = _request(client, "GET", url, check, deadline)
         except PermissionError as e:
             return {"opened": False, "reason": f"Not opened: {e}."}
+        except TimeoutError:
+            return {"opened": False, "reason": f"The page took longer than {MAX_SECONDS} seconds to load."}
         except httpx.HTTPError as e:
             return {"opened": False, "reason": f"The page could not be loaded ({type(e).__name__})."}
         site = _site(urlsplit(final).hostname)
@@ -361,9 +423,12 @@ def open_link(url: str, *, to_text: Callable[[str], str], check: Callable[[str],
                 break
             sent.add(key)
             try:
-                final, status, body, is_html = _request(client, method, action, check, form["data"])
+                final, status, body, is_html = _request(client, method, action, check, deadline, form["data"])
             except PermissionError as e:
-                out["stopped"] = f"The form was not sent: {e}."
+                out["stopped"] = f"Stopped at the form: {e}."
+                break
+            except TimeoutError:
+                out["stopped"] = f"Stopped: the pages took longer than {MAX_SECONDS} seconds."
                 break
             except httpx.HTTPError as e:
                 out["stopped"] = f"The form could not be sent ({type(e).__name__})."
