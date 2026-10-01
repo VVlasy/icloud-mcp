@@ -546,6 +546,7 @@ Everything is an environment variable. [`.env.example`](https://github.com/epine
 | `SEND_ALLOWLIST` | empty | Only these addresses or domains may receive mail (`@example.org,friend@example.com`) |
 | `MAX_RECIPIENTS` | 25 | Per message |
 | `ALLOW_PERMANENT_DELETE` | false | Allow deleting mail from Trash |
+| `ALLOW_UNSUBSCRIBE_LINKS` | false | Let `mail_unsubscribe_from_list` open a sender's unsubscribe web page (header or the unsubscribe link in the body) after the owner confirms a preview |
 | `SAVE_SENT_COPY` | true | Copy sent mail to Sent (iCloud doesn't do it itself) |
 | `MAX_BODY_CHARS`, `MAX_ATTACHMENT_BYTES` | 30000, 5 MiB | Result size caps |
 | `MCP_PUBLIC_URL`, `MCP_OWNER_PASSWORD` | required when hosted | Public https address; owner password (12+ characters) |

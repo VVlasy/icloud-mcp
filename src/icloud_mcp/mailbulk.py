@@ -5,8 +5,10 @@
 - senders: who fills a folder, grouped by address, with counts, unread counts and whether each sender can be unsubscribed from.
 - unsubscribe: RFC 8058 one-click (an HTTPS POST to the address in the List-Unsubscribe header, only when List-Unsubscribe-Post
   says it is one-click), or a mailto unsubscribe sent through the normal send path (so approval, allowlist and ALLOW_SEND apply).
-  Links in the message body are never followed, plain unsubscribe web pages are never opened (they are returned for the user),
-  mail in Junk is refused (unsubscribing from spam confirms the address is alive), and the POST only goes to public addresses.
+  Mail in Junk is refused (unsubscribing from spam confirms the address is alive), and the POST only goes to public addresses.
+  Without one-click or mailto, an unsubscribe web page (from the header, or the unsubscribe link in the body) is returned for the
+  user to open, or, with ALLOW_UNSUBSCRIBE_LINKS=true, opened by the server in two steps: a preview with a confirm_token, then
+  the visit (see unsublink.py). No other link in a body is ever followed.
 - bulk_action: move / archive / trash / mark read for everything matching a search, in two steps. A dry run returns the count, a
   sample and a confirm_token that stands for exactly those messages; running needs that token, so the agent must preview first
   and nothing that arrived in between is touched. Every run is logged by Message-ID and can be undone with bulk_undo; messages
@@ -133,17 +135,20 @@ def _post_one_click(url: str) -> dict[str, Any]:
             return {"status": r.status_code}
 
 
-def unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int | None = None,
-                post: Callable[[str], dict[str, Any]] | None = None, check_url: Callable[[str], str | None] | None = None) -> dict[str, Any]:
+def unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int | None = None, confirm_token: str | None = None,
+                post: Callable[[str], dict[str, Any]] | None = None, check_url: Callable[[str], str | None] | None = None,
+                open_page: Callable[[str], dict[str, Any]] | None = None) -> dict[str, Any]:
     """Unsubscribe from the list that sent one message. The sender's name, its addresses and whatever its server answered are a
     stranger's text, so the result carries safety_warnings when any of it looks like instructions."""
-    out = _unsubscribe(mail, folder, uid, uidvalidity=uidvalidity, post=post, check_url=check_url)
+    out = _unsubscribe(mail, folder, uid, uidvalidity=uidvalidity, confirm_token=confirm_token, post=post, check_url=check_url,
+                       open_page=open_page)
     found = warnings_for(json.dumps(out, ensure_ascii=False))
     return {**out, "safety_warnings": found} if found else out
 
 
-def _unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int | None = None,
-                 post: Callable[[str], dict[str, Any]] | None = None, check_url: Callable[[str], str | None] | None = None) -> dict[str, Any]:
+def _unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int | None = None, confirm_token: str | None = None,
+                 post: Callable[[str], dict[str, Any]] | None = None, check_url: Callable[[str], str | None] | None = None,
+                 open_page: Callable[[str], dict[str, Any]] | None = None) -> dict[str, Any]:
     post, check_url = post or _post_one_click, check_url or _public_https
     with mail.imap() as c:
         folder = mail.resolve_folder(c, folder)
@@ -154,7 +159,7 @@ def _unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int |
         if folder == junk:
             return {"unsubscribed": False, "reason": "This message is in Junk. Unsubscribing from spam only confirms the address is "
                                                      "read. Leave it in Junk instead."}
-        mail._select(c, folder, expect=uidvalidity)
+        uv = mail._select(c, folder, expect=uidvalidity)
         data = c.fetch([uid], ["BODY.PEEK[HEADER.FIELDS (FROM LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]"]).get(uid)
     if not data:
         return {"unsubscribed": False, "reason": f"No message with uid {uid} in {folder}."}
@@ -163,9 +168,12 @@ def _unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int |
     sender = str(hdr.get("From") or "")
     opts = parse_unsubscribe(hdr.get("List-Unsubscribe"), hdr.get("List-Unsubscribe-Post"))
     if not opts:
+        if mail.s.allow_unsubscribe_links:
+            return _web_page(mail, folder, uv, uid, None, sender, confirm_token, open_page)
         return {"unsubscribed": False, "sender": sender,
-                "reason": "This message has no List-Unsubscribe header. Links inside the message body are never followed; the user "
-                          "can unsubscribe from the message itself, or you can filter it with mail_run_bulk_action."}
+                "reason": "This message has no List-Unsubscribe header. Links inside the message body are never followed "
+                          "(ALLOW_UNSUBSCRIBE_LINKS is off); the user can unsubscribe from the message itself, or you can filter it "
+                          "with mail_run_bulk_action."}
     if opts["one_click"]:
         url = opts["https"][0]
         why = check_url(url)
@@ -197,9 +205,51 @@ def _unsubscribe(mail: MailService, folder: str, uid: int, *, uidvalidity: int |
         return {"unsubscribed": sent.get("status") == "sent", "method": "email to the list's unsubscribe address", "sender": sender,
                 **({"waiting": "The unsubscribe email is waiting for the owner's approval or in Drafts; it takes effect once sent."}
                    if sent.get("status") != "sent" else {}), "result": sent}
+    if mail.s.allow_unsubscribe_links:
+        return _web_page(mail, folder, uv, uid, opts["https"][0], sender, confirm_token, open_page)
     return {"unsubscribed": False, "sender": sender, "web_page": opts["https"][0],
             "reason": "This sender only offers an unsubscribe web page, which is never opened automatically (a visit can confirm "
                       "the address or do more than unsubscribe). Give the user the link to open themselves."}
+
+
+def _web_page(mail: MailService, folder: str, uv: Any, uid: int, header_url: str | None, sender: str,
+              confirm_token: str | None, open_page: Callable[[str], dict[str, Any]] | None) -> dict[str, Any]:
+    """Unsubscribing through a web page: without confirm_token, a preview of the page that would be opened and a token for exactly
+    that page; with it, the visit. The link is worked out again from the message, so the token cannot be pointed elsewhere."""
+    from . import unsublink
+    from .mail import extract_bodies, html_to_text
+
+    if header_url:
+        link = {"url": header_url, "link_text": "", "context": "", "source": "List-Unsubscribe header"}
+    else:
+        with mail.imap() as c:
+            raw, _, _, _ = mail._fetch_raw(c, folder, uid, uidvalidity=uv)
+        text, htm = extract_bodies(email.message_from_bytes(raw, policy=policy.default))
+        found = unsublink.find_link(htm, text)
+        if not found:
+            return {"unsubscribed": False, "sender": sender,
+                    "reason": "This message has no List-Unsubscribe header and no link in it says unsubscribe. The user can "
+                              "unsubscribe on the sender's website, or you can filter it with mail_run_bulk_action."}
+        link = {**found, "source": "message body"}
+    url = link["url"]
+    if why := unsublink.public_web(url):
+        return {"unsubscribed": False, "sender": sender, "web_page": url, "reason": f"The unsubscribe page was not used: {why}."}
+    if not confirm_token:
+        return {"unsubscribed": False, "sender": sender, "needs_confirmation": True,
+                "page": {"host": urlsplit(url).hostname, "source": link["source"],
+                         **({"link_text": link["link_text"]} if link["link_text"] else {}),
+                         **({"text_before_link": link["context"]} if link["context"] else {}), "url": url},
+                "confirm_token": _token(folder, uv, "unsubscribe_page", url, [uid]),
+                "next": "Tell the user which sender and which website this is. Only with their yes, call again with this "
+                        "confirm_token: the server then opens the page and clicks through up to three confirmation steps."}
+    if why := _token_ok(confirm_token, folder, uv, "unsubscribe_page", url, [uid]):
+        raise _MailError(why)
+    res = (open_page or (lambda u: unsublink.open_link(u, to_text=html_to_text)))(url)
+    done = bool(res.get("looks_unsubscribed"))
+    return {"unsubscribed": done, "method": "unsubscribe web page", "sender": sender, **res,
+            "note": ("The page says the address was removed. A few more messages may still arrive." if done else
+                     "It is not certain this worked: read page_text. If the page still wants something done, give the user the "
+                     "link to finish it themselves.")}
 
 
 # ------------------------------------------------------------------ bulk actions with preview and undo
