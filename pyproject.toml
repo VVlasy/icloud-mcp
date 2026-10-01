@@ -1,6 +1,6 @@
 [project]
 name = "icloud-mcp-server"
-version = "0.12.1"
+version = "0.13.0"
 description = "MCP server for iCloud Mail, Calendar, Contacts, Reminders, Notes and iCloud Drive. Self-hosted or local, approval-first."
 readme = "README.md"
 requires-python = ">=3.11"

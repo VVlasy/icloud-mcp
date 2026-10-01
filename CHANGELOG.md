@@ -3,6 +3,18 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
+## 0.13.0
+
+- **Unsubscribing through a web page, after the owner confirms.** When a sender has no one-click or mailto unsubscribe,
+  `mail_unsubscribe_from_list` can now open its unsubscribe page: the one in List-Unsubscribe, or the link in the body whose
+  own text or the sentence just before it says unsubscribe (cs, en, de, fr, es, pl, sk). Off unless
+  `ALLOW_UNSUBSCRIBE_LINKS=true` (always off when `READ_ONLY`). Two steps: the first call returns a preview (sender,
+  website, link text) and a `confirm_token` bound to that message and URL; only a call with it opens the page. The server
+  then clicks through up to three confirmation steps, each only on a single obvious form on the same site that asks for
+  nothing typed. Every hop must be a public address and the connection goes to the address that was checked (no DNS
+  rebinding), a redirect may not re-send a form to another site, the whole visit has a 45-second limit and pages are read
+  up to 512 KB after decompression. The result says whether the page reports the address removed, with its text.
+
 ## 0.12.1
 
 - **Agents are told which tool is for which job.** The server's instructions now open with a short WHICH TOOL map: one line

@@ -837,12 +837,15 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
 
             @mcp.tool(annotations=_WRITE)
             @_guard
-            def mail_unsubscribe_from_list(folder: Folder, uid: Uid, uidvalidity: UidValidity = None) -> dict[str, Any]:
-                """Unsubscribe from the mailing list a message came from, using its List-Unsubscribe header only: the standard
-                one-click request (RFC 8058), or an unsubscribe email (sent the normal way, so approval rules apply). Links in the
-                message body are never followed, unsubscribe web pages are only returned for the user to open, and mail in Junk
-                is refused. Only when the user asked to unsubscribe from this sender."""
-                return mailbulk.unsubscribe(mail, folder, uid, uidvalidity=uidvalidity)
+            def mail_unsubscribe_from_list(folder: Folder, uid: Uid, uidvalidity: UidValidity = None,
+                                           confirm_token: Annotated[str | None, _d("From the preview; needed to open an unsubscribe web page.")] = None) -> dict[str, Any]:
+                """Unsubscribe from the mailing list a message came from: the List-Unsubscribe header's one-click request (RFC 8058)
+                or unsubscribe email (sent the normal way, so approval rules apply). When the sender only has an unsubscribe web
+                page (in the header, or the unsubscribe link in the body) and the server allows it, the first call returns a
+                preview (sender, website, link text) and a confirm_token: show the owner, and only with their yes call again with
+                the token; the server then opens that page and clicks through up to three confirmation steps on the same
+                site. No other link is ever followed, and mail in Junk is refused. Only when the user asked to unsubscribe from this sender."""
+                return mailbulk.unsubscribe(mail, folder, uid, uidvalidity=uidvalidity, confirm_token=confirm_token)
 
     # -------------------------------------------------------------- calendar
     if s.enable_calendar:
