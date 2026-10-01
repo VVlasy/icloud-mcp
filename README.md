@@ -547,6 +547,7 @@ Everything is an environment variable. [`.env.example`](https://github.com/epine
 | `MAX_RECIPIENTS` | 25 | Per message |
 | `ALLOW_PERMANENT_DELETE` | false | Allow deleting mail from Trash |
 | `ALLOW_UNSUBSCRIBE_LINKS` | false | Let `mail_unsubscribe_from_list` open a sender's unsubscribe web page (header or the unsubscribe link in the body) after the owner confirms a preview; a form asking for an email gets only the address that sender mailed (a Hide My Email alias as itself) |
+| `UNSUBSCRIBE_LINKS_CONFIRM` | true | `false` = with `ALLOW_UNSUBSCRIBE_LINKS`, open the unsubscribe page on the first call instead of returning a preview for the owner to confirm |
 | `SAVE_SENT_COPY` | true | Copy sent mail to Sent (iCloud doesn't do it itself) |
 | `MAX_BODY_CHARS`, `MAX_ATTACHMENT_BYTES` | 30000, 5 MiB | Result size caps |
 | `MCP_PUBLIC_URL`, `MCP_OWNER_PASSWORD` | required when hosted | Public https address; owner password (12+ characters) |

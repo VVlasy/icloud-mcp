@@ -8,7 +8,7 @@
   Mail in Junk is refused (unsubscribing from spam confirms the address is alive), and the POST only goes to public addresses.
   Without one-click or mailto, an unsubscribe web page (from the header, or the unsubscribe link in the body) is returned for the
   user to open, or, with ALLOW_UNSUBSCRIBE_LINKS=true, opened by the server in two steps: a preview with a confirm_token, then
-  the visit (see unsublink.py). No other link in a body is ever followed. A form that asks for an email address gets only the
+  the visit (see unsublink.py); with UNSUBSCRIBE_LINKS_CONFIRM=false the owner skips the preview and the first call opens it. No other link in a body is ever followed. A form that asks for an email address gets only the
   address this sender mailed (a Hide My Email alias as itself), named in the preview.
 - bulk_action: move / archive / trash / mark read for everything matching a search, in two steps. A dry run returns the count, a
   sample and a confirm_token that stands for exactly those messages; running needs that token, so the agent must preview first
@@ -249,23 +249,24 @@ def _web_page(mail: MailService, folder: str, uv: Any, uid: int, header_url: str
     if why := unsublink.public_web(url):
         return {"unsubscribed": False, "sender": sender, "web_page": url, "reason": f"The unsubscribe page was not used: {why}."}
     target = f"{url}\n{address or ''}"         # the token stands for this page and this address
-    if not confirm_token:
-        return {"unsubscribed": False, "sender": sender, "needs_confirmation": True,
-                "page": {"host": urlsplit(url).hostname, "source": link["source"],
-                         **({"link_text": link["link_text"]} if link["link_text"] else {}),
-                         **({"text_before_link": link["context"]} if link["context"] else {}), "url": url},
-                "email_for_forms": ({"address": address, "found_as": found_as} if address else
-                                    {"address": None, "why_none": f"{found_as}, so a form asking for an email is left for the user"}),
+    page = {"host": urlsplit(url).hostname, "source": link["source"], **({"link_text": link["link_text"]} if link["link_text"] else {}),
+            **({"text_before_link": link["context"]} if link["context"] else {}), "url": url}
+    email_info = ({"address": address, "found_as": found_as} if address else
+                  {"address": None, "why_none": f"{found_as}, so a form asking for an email is left for the user"})
+    if not confirm_token and mail.s.unsubscribe_links_confirm:
+        return {"unsubscribed": False, "sender": sender, "needs_confirmation": True, "page": page, "email_for_forms": email_info,
                 "confirm_token": _token(folder, uv, "unsubscribe_page", target, [uid]),
                 "next": "Tell the user which sender and which website this is" +
                         (f", and that if the page asks for an email address, {address} is entered" if address else "") +
                         ". Only with their yes, call again with this confirm_token: the server then opens the page and clicks "
                         "through up to three confirmation steps."}
-    if why := _token_ok(confirm_token, folder, uv, "unsubscribe_page", target, [uid]):
+    # With UNSUBSCRIBE_LINKS_CONFIRM=false the owner chose to have the page opened on the first call; a token, when given, still
+    # has to match.
+    if confirm_token and (why := _token_ok(confirm_token, folder, uv, "unsubscribe_page", target, [uid])):
         raise _MailError(why)
     res = (open_page or (lambda u: unsublink.open_link(u, to_text=html_to_text, email=address)))(url)
     done = bool(res.get("looks_unsubscribed"))
-    return {"unsubscribed": done, "method": "unsubscribe web page", "sender": sender, **res,
+    return {"unsubscribed": done, "method": "unsubscribe web page", "sender": sender, "page": page, "email_for_forms": email_info, **res,
             "note": ("The page says the address was removed. A few more messages may still arrive." if done else
                      "It is not certain this worked: read page_text. If the page still wants something done, give the user the "
                      "link to finish it themselves.")}

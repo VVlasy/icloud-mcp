@@ -168,6 +168,7 @@ class Settings:
     invite_allowlist: tuple[str, ...] = ()   # INVITE_ALLOWLIST: addresses/domains that may be invited when invites are on (empty = anyone)
     max_attendees: int = 10                 # MAX_ATTENDEES: most guests one event may carry through the connector
     allow_unsubscribe_links: bool = False          # ALLOW_UNSUBSCRIBE_LINKS: open unsubscribe web pages after the user confirms
+    unsubscribe_links_confirm: bool = True         # UNSUBSCRIBE_LINKS_CONFIRM: false = open them on the first call, no preview
     contacts_allow_email_changes: bool = True  # CONTACTS_ALLOW_EMAIL_CHANGES: false = agents cannot add or replace emails/phones on cards
     mail_max_age_days: int = 0              # MAIL_MAX_AGE_DAYS: 0 = whole mailbox; N = searches never reach further back than N days
     safety_screen: str = ""                 # SAFETY_SCREEN: "" (built-in patterns) or "command:<path>" (the owner's own classifier)
@@ -199,6 +200,7 @@ class Settings:
             save_sent_copy=_bool("SAVE_SENT_COPY", True),
             allow_permanent_delete=_bool("ALLOW_PERMANENT_DELETE", False),
             allow_unsubscribe_links=_bool("ALLOW_UNSUBSCRIBE_LINKS", False) and not read_only,
+            unsubscribe_links_confirm=_bool("UNSUBSCRIBE_LINKS_CONFIRM", True),
             max_recipients=_int("MAX_RECIPIENTS", 25),
             send_allowlist=tuple(x.lower() for x in _list("SEND_ALLOWLIST")),
             max_body_chars=_int("MAX_BODY_CHARS", 30000),
