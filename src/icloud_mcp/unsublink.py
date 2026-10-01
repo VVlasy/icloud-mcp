@@ -40,10 +40,12 @@ _NEXT = re.compile(r"pokra[cč]ovat|continue|next|weiter|suivant|siguiente|dalej
 # The one "unsubscribe from all" box a preference centre may show.
 _ALL = re.compile(r"(unsubscri|odhl[aá][sš]|abmeld|d[ée]sinscri|opt[- ]?out|zru[sš]).{0,40}?\b(all|v[sš]e|v[sš]ech|alle[nms]?|tous|toutes|todos)\b|"
                   r"\b(all|v[sš]ech)\b.{0,30}?(unsubscri|odhl[aá][sš])")
-# Wording of a finished unsubscribe, to say whether it looks done. The agent still reads page_text.
+# Wording of a finished unsubscribe, to say whether it looks done. The agent still reads page_text. The Czech noun alone
+# ("Odhlášení z newsletteru") is a heading, not a result; with a finished verb ("Odhlášení proběhlo úspěšně") it is one.
 _DONE = re.compile(
     r"unsubscribed|been removed|no longer receive|odhl[aá][sš]en(?![ií]\b)(?!í)|odhl[aá][sš]eni\b|abgemeldet|d[ée]sinscrit|"
-    r"dado de baja|wypisan|nebudete.{0,40}?dost[aá]vat")
+    r"dado de baja|wypisan|nebudete.{0,40}?dost[aá]vat|"
+    r"odhl[aá][sš]en[ií]\s+(?:prob[eě]hl|byl[oa]?\s+(?:[uú]sp[eě][sš]n|dokon[cč]en|proveden))|\bodhl[aá]sil[aiy]?\b")
 
 MAX_REDIRECTS = 5
 MAX_CLICKS = 3

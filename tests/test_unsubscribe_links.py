@@ -208,6 +208,34 @@ def test_czech_noun_is_not_success():
         assert unsublink._DONE.search(unsublink._norm(page)), page
 
 
+def test_czech_noun_with_a_finished_verb_is_success():
+    for page in ("Odhlášení proběhlo úspěšně!", "Odhlášení bylo úspěšné.", "Odhlášení bylo dokončeno", "Úspěšně jste se odhlásili."):
+        assert unsublink._DONE.search(unsublink._norm(page)), page
+    for page in ("Odhlášení proběhne po potvrzení.", "Po úspěšném odhlášení vám přestanou chodit e-maily.",
+                 "Ještě jste se neodhlásili.", "Chcete se odhlásit?"):
+        assert not unsublink._DONE.search(unsublink._norm(page)), page
+
+
+def test_success_page_that_repeats_the_survey_form_is_done():
+    """Exponea (Planeo): after ODHLÁSIT the page says it worked and shows the optional reason form again underneath."""
+    form = """<form method="post" action="/unsubscribe"><input type="hidden" name="token" value="t1">
+        <p>Důvod odhlášení (nepovinné):</p>
+        <label><input type="radio" name="reason" value="many"> Příliš mnoho e-mailů</label>
+        <label><input type="radio" name="reason" value="dull"> Nezajímavý obsah</label>
+        <label><input type="checkbox" name="consent" value="1"> Souhlasím se zpracováním důvodu</label>
+        <button type="submit">ODHLÁSIT</button></form>"""
+    posts = []
+
+    def h(req):
+        if req.method == "GET":
+            return httpx.Response(200, html=f"<h1>Odhlášení z odběru</h1>{form}")
+        posts.append(dict(httpx.QueryParams(req.content.decode())))
+        return httpx.Response(200, html=f"<h1>Odhlášení proběhlo úspěšně!</h1>{form}")
+    r = _open(h)
+    assert r["looks_unsubscribed"] and r["clicks"] == 1 and "stopped" not in r
+    assert posts == [{"token": "t1"}]                  # no reason picked, consent left unticked
+
+
 def test_site_helper():
     assert unsublink._site("news.shop.planeo.cz") == "planeo.cz"
     assert unsublink._site("a.b.co.uk") == "b.co.uk"

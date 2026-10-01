@@ -3,6 +3,13 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
+## 0.13.1
+
+- **Czech unsubscribe pages that say "Odhlášení proběhlo úspěšně" count as done.** The noun alone is still treated as a
+  heading, not a result, but with a finished verb (proběhlo, bylo úspěšné / dokončeno / provedeno) or "jste se
+  odhlásili" the page is recognised as a finished unsubscribe. Before, such a page (Exponea, seen on Planeo) was reported
+  as uncertain, and when it repeated the optional reason form underneath, the visit stopped at "same form again".
+
 ## 0.13.0
 
 - **Unsubscribing through a web page, after the owner confirms.** When a sender has no one-click or mailto unsubscribe,
