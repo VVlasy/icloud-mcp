@@ -169,6 +169,9 @@ class Settings:
     max_attendees: int = 10                 # MAX_ATTENDEES: most guests one event may carry through the connector
     allow_unsubscribe_links: bool = False          # ALLOW_UNSUBSCRIBE_LINKS: open unsubscribe web pages after the user confirms
     unsubscribe_links_confirm: bool = True         # UNSUBSCRIBE_LINKS_CONFIRM: false = open them on the first call, no preview
+    attachment_url_allowlist: tuple[str, ...] = ()           # ATTACHMENT_URL_ALLOWLIST: https URL prefixes attachment_urls may fetch (empty = off)
+    attachment_url_max_bytes: int = 10 * 1024 * 1024         # ATTACHMENT_URL_MAX_BYTES: largest file attachment_urls downloads
+    attachment_url_content_types: tuple[str, ...] = ("application/pdf",)   # ATTACHMENT_URL_CONTENT_TYPES: types it accepts
     contacts_allow_email_changes: bool = True  # CONTACTS_ALLOW_EMAIL_CHANGES: false = agents cannot add or replace emails/phones on cards
     mail_max_age_days: int = 0              # MAIL_MAX_AGE_DAYS: 0 = whole mailbox; N = searches never reach further back than N days
     safety_screen: str = ""                 # SAFETY_SCREEN: "" (built-in patterns) or "command:<path>" (the owner's own classifier)
@@ -201,6 +204,9 @@ class Settings:
             allow_permanent_delete=_bool("ALLOW_PERMANENT_DELETE", False),
             allow_unsubscribe_links=_bool("ALLOW_UNSUBSCRIBE_LINKS", False) and not read_only,
             unsubscribe_links_confirm=_bool("UNSUBSCRIBE_LINKS_CONFIRM", True),
+            attachment_url_allowlist=tuple(_list("ATTACHMENT_URL_ALLOWLIST")),
+            attachment_url_max_bytes=_int("ATTACHMENT_URL_MAX_BYTES", 10 * 1024 * 1024),
+            attachment_url_content_types=tuple(t.lower() for t in _list("ATTACHMENT_URL_CONTENT_TYPES", "application/pdf")),
             max_recipients=_int("MAX_RECIPIENTS", 25),
             send_allowlist=tuple(x.lower() for x in _list("SEND_ALLOWLIST")),
             max_body_chars=_int("MAX_BODY_CHARS", 30000),
@@ -306,6 +312,22 @@ class Settings:
                 raise SystemExit("BRIDGE_TOKEN must differ from MCP_OWNER_PASSWORD.")
         if not (self.enable_mail or self.enable_calendar or self.enable_contacts):
             raise SystemExit("ENABLE_MAIL, ENABLE_CALENDAR and ENABLE_CONTACTS are all false; nothing to serve.")
+        self._validate_attachment_urls()
+
+    def _validate_attachment_urls(self) -> None:
+        """ATTACHMENT_URL_* must be usable as written: a server that downloads files into outgoing mail never starts with an
+        allowlist entry it would have to guess about."""
+        from .urlattach import parse_allowlist
+        try:
+            parse_allowlist(self.attachment_url_allowlist)
+        except ValueError as e:
+            raise SystemExit(f"ATTACHMENT_URL_ALLOWLIST: {e}. Each entry is an https URL prefix such as "
+                             "https://www.example.com/invoices/ (comma-separated).") from e
+        if self.attachment_url_max_bytes <= 0:
+            raise SystemExit("ATTACHMENT_URL_MAX_BYTES must be a positive number of bytes.")
+        bad = [t for t in self.attachment_url_content_types if not re.fullmatch(r"[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*", t)]
+        if bad or not self.attachment_url_content_types:
+            raise SystemExit(f"ATTACHMENT_URL_CONTENT_TYPES must list media types such as application/pdf, not {', '.join(bad) or 'nothing'}.")
 
     def validate_for_local(self) -> None:
         """Local (stdio) mode: the desktop client on this computer starts the server itself, so there is no public URL or owner password."""

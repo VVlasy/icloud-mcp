@@ -42,6 +42,7 @@ from .safety import confirm_token as make_confirm_token
 from .mailbulk import bulk_view
 from . import mailparts
 from .outbox import Outbox, OutboxFull, QueuedMessage
+from . import urlattach
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -287,13 +288,18 @@ def _add_html_alt(msg: EmailMessage, html: str) -> None:
 
 
 def _attach(msg: EmailMessage, att: dict[str, Any], max_bytes: int) -> None:
+    """Add one file: base64 from the agent ('content_base64', up to MAX_ATTACHMENT_BYTES), or bytes the server already holds
+    ('content': downloaded from attachment_urls under its own limits, or kept from a draft being changed)."""
     filename = att.get("filename") or "attachment"
-    try:
-        data = base64.b64decode(att["content_base64"], validate=False)
-    except Exception as e:  # noqa: BLE001
-        raise MailError(f"Attachment '{filename}': invalid base64 ({e}). Pass the file's bytes base64-encoded.") from e
-    if len(data) > max_bytes:
-        raise MailError(f"Attachment '{filename}' is {len(data)} bytes; the limit is {max_bytes} (MAX_ATTACHMENT_BYTES). Send a smaller file.")
+    if isinstance(att.get("content"), bytes):
+        data = att["content"]
+    else:
+        try:
+            data = base64.b64decode(att["content_base64"], validate=False)
+        except Exception as e:  # noqa: BLE001
+            raise MailError(f"Attachment '{filename}': invalid base64 ({e}). Pass the file's bytes base64-encoded.") from e
+        if len(data) > max_bytes:
+            raise MailError(f"Attachment '{filename}' is {len(data)} bytes; the limit is {max_bytes} (MAX_ATTACHMENT_BYTES). Send a smaller file.")
     ctype = att.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     maintype, _, subtype = ctype.partition("/")
     msg.add_attachment(data, maintype=maintype or "application", subtype=subtype or "octet-stream", filename=filename)
@@ -1602,19 +1608,33 @@ class MailService:
             self.outbox.restore(q)  # not sent: keep it so the owner can retry or discard
             raise
 
-    def send(self, *, to, subject, body, body_html=None, cc=None, bcc=None, attachments=None, draft=False) -> dict[str, Any]:
+    def _url_attachments(self, attachment_urls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """The files of attachment_urls, downloaded before anything is sent or saved: every one of them, or a MailError naming
+        the URL that failed (urlattach), so a message never goes out with some of its files missing."""
+        if not attachment_urls:
+            return []
+        try:
+            return urlattach.fetch_all(attachment_urls, allowlist=urlattach.parse_allowlist(self.s.attachment_url_allowlist),
+                                       max_bytes=self.s.attachment_url_max_bytes, content_types=self.s.attachment_url_content_types)
+        except urlattach.AttachmentUrlError as e:
+            raise MailError(str(e)) from e
+
+    def send(self, *, to, subject, body, body_html=None, cc=None, bcc=None, attachments=None, attachment_urls=None,
+             draft=False) -> dict[str, Any]:
         to_p, cc_p, bcc_p = parse_recipients(to, "to"), parse_recipients(cc, "cc"), parse_recipients(bcc, "bcc")
         if not to_p and not draft:
             raise MailError("'to' must contain at least one valid email address.")
+        files = (attachments or []) + self._url_attachments(attachment_urls)
         msg = build_message(
             sender=self.sender, to=to_p, cc=cc_p, bcc=bcc_p, subject=subject, text=body, html=body_html,
-            signature=self.s.signature, attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
+            signature=self.s.signature, attachments=files, max_attachment_bytes=self.s.max_attachment_bytes,
         )
         with self.imap() as c:
             return _with_layout(self._deliver(c, msg, draft=draft), body)
 
-    def reply(self, folder: str, uid: int, body: str, *, body_html=None, reply_all=False, quote=True, to=None, cc=None, bcc=None, attachments=None, draft=False,
-              uidvalidity: int | None = None) -> dict[str, Any]:
+    def reply(self, folder: str, uid: int, body: str, *, body_html=None, reply_all=False, quote=True, to=None, cc=None, bcc=None, attachments=None,
+              attachment_urls=None, draft=False, uidvalidity: int | None = None) -> dict[str, Any]:
+        files = (attachments or []) + self._url_attachments(attachment_urls)    # before the mailbox is touched
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
             raw, _, _, uv = self._fetch_raw(c, folder, uid, readonly=False, uidvalidity=uidvalidity)
@@ -1622,7 +1642,7 @@ class MailService:
             msg = build_reply(
                 original, sender=self.sender, body=body, body_html=body_html, reply_all=reply_all, quote=quote,
                 to=parse_recipients(to, "to"), cc=parse_recipients(cc, "cc"), bcc=parse_recipients(bcc, "bcc"), signature=self.s.signature,
-                attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
+                attachments=files, max_attachment_bytes=self.s.max_attachment_bytes,
             )
             result = self._deliver(c, msg, draft=draft, followup={"folder": folder, "uid": uid, "flag": ANSWERED,
                                                           "uidvalidity": uv})
@@ -1821,9 +1841,12 @@ class MailService:
 
     def update_draft(self, uid: int, *, folder: str = "Drafts", uidvalidity: int | None = None, to=None, cc=None, bcc=None,
                      subject: str | None = None, body: str | None = None, body_html: str | None = None,
-                     attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                     attachments: list[dict[str, Any]] | None = None,
+                     attachment_urls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Change a saved draft. Fields left out keep their current value. The new draft is saved first and only then does the
-        old one go to Trash, so a failure never loses it."""
+        old one go to Trash, so a failure never loses it. attachments replaces the draft's files; attachment_urls adds to them
+        (to the kept ones, or to the new attachments)."""
+        fetched = self._url_attachments(attachment_urls)    # before the draft is touched: a failed download changes nothing
         with self.imap() as c:
             folder, old, uv = self._load_draft(c, folder, uid, uidvalidity)
             keep = lambda h: parse_addrs(old.get_all(h, []))        # noqa: E731
@@ -1835,13 +1858,14 @@ class MailService:
                 text, htm, signature = old_text or (html_to_text(old_html) if old_html else ""), old_html, ""
             else:
                 text, htm, signature = (body if body is not None else ""), body_html, self.s.signature
-            if attachments is None:
+            if attachments is None:          # kept as they are: a file already in the draft is not held to MAX_ATTACHMENT_BYTES again
                 attachments = [{"filename": p.get_filename() or "attachment", "content_type": p.get_content_type(),
-                                "content_base64": base64.b64encode(p.get_payload(decode=True) or b"").decode()}
+                                "content": p.get_payload(decode=True) or b""}
                                for p in iter_attachment_parts(old)]
             new = build_message(
                 sender=self.sender, to=to_p, cc=cc_p, bcc=bcc_p, subject=subject if subject is not None else str(old["Subject"] or ""),
-                text=text, html=htm, signature=signature, attachments=attachments, max_attachment_bytes=self.s.max_attachment_bytes,
+                text=text, html=htm, signature=signature, attachments=attachments + fetched,
+                max_attachment_bytes=self.s.max_attachment_bytes,
                 in_reply_to=str(old["In-Reply-To"]) if old["In-Reply-To"] else None,
                 references=str(old["References"]) if old["References"] else None,
             )

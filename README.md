@@ -326,6 +326,7 @@ Every name is `area_verb_noun` (`mail_send_message`, `calendar_create_event`). E
 - **Stale ids are refused.** Every message comes with its folder's `uidvalidity`; tools that act on a uid accept it back and refuse if iCloud has renumbered the folder since, instead of touching a different message.
 - Reading a message does not mark it read. Bcc recipients receive the mail, but the header is stripped on the wire.
 - Recipients accept `a@b.com`, `Name <a@b.com>` or `mailto:a@b.com`. Anything else is rejected with a clear error and never silently dropped.
+- **Attach a file from a link without passing it through the agent.** `mail_send_message`, `mail_reply_to_message` and `mail_update_draft` (and their `draft=true` paths) take `attachment_urls: [{url, filename?}]` (up to 20) next to `attachments`: the server downloads each file and attaches it, so an invoice link from another tool (alza-mcp's `order_document.href`) never travels as base64 through the model. Off unless `ATTACHMENT_URL_ALLOWLIST` lists https prefixes; every URL and every redirect (at most 3) must sit under one of them, on a public address (checked, then connected to as checked), as PDF by default (it must start with `%PDF-`), within `ATTACHMENT_URL_MAX_BYTES` (20 MiB for all files of one message, iCloud's message limit) and 20 seconds. If one link fails nothing is sent or saved and the error names it. Logs name a link by host and path only, never its query string (Alza's carries an access key). Approval treats these files like any other attachment.
 
 </details>
 
@@ -548,6 +549,9 @@ Everything is an environment variable. [`.env.example`](https://github.com/epine
 | `ALLOW_PERMANENT_DELETE` | false | Allow deleting mail from Trash |
 | `ALLOW_UNSUBSCRIBE_LINKS` | false | Let `mail_unsubscribe_from_list` open a sender's unsubscribe web page (header or the unsubscribe link in the body) after the owner confirms a preview; a form asking for an email gets only the address that sender mailed (a Hide My Email alias as itself) |
 | `UNSUBSCRIBE_LINKS_CONFIRM` | true | `false` = with `ALLOW_UNSUBSCRIBE_LINKS`, open the unsubscribe page on the first call instead of returning a preview for the owner to confirm |
+| `ATTACHMENT_URL_ALLOWLIST` | empty (off) | https URL prefixes `attachment_urls` may download from, comma-separated, e.g. `https://www.alza.cz/Apps/pdfdoc.asp,https://pdf.alza.cz/Apps/pdfdoc.asp`. Host, port and whole path segments must match, for every redirect too; a bad entry stops the server |
+| `ATTACHMENT_URL_MAX_BYTES` | 10 MiB | Largest file `attachment_urls` downloads (all files of one message together at most 20 MiB) |
+| `ATTACHMENT_URL_CONTENT_TYPES` | `application/pdf` | Types `attachment_urls` accepts, comma-separated; a PDF must also start with `%PDF-` |
 | `SAVE_SENT_COPY` | true | Copy sent mail to Sent (iCloud doesn't do it itself) |
 | `MAX_BODY_CHARS`, `MAX_ATTACHMENT_BYTES` | 30000, 5 MiB | Result size caps |
 | `MCP_PUBLIC_URL`, `MCP_OWNER_PASSWORD` | required when hosted | Public https address; owner password (12+ characters) |
