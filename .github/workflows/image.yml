@@ -1,0 +1,45 @@
+name: image
+
+# Builds the server image and pushes it to ghcr.io/<owner>/icloud-mcp:<version> when a v* tag is pushed (or by hand from the
+# Actions tab, on a tag). Plain docker on the runner, no third-party actions; the registry login is this run's own
+# GITHUB_TOKEN (packages: write), so no credential is stored. The image is labelled with the version and commit, like the
+# images published by hand before this workflow, and the job summary gives the digest to pin in a deployment.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Check the tag matches the package version
+        id: v
+        run: |
+          [ "$GITHUB_REF_TYPE" = "tag" ] || { echo "Run this on a v* tag: an image tag must name one release."; exit 1; }
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          [ "${GITHUB_REF_NAME#v}" = "$version" ] || { echo "tag $GITHUB_REF_NAME, pyproject.toml $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/icloud-mcp" >> "$GITHUB_OUTPUT"
+      - name: Log in to ghcr.io
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          docker buildx create --use
+          docker buildx build --platform linux/amd64 --provenance=true --push --metadata-file metadata.json \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            -t "$IMAGE:$VERSION" .
+          digest=$(python3 -c "import json; print(json.load(open('metadata.json'))['containerimage.digest'])")
+          echo "Pushed \`$IMAGE:$VERSION@$digest\`" >> "$GITHUB_STEP_SUMMARY"
