@@ -78,7 +78,7 @@ class Cal:
 @pytest.fixture
 def calsvc(s, monkeypatch):
     soon = datetime.now(timezone.utc).replace(microsecond=0, second=0) + timedelta(minutes=30)
-    day = datetime(2026, 10, 5, 9, 0)
+    day = datetime(2016, 10, 5, 9, 0)        # a fixed day that is never today, so events relative to now never meet it
     work = Cal("Work", [
         vevent("w1", day, summary="Review", extra="X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT30M\r\n"),
         vevent("inv", day + timedelta(hours=5), summary="Invite",
@@ -100,7 +100,7 @@ def calsvc(s, monkeypatch):
 
 def test_needs_reply_finds_invitations_to_any_owner_address_only(calsvc):
     svc, _, day = calsvc
-    got = svc.list_events("2026-10-05", "2026-10-05", needs_reply=True)
+    got = svc.list_events("2016-10-05", "2016-10-05", needs_reply=True)
     assert [e["uid"] for e in got["events"]] == ["inv"]           # an alias counts; declined and self-organised do not
     assert "now" in got
 

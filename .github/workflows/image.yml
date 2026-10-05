@@ -1,11 +1,14 @@
 name: image
 
-# Builds the server image and pushes it to ghcr.io/<owner>/icloud-mcp:<version> when a v* tag is pushed (or by hand from the
-# Actions tab, on a tag). Plain docker on the runner, no third-party actions; the registry login is this run's own
-# GITHUB_TOKEN (packages: write), so no credential is stored. The image is labelled with the version and commit, like the
-# images published by hand before this workflow, and the job summary gives the digest to pin in a deployment.
+# Builds the server image and pushes it to ghcr.io/<owner>/icloud-mcp:<version>, <version> from pyproject.toml: on every push
+# to a release/** branch and on a v* tag, but once per version. A version already on ghcr.io is skipped, so merging a change
+# without a version bump publishes nothing and a published image is never replaced: bump the version to publish.
+# Plain docker on the runner, no third-party actions; the registry login is this run's own GITHUB_TOKEN (packages: write), so
+# no credential is stored. A package first pushed by hand needs this repository added under its "Manage Actions access" with
+# the Write role. The image is labelled with the version and commit, and the job summary gives the digest to pin.
 on:
   push:
+    branches: ["release/**"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -13,24 +16,44 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: image              # one run at a time, so two pushes of one version cannot both find it unpublished
+  cancel-in-progress: false
+
 jobs:
   image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - name: Check the tag matches the package version
+      - name: Version from pyproject.toml (a tag must match it)
         id: v
         run: |
-          [ "$GITHUB_REF_TYPE" = "tag" ] || { echo "Run this on a v* tag: an image tag must name one release."; exit 1; }
           version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          [ "${GITHUB_REF_NAME#v}" = "$version" ] || { echo "tag $GITHUB_REF_NAME, pyproject.toml $version"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME, pyproject.toml $version"; exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/icloud-mcp" >> "$GITHUB_OUTPUT"
       - name: Log in to ghcr.io
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Skip a version that is already published
+        id: published
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          if out=$(docker buildx imagetools inspect "$IMAGE:$VERSION" 2>&1); then
+            echo "\`$IMAGE:$VERSION\` is already published; nothing was built. Bump the version in pyproject.toml to publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif ! grep -qiE "not found|manifest unknown" <<< "$out"; then
+            echo "$out"
+            echo "Could not tell whether $IMAGE:$VERSION exists, so nothing is pushed over it."
+            exit 1
+          fi
       - name: Build and push
+        if: steps.published.outputs.skip != 'true'
         env:
           IMAGE: ${{ steps.v.outputs.image }}
           VERSION: ${{ steps.v.outputs.version }}

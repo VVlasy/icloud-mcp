@@ -247,10 +247,10 @@ def test_site_helper():
 
 def test_redirect_into_private_network_is_refused():
     def h(req):
-        return httpx.Response(302, headers={"location": "http://10.0.0.5/admin"})
+        return httpx.Response(302, headers={"location": "http://10.0.0.5/admin"})   # privacy-ok: test value
 
     def check(url):
-        return "the address points into a private or local network" if "10.0.0.5" in url else None
+        return "the address points into a private or local network" if "10.0.0.5" in url else None   # privacy-ok
     r = _open(h, check=check)
     assert not r["opened"] and "private" in r["reason"]
 
