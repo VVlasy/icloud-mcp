@@ -38,6 +38,7 @@ from .safety import clean_deep, configure_screen, confirm_problem, stats as safe
 from .safety import confirm_token as make_confirm_token
 from . import mailbulk
 from .mail import UNTRUSTED_NOTICE, MailError, MailService
+from .urlattach import MAX_URLS
 
 log = logging.getLogger("icloud_mcp")
 
@@ -99,6 +100,11 @@ class Attachment(BaseModel):
     content_type: str | None = None
 
 
+class AttachmentUrl(BaseModel):
+    url: str = Field(description="The file's https link as another tool gave it (query string included).")
+    filename: str | None = Field(None, description="Name to attach it under; default the name the website sends.")
+
+
 ReminderRepeat = Annotated[str | None, _d("Repeat rule: 'FREQ=WEEKLY;BYDAY=MO', 'FREQ=MONTHLY;BYMONTHDAY=1;COUNT=12', 'FREQ=YEARLY'. DAILY or coarser; needs a due date.")]
 ReminderAlertsBefore = Annotated[list[int] | None, _d("Alerts this many minutes before the due time, e.g. [1440, 30].")]
 ReminderAlertsAt = Annotated[list[str] | None, _d("Alerts at these times (ISO 8601).")]
@@ -121,6 +127,11 @@ def _alert_args(before: list[int] | None, at: list[str] | None) -> dict[str, str
 
 Attachments = Annotated[list[Attachment] | None, _d("Files to attach (from mail_get_attachment as is; from drive_get_file, name and "
                                                     "data_base64 go in filename and content_base64).")]
+AttachmentUrls = Annotated[list[AttachmentUrl] | None, Field(max_length=MAX_URLS, description=(
+    "Files the server downloads and attaches itself, so their bytes never pass through you: the preferred way to attach a file "
+    "another tool gives as a link (e.g. alza-mcp order_document.href). Only https links on the server's ATTACHMENT_URL_ALLOWLIST "
+    "work (a refused link's error lists the allowed prefixes); PDF up to 10 MB each by default, 20 MB together. If any link "
+    "fails, nothing is sent or saved and the error names it. Works alongside 'attachments'."))]
 
 
 _tool_timeout = 90.0     # set from TOOL_TIMEOUT_SECONDS in create_server()
@@ -180,6 +191,10 @@ def _addrs(items: list[PostalAddress] | None) -> list[dict[str, Any]] | None:
 
 
 def _atts(items: list[Attachment] | None) -> list[dict[str, Any]] | None:
+    return [a.model_dump() for a in items] if items else None
+
+
+def _urls(items: list[AttachmentUrl] | None) -> list[dict[str, Any]] | None:
     return [a.model_dump() for a in items] if items else None
 
 
@@ -669,6 +684,7 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 bcc: Bcc = None,
                 body_html: BodyHtml = None,
                 attachments: Attachments = None,
+                attachment_urls: AttachmentUrls = None,
                 draft: Draft = False,
             ) -> dict[str, Any]:
                 """Compose a NEW email (use mail_reply_to_message to answer an existing message). Addresses may be 'a@b.com' or
@@ -676,11 +692,12 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 multipart/alternative). A signature configured on the server is appended. The message is sent immediately
                 and saved to the Sent folder (status "sent"). If the operator turned on owner approval, the result has sent=false
                 and says where the message waits for the owner (outbox or Drafts): it is NOT sent.
-                draft=true saves to Drafts instead. Files go in 'attachments' (from drive_get_file or mail_get_attachment); to pass
-                on a received message with its attachments, use mail_forward_message. Example: to=['anna@example.org'], subject='Agenda',
-                body='Hi Anna, ...'."""
+                draft=true saves to Drafts instead. Files go in 'attachments' (from drive_get_file or mail_get_attachment); a file
+                another tool gives as a link (e.g. alza-mcp order_document.href) goes in 'attachment_urls' instead, which the server
+                downloads itself (preferred; only links on its allowlist work). To pass on a received message with its attachments,
+                use mail_forward_message. Example: to=['anna@example.org'], subject='Agenda', body='Hi Anna, ...'."""
                 return mail.send(to=to, subject=subject, body=body, body_html=body_html, cc=cc, bcc=bcc,
-                                 attachments=_atts(attachments), draft=draft)
+                                 attachments=_atts(attachments), attachment_urls=_urls(attachment_urls), draft=draft)
 
             @mcp.tool(annotations=_WRITE)
             @_guard
@@ -695,6 +712,7 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 cc: Cc = None,
                 bcc: Bcc = None,
                 attachments: Attachments = None,
+                attachment_urls: AttachmentUrls = None,
                 draft: Draft = False,
                 uidvalidity: UidValidity = None,
             ) -> dict[str, Any]:
@@ -702,10 +720,12 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 Replies to the sender (or Reply-To); reply_all=true also includes the other To/Cc recipients.
                 Pass 'to' only to override the computed recipients. 'body' is your new text only (the quote is added).
                 Sent immediately, saved to Sent, and the original is flagged Answered (unless owner approval is on: then the result
-                has sent=false and the reply waits for the owner). draft=true saves a draft instead. Files go in 'attachments'.
+                has sent=false and the reply waits for the owner). draft=true saves a draft instead. Files go in 'attachments'; a file
+                another tool gives as a link (e.g. alza-mcp order_document.href) goes in 'attachment_urls' (preferred: the server
+                downloads it; only links on its allowlist work).
                 Example (after mail_search_messages found the message): mail_reply_to_message(folder='INBOX', uid=8851, body='Thanks, see you then.')"""
-                return mail.reply(folder, uid, body, body_html=body_html, reply_all=reply_all, quote=quote_original,
-                                  to=to, cc=cc, bcc=bcc, attachments=_atts(attachments), draft=draft, uidvalidity=uidvalidity)
+                return mail.reply(folder, uid, body, body_html=body_html, reply_all=reply_all, quote=quote_original, to=to, cc=cc, bcc=bcc,
+                                  attachments=_atts(attachments), attachment_urls=_urls(attachment_urls), draft=draft, uidvalidity=uidvalidity)
 
             @mcp.tool(annotations=_WRITE)
             @_guard
@@ -797,11 +817,15 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                                   subject: Annotated[str | None, _d("New subject; omit to keep.")] = None,
                                   body: Annotated[str | None, _d("New plain-text body (the signature is added); omit to keep the current body.")] = None,
                                   body_html: BodyHtml = None, attachments: Attachments = None,
+                                  attachment_urls: AttachmentUrls = None,
                                   folder: Annotated[str, _d("Where the draft is; default Drafts.")] = "Drafts") -> dict[str, Any]:
-                """Change a saved draft; anything left out stays as it is (attachments too, unless given). The new version is saved
-                first, then the old one goes to Trash; the result has the new uid. Nothing is sent."""
+                """Change a saved draft; anything left out stays as it is (attachments too, unless given). 'attachments' replaces the
+                draft's files; 'attachment_urls' adds files the server downloads from links (preferred for a file another tool gives as
+                a link, e.g. alza-mcp order_document.href; only links on its allowlist work). The new version is saved first, then the
+                old one goes to Trash; the result has the new uid. Nothing is sent."""
                 return mail.update_draft(uid, folder=folder, uidvalidity=uidvalidity, to=to, cc=cc, bcc=bcc, subject=subject,
-                                         body=body, body_html=body_html, attachments=_atts(attachments))
+                                         body=body, body_html=body_html, attachments=_atts(attachments),
+                                         attachment_urls=_urls(attachment_urls))
 
             @mcp.tool(annotations=_WRITE)
             @_guard

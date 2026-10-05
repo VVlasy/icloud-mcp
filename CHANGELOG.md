@@ -3,6 +3,33 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
+## 0.16.0
+
+- **Attachments from a link (`attachment_urls`).** `mail_send_message`, `mail_reply_to_message` and `mail_update_draft`
+  (`draft=true` included) take `attachment_urls: [{url, filename?}]`, up to 20, next to `attachments`. The server downloads
+  each file and attaches it, so a file another tool links to (alza-mcp's `order_document.href`) never passes through the
+  model as base64. The owner-approval page, the outbox and drafts treat these files exactly like base64 attachments.
+  `mail_update_draft`: `attachments` still replaces the draft's files; `attachment_urls` adds to them.
+- **Off unless `ATTACHMENT_URL_ALLOWLIST` lists https URL prefixes.** A URL must be https, without credentials, on the host
+  and port of an entry and under its path in whole segments (`/Apps/pdfdoc.asp` matches `/Apps/pdfdoc.asp?d=1`, never
+  `/Apps/pdfdoc.aspx`). It is checked as it will be sent, after `..` is resolved; encoded dots or slashes and backslashes are
+  refused. Redirects are followed by hand, at most 3, and every hop must match too. A malformed entry stops the server.
+- **Public addresses only.** Every name is resolved and refused if any address is private, loopback, link-local, CGNAT,
+  IPv6 unique-local, multicast or wraps one of those (IPv4-mapped, NAT64); the connection then goes to the address that
+  was checked, so DNS rebinding cannot swap it. Unsubscribe page visits use the same, now stricter, check.
+- **Limits.** `ATTACHMENT_URL_MAX_BYTES` (10 MiB) per file, read as it arrives and abandoned past the limit; 20 MiB for all
+  files of one message (iCloud's message limit); 20 seconds for all links of one call, well inside the tool time limit, so
+  a message is never sent after the agent was told the call failed. `ATTACHMENT_URL_CONTENT_TYPES` (`application/pdf`): a
+  PDF must also start with `%PDF-`, so a login page sent as `application/pdf` is refused.
+- **All or nothing.** If one link fails, nothing is sent, queued or saved, and the error names the link (its position,
+  host and path) and why.
+- **Filenames:** the one given, else the server's `Content-Disposition`, else the link's last path segment with `.pdf`
+  added; without path separators, control or bidi characters, at most 120 characters.
+- **Access keys stay out of logs.** Logs and errors name a link by scheme, host and path only; Alza's links carry an
+  access key in `x=`.
+- `mail_update_draft` keeps a draft's files as they are, without holding them to `MAX_ATTACHMENT_BYTES` again, so a draft
+  with a downloaded 8 MB invoice can still be changed.
+
 ## 0.15.0
 
 - **Fix: consent boxes are unticked before an unsubscribe form is sent.** Some unsubscribe pages show the marketing consent as

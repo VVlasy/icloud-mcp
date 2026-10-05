@@ -65,6 +65,7 @@ An agent that obeys every instruction it reads can only get data out through the
 | Mail (`mail_send_message`, `mail_reply_to_message`, `mail_forward_message`, `mail_unsubscribe_from_list` by mail) | Queued for the owner on `/outbox` (`SEND_REQUIRES_APPROVAL`), `SEND_ALLOWLIST`, `MAX_RECIPIENTS`; re-checked at release |
 | iMessage (`imessage_send_message`) | Off by default; queued for the owner; `IMESSAGE_SEND_ALLOWLIST` (empty = nobody), `IMESSAGE_NEVER_SEND` |
 | Calendar invitations, updates, cancellations and RSVPs | Off by default (`ALLOW_CALENDAR_INVITES`); when on, `INVITE_ALLOWLIST` and `MAX_ATTENDEES`. No approval page yet: an allowed guest receives the event's text |
+| Attachment downloads (`attachment_urls`) | Off by default; a GET only to https prefixes on `ATTACHMENT_URL_ALLOWLIST` (every redirect too), on public addresses only. The agent chooses the query string, so an allowlisted site sees whatever it puts there: list only sites you would let read that. The file then goes out through the mail gate above |
 | One-click unsubscribe (`mail_unsubscribe_from_list`) | A POST with a fixed body to the URL in the sender's own header, public HTTPS only; it tells the sender the mail was processed and reveals the server's address, nothing else |
 | Shortcuts (`shortcuts_run_shortcut`) | Off by default; a double allowlist of names; the agent's `input` text reaches whatever the Shortcut does, so allow only Shortcuts that send nothing anywhere |
 | Apple Maps (`maps_*`) | Query text goes to Apple only |

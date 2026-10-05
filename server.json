@@ -8,13 +8,13 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/epinethrone/icloud-mcp",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "icloud-mcp-server",
-      "version": "0.15.0",
+      "version": "0.16.0",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "packageArguments": [

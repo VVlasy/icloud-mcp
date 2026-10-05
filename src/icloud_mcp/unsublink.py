@@ -23,9 +23,7 @@ it to the user, and only a call with the preview's confirm_token opens it. What 
 """
 from __future__ import annotations
 
-import ipaddress
 import re
-import socket
 import time
 import zlib
 from email.utils import getaddresses
@@ -34,6 +32,8 @@ from typing import Any, Callable
 from urllib.parse import urlencode, urljoin, urlsplit
 
 import httpx
+
+from .netguard import PinnedTransport as _Pinned, public_address as _public_address
 
 # "Unsubscribe" in the wording newsletters actually use (cs, en, de, fr, es, pl, sk). Matched on lowercased, space-collapsed text.
 _UNSUB = re.compile(
@@ -174,43 +174,6 @@ def public_web(url: str) -> str | None:
     if parts.username or parts.password:
         return "the address carries credentials"
     return _public_address(parts.hostname, parts.port or (443 if parts.scheme.lower() == "https" else 80))[0]
-
-
-def _public_address(host: str, port: int) -> tuple[str | None, str | None]:
-    """(why not, None), or (None, the address to connect to) when every address the name resolves to is global."""
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except OSError:
-        return "the address does not resolve", None
-    for info in infos:
-        if not ipaddress.ip_address(info[4][0]).is_global:
-            return "the address points into a private or local network", None
-    return None, infos[0][4][0]
-
-
-class _Pinned(httpx.BaseTransport):
-    """Connects to the address it has just checked, not to whatever the name resolves to a moment later (DNS rebinding). The Host
-    header, the TLS server name and the certificate check keep the real name; connections are not reused across names."""
-
-    def __init__(self, inner: httpx.BaseTransport | None = None,
-                 resolve: Callable[[str, int], tuple[str | None, str | None]] | None = None) -> None:
-        self._inner = inner or httpx.HTTPTransport(limits=httpx.Limits(max_keepalive_connections=0))
-        self._resolve = resolve or _public_address
-
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        url = request.url
-        why, ip = self._resolve(url.host, url.port or (443 if url.scheme == "https" else 80))
-        if why or not ip:
-            raise PermissionError(f"{url.host}: {why}")
-        request.url = url.copy_with(host=ip)
-        request.extensions = {**request.extensions, "sni_hostname": url.host}
-        try:
-            return self._inner.handle_request(request)
-        finally:
-            request.url = url               # cookies are kept for the real name
-
-    def close(self) -> None:
-        self._inner.close()
 
 
 class _Forms(HTMLParser):
