@@ -6,6 +6,7 @@ import functools
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,7 @@ from .safety import clean_deep, configure_screen, confirm_problem, stats as safe
 from .safety import confirm_token as make_confirm_token
 from . import mailbulk
 from .mail import UNTRUSTED_NOTICE, MailError, MailService
+from .uploads import UploadError, UploadStore, register_upload_route
 from .urlattach import MAX_URLS
 
 log = logging.getLogger("icloud_mcp")
@@ -98,11 +100,13 @@ class Attachment(BaseModel):
     filename: str
     content_base64: str
     content_type: str | None = None
+    sha256: str | None = Field(None, description="The file's sha256 (hex) if you know it: other bytes are refused, so mistyped base64 never goes out.")
 
 
 class AttachmentUrl(BaseModel):
-    url: str = Field(description="The file's https link as another tool gave it (query string included).")
+    url: str = Field(description="The file's https link as another tool gave it (query string included), or your URL from mail_create_upload_url.")
     filename: str | None = Field(None, description="Name to attach it under; default the name the website sends.")
+    sha256: str | None = Field(None, description="The file's sha256 (hex) if you know it; a different file is refused.")
 
 
 ReminderRepeat = Annotated[str | None, _d("Repeat rule: 'FREQ=WEEKLY;BYDAY=MO', 'FREQ=MONTHLY;BYMONTHDAY=1;COUNT=12', 'FREQ=YEARLY'. DAILY or coarser; needs a due date.")]
@@ -128,10 +132,11 @@ def _alert_args(before: list[int] | None, at: list[str] | None) -> dict[str, str
 Attachments = Annotated[list[Attachment] | None, _d("Files to attach (from mail_get_attachment as is; from drive_get_file, name and "
                                                     "data_base64 go in filename and content_base64).")]
 AttachmentUrls = Annotated[list[AttachmentUrl] | None, Field(max_length=MAX_URLS, description=(
-    "Files the server downloads and attaches itself, so their bytes never pass through you: the preferred way to attach a file "
-    "another tool gives as a link (e.g. alza-mcp order_document.href). Only https links on the server's ATTACHMENT_URL_ALLOWLIST "
-    "work (a refused link's error lists the allowed prefixes); PDF up to 10 MB each by default, 20 MB together. If any link "
-    "fails, nothing is sent or saved and the error names it. Works alongside 'attachments'."))]
+    "Files the server fetches and attaches itself, so their bytes never pass through you: the way to attach a file another tool "
+    "gives as a link (e.g. alza-mcp order_document.href) or one you uploaded to a mail_create_upload_url URL. Other links must be "
+    "https on the server's ATTACHMENT_URL_ALLOWLIST (a refused link's error lists the allowed prefixes); types per "
+    "ATTACHMENT_URL_CONTENT_TYPES (PDF by default), 10 MB each by default, 20 MB together. If any link fails, nothing is sent or "
+    "saved and the error names it. Works alongside 'attachments'."))]
 
 
 _tool_timeout = 90.0     # set from TOOL_TIMEOUT_SECONDS in create_server()
@@ -531,7 +536,14 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
 
     # ------------------------------------------------------------------ mail
     if s.enable_mail:
-        mail = MailService(s)
+        # Files agents upload to this server's own URLs (mail_create_upload_url), hosted and writable only: no HTTP server over stdio
+        uploads = (UploadStore(s.data_dir, s.public_url, ttl=s.attachment_upload_ttl_seconds, max_bytes=s.attachment_url_max_bytes,
+                               content_types=s.attachment_url_content_types)
+                   if writable and s.allow_attachment_uploads and provider is not None else None)
+        mail = MailService(s, uploads=uploads)
+        mcp._icloud_uploads = uploads
+        if uploads is not None:
+            register_upload_route(mcp, uploads)
         health["mail"] = mail.health
         warm["mail"] = lambda: mail.list_folders() and None       # one pooled login plus the folder list
         pools["mail"] = lambda: {"warm": bool(mail._pool), "imap_kept": len(mail._pool), "imap_pool_size": s.imap_pool_size,
@@ -693,9 +705,10 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 and saved to the Sent folder (status "sent"). If the operator turned on owner approval, the result has sent=false
                 and says where the message waits for the owner (outbox or Drafts): it is NOT sent.
                 draft=true saves to Drafts instead. Files go in 'attachments' (from drive_get_file or mail_get_attachment); a file
-                another tool gives as a link (e.g. alza-mcp order_document.href) goes in 'attachment_urls' instead, which the server
-                downloads itself (preferred; only links on its allowlist work). To pass on a received message with its attachments,
-                use mail_forward_message. Example: to=['anna@example.org'], subject='Agenda', body='Hi Anna, ...'."""
+                another tool gives as a link (e.g. alza-mcp order_document.href), or one you uploaded with mail_create_upload_url, goes
+                in 'attachment_urls' instead, which the server fetches itself (preferred; other links must be on its allowlist). To pass
+                on a received message with its attachments, use mail_forward_message. Example: to=['anna@example.org'], subject='Agenda',
+                body='Hi Anna, ...'."""
                 return mail.send(to=to, subject=subject, body=body, body_html=body_html, cc=cc, bcc=bcc,
                                  attachments=_atts(attachments), attachment_urls=_urls(attachment_urls), draft=draft)
 
@@ -721,8 +734,8 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                 Pass 'to' only to override the computed recipients. 'body' is your new text only (the quote is added).
                 Sent immediately, saved to Sent, and the original is flagged Answered (unless owner approval is on: then the result
                 has sent=false and the reply waits for the owner). draft=true saves a draft instead. Files go in 'attachments'; a file
-                another tool gives as a link (e.g. alza-mcp order_document.href) goes in 'attachment_urls' (preferred: the server
-                downloads it; only links on its allowlist work).
+                another tool gives as a link (e.g. alza-mcp order_document.href), or one you uploaded with mail_create_upload_url, goes
+                in 'attachment_urls' (preferred: the server fetches it; other links must be on its allowlist).
                 Example (after mail_search_messages found the message): mail_reply_to_message(folder='INBOX', uid=8851, body='Thanks, see you then.')"""
                 return mail.reply(folder, uid, body, body_html=body_html, reply_all=reply_all, quote=quote_original, to=to, cc=cc, bcc=bcc,
                                   attachments=_atts(attachments), attachment_urls=_urls(attachment_urls), draft=draft, uidvalidity=uidvalidity)
@@ -820,12 +833,31 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
                                   attachment_urls: AttachmentUrls = None,
                                   folder: Annotated[str, _d("Where the draft is; default Drafts.")] = "Drafts") -> dict[str, Any]:
                 """Change a saved draft; anything left out stays as it is (attachments too, unless given). 'attachments' replaces the
-                draft's files; 'attachment_urls' adds files the server downloads from links (preferred for a file another tool gives as
-                a link, e.g. alza-mcp order_document.href; only links on its allowlist work). The new version is saved first, then the
-                old one goes to Trash; the result has the new uid. Nothing is sent."""
+                draft's files; 'attachment_urls' adds files the server fetches itself (preferred for a file another tool gives as a
+                link, e.g. alza-mcp order_document.href, or one you uploaded with mail_create_upload_url; other links must be on its
+                allowlist). The new version is saved first, then the old one goes to Trash; the result has the new uid. Nothing is sent."""
                 return mail.update_draft(uid, folder=folder, uidvalidity=uidvalidity, to=to, cc=cc, bcc=bcc, subject=subject,
                                          body=body, body_html=body_html, attachments=_atts(attachments),
                                          attachment_urls=_urls(attachment_urls))
+
+            if uploads is not None:
+
+                @mcp.tool(annotations=_WRITE)
+                @_guard
+                def mail_create_upload_url(filename: Annotated[str, _d("The file's name with its extension, which sets its type: 'report.docx'.")],
+                                           sha256: Annotated[str | None, _d("The file's sha256 (hex, as sha256sum prints it): other bytes are refused.")] = None,
+                                           content_type: Annotated[str | None, _d("Its media type, when the extension does not say.")] = None) -> dict[str, Any]:
+                    """Get a one-time URL to upload a file you generated, so its bytes never pass through you: from a shell,
+                    curl -T <file> <url> (PUT, the bytes as the body), then pass the same url in 'attachment_urls' of mail_send_message,
+                    mail_reply_to_message or mail_update_draft. One file per URL, of a type the server accepts (the error names them),
+                    within max_bytes, until expires_at; nothing is ever served from it. Use base64 in 'attachments' only without a shell."""
+                    try:
+                        token, up = uploads.create(filename, content_type=content_type, sha256=sha256)
+                    except UploadError as e:
+                        raise ToolError(str(e)) from e
+                    return {**uploads.describe(token, up),
+                            "upload_with": f"curl -sS -T {shlex.quote(up.filename)} {shlex.quote(uploads.url(token))}",
+                            "then": "Put the same url in attachment_urls on the mail tool call; the server attaches its copy of the file."}
 
             @mcp.tool(annotations=_WRITE)
             @_guard

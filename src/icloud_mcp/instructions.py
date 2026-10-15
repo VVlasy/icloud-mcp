@@ -47,6 +47,9 @@ _RULES: list[tuple[str, str, tuple[str, ...]]] = [
      ("mail_delete_messages", "mail_send_message")),
     ("MAIL", "A saved draft is sent as it is with mail_send_draft and changed with mail_update_draft; never resend it with mail_send_message.",
      ("mail_send_draft", "mail_update_draft")),
+    ("MAIL", "A file you generated: mail_create_upload_url, send the bytes to its url from your shell (curl -T), then pass that url in "
+             "attachment_urls. Base64 in 'attachments' only when you have no shell, and then with the file's sha256.",
+     ("mail_create_upload_url",)),
     ("MAIL", "mail_delete_folder never deletes mail: a folder's messages go to Trash first, after the owner confirms the preview.",
      ("mail_delete_folder",)),
 
@@ -123,7 +126,8 @@ _TOOL_MAP: list[tuple[str, list[str]]] = [
     ("Read mail", ["mail_get_message (one)", "mail_get_messages (a batch from one search)", "mail_get_thread (the whole conversation)",
                    "mail_get_attachment (a file in it)", "mail_extract_bookings (exact bookings and invitations)"]),
     ("Write mail", ["mail_reply_to_message (answer, keeps the thread)", "mail_send_message (a new conversation)",
-                    "mail_forward_message (pass one on)", "mail_send_draft / mail_update_draft (a saved draft)"]),
+                    "mail_forward_message (pass one on)", "mail_send_draft / mail_update_draft (a saved draft)",
+                    "mail_create_upload_url (a file you generated: upload it there, then attachment_urls)"]),
     ("File mail", ["mail_mark_messages (read, flagged)", "mail_move_messages", "mail_delete_messages (to Trash)",
                    "mail_create_folder / mail_update_folder / mail_delete_folder"]),
     ("Clean up mail", ["mail_list_senders (who fills a folder)", "mail_run_bulk_action (by sender, preview first)",

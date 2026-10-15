@@ -3,6 +3,28 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
+## 0.17.0
+
+- **Agents can attach files they generated (`mail_create_upload_url`).** A hosted server now hands an agent a one-time https
+  URL on its own address (`<MCP_PUBLIC_URL>/upload/<token>`); the agent sends the file's bytes to it from a shell
+  (`curl -T report.docx <url>`) and passes the same URL in `attachment_urls` of `mail_send_message`, `mail_reply_to_message`
+  or `mail_update_draft`, which attach the server's copy. The bytes never pass through the model, so nothing is retyped,
+  shrunk or mangled on the way. Only a signed-in MCP client can mint a URL; the token (32 random bytes, kept on disk only as
+  a hash) is the upload's only credential; a URL takes one file, of the type its name says, on `ATTACHMENT_URL_CONTENT_TYPES`
+  and within `ATTACHMENT_URL_MAX_BYTES`, its first bytes checked; nothing is ever served back from it (no GET). URLs and
+  files live for `ATTACHMENT_UPLOAD_TTL_SECONDS` (an hour), at most 20 at once and 100 MiB together, in `DATA_DIR/uploads`
+  (owner-only files). `ALLOW_ATTACHMENT_UPLOADS=false` turns it off; it is never on over stdio or read-only. It works without
+  an `ATTACHMENT_URL_ALLOWLIST`: the server's own upload URLs need no entry.
+- **A sha256 to match.** `attachments[].sha256` and `attachment_urls[].sha256` (hex, as `sha256sum` prints it) are optional:
+  bytes with another hash are refused before anything is sent, queued or saved, so a base64 string a model mistyped, or a
+  file that changed at its link, is caught at the tool call and not after a round trip through `mail_get_attachment`.
+  `mail_create_upload_url` takes a `sha256` too and refuses an upload of other bytes.
+- **More types are checked by their first bytes.** Besides PDF, a file sent as Word, Excel or PowerPoint (OOXML and the
+  OpenDocument types), zip, the old `.doc`/`.xls`/`.ppt`, PNG, JPEG, GIF, WebP, TIFF, BMP or gzip must start as such a file
+  does, for downloads and uploads alike; a login page sent under one of those types is refused. Which types are accepted is
+  still `ATTACHMENT_URL_CONTENT_TYPES` (`application/pdf` by default): list the Office or image types there to attach them.
+  A downloaded file with no name of its own gets the right extension for these types on every system.
+
 ## 0.16.0
 
 - **Attachments from a link (`attachment_urls`).** `mail_send_message`, `mail_reply_to_message` and `mail_update_draft`

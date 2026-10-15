@@ -172,6 +172,8 @@ class Settings:
     attachment_url_allowlist: tuple[str, ...] = ()           # ATTACHMENT_URL_ALLOWLIST: https URL prefixes attachment_urls may fetch (empty = off)
     attachment_url_max_bytes: int = 10 * 1024 * 1024         # ATTACHMENT_URL_MAX_BYTES: largest file attachment_urls downloads
     attachment_url_content_types: tuple[str, ...] = ("application/pdf",)   # ATTACHMENT_URL_CONTENT_TYPES: types it accepts
+    allow_attachment_uploads: bool = True          # ALLOW_ATTACHMENT_UPLOADS: mail_create_upload_url and PUT /upload/<token> (hosted only)
+    attachment_upload_ttl_seconds: int = 3600      # ATTACHMENT_UPLOAD_TTL_SECONDS: how long an upload URL, and the file sent to it, is kept
     contacts_allow_email_changes: bool = True  # CONTACTS_ALLOW_EMAIL_CHANGES: false = agents cannot add or replace emails/phones on cards
     mail_max_age_days: int = 0              # MAIL_MAX_AGE_DAYS: 0 = whole mailbox; N = searches never reach further back than N days
     safety_screen: str = ""                 # SAFETY_SCREEN: "" (built-in patterns) or "command:<path>" (the owner's own classifier)
@@ -207,6 +209,8 @@ class Settings:
             attachment_url_allowlist=tuple(_list("ATTACHMENT_URL_ALLOWLIST")),
             attachment_url_max_bytes=_int("ATTACHMENT_URL_MAX_BYTES", 10 * 1024 * 1024),
             attachment_url_content_types=tuple(t.lower() for t in _list("ATTACHMENT_URL_CONTENT_TYPES", "application/pdf")),
+            allow_attachment_uploads=_bool("ALLOW_ATTACHMENT_UPLOADS", True) and not read_only,
+            attachment_upload_ttl_seconds=_int("ATTACHMENT_UPLOAD_TTL_SECONDS", 3600),
             max_recipients=_int("MAX_RECIPIENTS", 25),
             send_allowlist=tuple(x.lower() for x in _list("SEND_ALLOWLIST")),
             max_body_chars=_int("MAX_BODY_CHARS", 30000),
@@ -328,6 +332,8 @@ class Settings:
         bad = [t for t in self.attachment_url_content_types if not re.fullmatch(r"[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*", t)]
         if bad or not self.attachment_url_content_types:
             raise SystemExit(f"ATTACHMENT_URL_CONTENT_TYPES must list media types such as application/pdf, not {', '.join(bad) or 'nothing'}.")
+        if self.attachment_upload_ttl_seconds <= 0:
+            raise SystemExit("ATTACHMENT_UPLOAD_TTL_SECONDS must be a positive number of seconds.")
 
     def validate_for_local(self) -> None:
         """Local (stdio) mode: the desktop client on this computer starts the server itself, so there is no public URL or owner password."""

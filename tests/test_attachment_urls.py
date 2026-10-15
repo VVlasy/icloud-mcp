@@ -307,9 +307,9 @@ def test_a_pdf_that_is_not_a_pdf_is_refused():
 
 def test_other_allowed_types_need_no_magic():
     def h(req):
-        return httpx.Response(200, headers={"content-type": "image/png"}, content=b"\x89PNG....")
-    got = fetch(h, [{"url": "https://www.alza.cz/Apps/pdfdoc.asp?d=1"}], types=("application/pdf", "image/png"))
-    assert got[0]["content_type"] == "image/png" and got[0]["filename"] == "pdfdoc.asp.png"
+        return httpx.Response(200, headers={"content-type": "text/csv"}, content=b"a,b\n1,2\n")
+    got = fetch(h, [{"url": "https://www.alza.cz/Apps/pdfdoc.asp?d=1"}], types=("application/pdf", "text/csv"))
+    assert got[0]["content_type"] == "text/csv" and got[0]["filename"] == "pdfdoc.asp.csv"
 
 
 def test_a_slow_server_is_cut_off(monkeypatch):
@@ -510,3 +510,57 @@ def test_the_tool_passes_attachment_urls_through(svc):
     with pytest.raises(Exception, match="20"):
         asyncio.run(server.call_tool("mail_send_message", {"to": ["anna@example.org"], "subject": "x", "body": "x",
                                                            "attachment_urls": [{"url": INVOICE}] * 21}))
+
+
+# ------------------------------------------------------------------ more types, and a hash to match
+DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+@pytest.mark.parametrize("ctype, good, bad", [
+    (DOCX_TYPE, b"PK\x03\x04" + b"\x00" * 30, b"<!doctype html><html>sign in</html>"),
+    ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b"PK\x03\x04\x14\x00", b"%PDF-1.4"),
+    ("application/vnd.oasis.opendocument.text", b"PK\x03\x04\x14\x00", b"PK\x05\x06"),
+    ("application/msword", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", b"PK\x03\x04"),
+    ("image/png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 8, b"PNG\r\n\x1a\n"),
+    ("image/jpeg", b"\xff\xd8\xff\xe0\x00\x10JFIF", b"\xff\xd9\xff"),
+    ("image/gif", b"GIF89a\x01\x00", b"GIF90a"),
+    ("image/webp", b"RIFF\x10\x00\x00\x00WEBPVP8 ", b"RIFF\x10\x00\x00\x00WAVE"),
+    ("image/tiff", b"MM\x00*\x00\x00", b"MM*\x00"),
+])
+def test_signatures_are_checked_for_office_files_and_images_too(ctype, good, bad):
+    import re
+    assert urlattach.wrong_signature(ctype, good) is None
+    assert "does not start with" in urlattach.wrong_signature(ctype, bad)
+    assert urlattach.wrong_signature("text/csv", b"a,b\n") is None            # no signature known for the type: not checked
+
+    def wrong(req):
+        return httpx.Response(200, headers={"content-type": ctype}, content=bad)
+    with pytest.raises(urlattach.AttachmentUrlError, match=f"not a real {re.escape(ctype)} file"):
+        fetch(wrong, [{"url": f"{ALZA}?d=1"}], types=(ctype,))
+
+    def right(req):
+        return httpx.Response(200, headers={"content-type": ctype}, content=good)
+    got = fetch(right, [{"url": f"{ALZA}?d=1"}], types=(ctype,))
+    assert got[0]["content"] == good and got[0]["filename"] == "pdfdoc.asp" + urlattach._EXTENSION[ctype]
+
+
+@pytest.mark.parametrize("name, ctype", [("a.docx", DOCX_TYPE), ("A.PDF", "application/pdf"), ("x.jpeg", "image/jpeg"),
+                                         ("x.jpg", "image/jpeg"), ("x.csv", "text/csv"), ("report", None), (".pdf", None),
+                                         ("x.nosuchext", None)])
+def test_the_type_a_file_name_means(name, ctype):
+    assert urlattach.type_of(name) == ctype
+
+
+def test_a_sha256_given_with_a_link_must_be_the_files():
+    import hashlib
+    good = hashlib.sha256(PDF).hexdigest()
+    assert fetch(lambda req: pdf_response(), [{"url": INVOICE, "sha256": "sha256:" + good.upper()}])[0]["content"] == PDF
+    with pytest.raises(urlattach.AttachmentUrlError, match=rf"attachment_urls\[0\] .*its sha256 is {good}, not the 0{{64}} given.*Nothing was sent"):
+        fetch(lambda req: pdf_response(), [{"url": INVOICE, "sha256": "0" * 64}])
+
+    def h(req):
+        raise AssertionError("a hash that cannot be right is refused before anything is downloaded")
+    with pytest.raises(urlattach.AttachmentUrlError, match=r"attachment_urls\[1\]: sha256: a sha256 is 64 hexadecimal"):
+        fetch(h, [{"url": INVOICE}, {"url": INVOICE, "sha256": "abc"}])
+    for value in ("", None):
+        assert urlattach.fetch_all.__doc__ and fetch(lambda req: pdf_response(), [{"url": INVOICE, "sha256": value}])[0]["content"] == PDF
