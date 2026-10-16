@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import pathlib
 import time
+from datetime import datetime, timedelta, timezone
 
 import caldav
 import pytest
@@ -219,9 +220,10 @@ def test_a_calendar_that_cannot_be_read_is_named_not_hidden(s, monkeypatch):
     monkeypatch.setattr(svc, "_principal", lambda: contextlib.nullcontext(object()))
     monkeypatch.setattr(svc, "_pick", lambda p, name: cals)
     monkeypatch.setattr(svc, "_cal_name", lambda c: c.name)
-    out = svc.list_events("2026-10-05", "2026-10-06")
+    day = (datetime.now(timezone.utc) + timedelta(days=7)).date()      # always ahead of now: free time is never looked for in the past
+    out = svc.list_events(day.isoformat(), (day + timedelta(days=1)).isoformat())
     assert out["complete"] is False and out["not_read"] == ["Broken"] and "missing" in out["warning"]
-    free = svc.find_free_time("2026-10-05T09:00", "2026-10-06T17:00", 30)
+    free = svc.find_free_time(f"{day}T09:00", f"{day + timedelta(days=1)}T17:00", 30)
     assert free["complete"] is False and free["not_read"] == ["Broken"] and "may not really be free" in free["warning"]
 
 
