@@ -96,7 +96,8 @@ def test_local_server_has_no_oauth_and_the_same_tools(local_env, tmp_path, monke
     monkeypatch.setenv("MCP_PUBLIC_URL", "https://mcp.example.com")
     monkeypatch.setenv("MCP_OWNER_PASSWORD", "x" * 16)
     remote, _ = create_server(Settings.from_env())
-    assert local_tools == {t.name for t in asyncio.run(remote.list_tools())}
+    # the one tool apart: an upload URL needs the HTTP server a hosted deployment has and a desktop client over stdio does not
+    assert local_tools == {t.name for t in asyncio.run(remote.list_tools())} - {"mail_create_upload_url"}
     assert {"mail_send_message", "calendar_create_event", "contacts_search_contacts"} <= local_tools
 
 

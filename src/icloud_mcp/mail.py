@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import email
+import hashlib
 import html as html_lib
 import imaplib
 import json
@@ -288,8 +289,9 @@ def _add_html_alt(msg: EmailMessage, html: str) -> None:
 
 
 def _attach(msg: EmailMessage, att: dict[str, Any], max_bytes: int) -> None:
-    """Add one file: base64 from the agent ('content_base64', up to MAX_ATTACHMENT_BYTES), or bytes the server already holds
-    ('content': downloaded from attachment_urls under its own limits, or kept from a draft being changed)."""
+    """Add one file: base64 from the agent ('content_base64', up to MAX_ATTACHMENT_BYTES, checked against its 'sha256' when one is
+    given), or bytes the server already holds ('content': fetched or uploaded through attachment_urls under its own limits, or kept
+    from a draft being changed)."""
     filename = att.get("filename") or "attachment"
     if isinstance(att.get("content"), bytes):
         data = att["content"]
@@ -300,6 +302,15 @@ def _attach(msg: EmailMessage, att: dict[str, Any], max_bytes: int) -> None:
             raise MailError(f"Attachment '{filename}': invalid base64 ({e}). Pass the file's bytes base64-encoded.") from e
         if len(data) > max_bytes:
             raise MailError(f"Attachment '{filename}' is {len(data)} bytes; the limit is {max_bytes} (MAX_ATTACHMENT_BYTES). Send a smaller file.")
+        if att.get("sha256"):
+            try:
+                want = urlattach.normalize_sha256(att["sha256"])
+            except ValueError as e:
+                raise MailError(f"Attachment '{filename}': sha256: {e}.") from None
+            if (have := hashlib.sha256(data).hexdigest()) != want:
+                raise MailError(f"Attachment '{filename}': its bytes have sha256 {have}, not the {want} given, so the base64 is not the "
+                                "file (a character was dropped or changed on the way). Nothing was sent or saved; pass the file again, "
+                                "or through attachment_urls.")
     ctype = att.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     maintype, _, subtype = ctype.partition("/")
     msg.add_attachment(data, maintype=maintype or "application", subtype=subtype or "octet-stream", filename=filename)
@@ -630,8 +641,9 @@ _retrying = callctx.retry_once_if_safe(_mail_transport)
 
 
 class MailService:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, uploads: Any = None):
         self.s = settings
+        self.uploads = uploads              # uploads.UploadStore: files agents sent to this server's own upload URLs (hosted only)
         self._folder_cache: dict[str, str] = {}
         self.outbox = Outbox(settings.data_dir, settings.outbox_ttl, settings.outbox_max)
         self._people_lock = threading.Lock()
@@ -1609,13 +1621,15 @@ class MailService:
             raise
 
     def _url_attachments(self, attachment_urls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-        """The files of attachment_urls, downloaded before anything is sent or saved: every one of them, or a MailError naming
-        the URL that failed (urlattach), so a message never goes out with some of its files missing."""
+        """The files of attachment_urls, downloaded (or taken from this server's upload store) before anything is sent or saved:
+        every one of them, or a MailError naming the URL that failed (urlattach), so a message never goes out with some of its
+        files missing."""
         if not attachment_urls:
             return []
         try:
             return urlattach.fetch_all(attachment_urls, allowlist=urlattach.parse_allowlist(self.s.attachment_url_allowlist),
-                                       max_bytes=self.s.attachment_url_max_bytes, content_types=self.s.attachment_url_content_types)
+                                       max_bytes=self.s.attachment_url_max_bytes, content_types=self.s.attachment_url_content_types,
+                                       uploads=self.uploads)
         except urlattach.AttachmentUrlError as e:
             raise MailError(str(e)) from e
 

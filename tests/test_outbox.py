@@ -189,7 +189,7 @@ def test_calendar_invites_blocked_by_default(env):
 def web(env, monkeypatch):
     s, fake, sent = env
     created, orig = [], MailService.__init__
-    monkeypatch.setattr(MailService, "__init__", lambda self, st: (orig(self, st), created.append(self))[0])
+    monkeypatch.setattr(MailService, "__init__", lambda self, st, **kw: (orig(self, st, **kw), created.append(self))[0])
     mcp, provider = create_server(s)
     app = mcp.streamable_http_app(host="0.0.0.0")
     return app, provider, created[0], fake, sent

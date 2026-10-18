@@ -300,18 +300,18 @@ Most clients can also ask you before a tool runs (in Claude, "ask before use" pe
 
 ## Tools
 
-**92 tools.** 50 for Mail, Calendar, Contacts, the clock and the health check, 40 more with the optional Mac helper, and 2 for Shortcuts you allowlist. Open a section for the details.
+**93 tools.** 51 for Mail, Calendar, Contacts, the clock and the health check (one of them, `mail_create_upload_url`, on a hosted server only), 40 more with the optional Mac helper, and 2 for Shortcuts you allowlist. Open a section for the details.
 
 Every name is `area_verb_noun` (`mail_send_message`, `calendar_create_event`). Eleven tools were renamed in 0.7.0 and 36 in 0.12.0 (a verb with no noun, such as `mail_send`) to follow that pattern; `TOOLS` still accepts the old names and logs the new one.
 
 <details>
-<summary><b>Mail</b> &nbsp;·&nbsp; 25 tools</summary>
+<summary><b>Mail</b> &nbsp;·&nbsp; 26 tools</summary>
 
 | Kind | Tools |
 |---|---|
 | Read | `mail_list_folders`, `mail_search_messages`, `mail_list_changes`, `mail_find_correspondent`, `mail_get_message`, `mail_get_messages` (up to 25 in one call), `mail_get_thread`, `mail_get_attachment`, `mail_extract_bookings` |
 | Read | `mail_list_senders` (who fills a folder, busiest first, with bulk and unsubscribe info), `mail_list_awaiting_reply` (mail you sent that has had no answer) |
-| Write | `mail_send_message`, `mail_reply_to_message` (including reply-all), `mail_forward_message`, `mail_mark_messages`, `mail_move_messages`, `mail_delete_messages` (to Trash), `mail_send_draft` (a saved draft, as it is), `mail_update_draft`, `mail_create_folder`, `mail_update_folder` (rename), `mail_delete_folder` (its mail goes to Trash first), `mail_run_bulk_action`, `mail_undo_bulk_action`, `mail_unsubscribe_from_list` |
+| Write | `mail_send_message`, `mail_reply_to_message` (including reply-all), `mail_forward_message`, `mail_mark_messages`, `mail_move_messages`, `mail_delete_messages` (to Trash), `mail_send_draft` (a saved draft, as it is), `mail_update_draft`, `mail_create_folder`, `mail_update_folder` (rename), `mail_delete_folder` (its mail goes to Trash first), `mail_run_bulk_action`, `mail_undo_bulk_action`, `mail_unsubscribe_from_list`, `mail_create_upload_url` (a one-time URL to upload a file the agent generated; hosted servers) |
 
 - Replies keep the `Re:` subject, `In-Reply-To` and `References`, the right recipients and the quoted original in plain text and HTML. Sent mail is copied to Sent and the original is flagged Answered (forwards get `$Forwarded`). `draft=true` saves to Drafts instead of sending.
 - `mail_get_messages` reads a batch (a day's unread mail, a whole thread) in one IMAP round trip, about 7 times faster than one at a time.
@@ -326,7 +326,8 @@ Every name is `area_verb_noun` (`mail_send_message`, `calendar_create_event`). E
 - **Stale ids are refused.** Every message comes with its folder's `uidvalidity`; tools that act on a uid accept it back and refuse if iCloud has renumbered the folder since, instead of touching a different message.
 - Reading a message does not mark it read. Bcc recipients receive the mail, but the header is stripped on the wire.
 - Recipients accept `a@b.com`, `Name <a@b.com>` or `mailto:a@b.com`. Anything else is rejected with a clear error and never silently dropped.
-- **Attach a file from a link without passing it through the agent.** `mail_send_message`, `mail_reply_to_message` and `mail_update_draft` (and their `draft=true` paths) take `attachment_urls: [{url, filename?}]` (up to 20) next to `attachments`: the server downloads each file and attaches it, so an invoice link from another tool (alza-mcp's `order_document.href`) never travels as base64 through the model. Off unless `ATTACHMENT_URL_ALLOWLIST` lists https prefixes; every URL and every redirect (at most 3) must sit under one of them, on a public address (checked, then connected to as checked), as PDF by default (it must start with `%PDF-`), within `ATTACHMENT_URL_MAX_BYTES` (20 MiB for all files of one message, iCloud's message limit) and 20 seconds. If one link fails nothing is sent or saved and the error names it. Logs name a link by host and path only, never its query string (Alza's carries an access key). Approval treats these files like any other attachment.
+- **Attach a file from a link without passing it through the agent.** `mail_send_message`, `mail_reply_to_message` and `mail_update_draft` (and their `draft=true` paths) take `attachment_urls: [{url, filename?, sha256?}]` (up to 20) next to `attachments`: the server downloads each file and attaches it, so an invoice link from another tool (alza-mcp's `order_document.href`) never travels as base64 through the model. Off unless `ATTACHMENT_URL_ALLOWLIST` lists https prefixes; every URL and every redirect (at most 3) must sit under one of them, on a public address (checked, then connected to as checked), of a type on `ATTACHMENT_URL_CONTENT_TYPES` (PDF by default; PDF, Office, OpenDocument, zip and image files must start as such a file does), within `ATTACHMENT_URL_MAX_BYTES` (20 MiB for all files of one message, iCloud's message limit) and 20 seconds. If one link fails nothing is sent or saved and the error names it. Logs name a link by host and path only, never its query string (Alza's carries an access key). Approval treats these files like any other attachment.
+- **Attach a file the agent generated, without base64.** On a hosted server, `mail_create_upload_url` hands the agent a one-time URL on the server's own address; the agent sends the file's bytes to it from a shell (`curl -T report.docx <url>`) and passes the same URL in `attachment_urls`, with no allowlist entry needed. Only a signed-in client can mint a URL; one file per URL, of a type on `ATTACHMENT_URL_CONTENT_TYPES`, within `ATTACHMENT_URL_MAX_BYTES`, its first bytes checked; nothing is ever served back from it; URLs and files expire after an hour (`ATTACHMENT_UPLOAD_TTL_SECONDS`), at most 20 at once. `ALLOW_ATTACHMENT_UPLOADS=false` turns it off. Where an agent has no shell, `attachments[].sha256` (and `attachment_urls[].sha256`) makes the server refuse bytes with another hash, so a mistyped base64 string is caught at the call instead of after a round trip through `mail_get_attachment`.
 
 </details>
 
@@ -551,7 +552,9 @@ Everything is an environment variable. [`.env.example`](https://github.com/epine
 | `UNSUBSCRIBE_LINKS_CONFIRM` | true | `false` = with `ALLOW_UNSUBSCRIBE_LINKS`, open the unsubscribe page on the first call instead of returning a preview for the owner to confirm |
 | `ATTACHMENT_URL_ALLOWLIST` | empty (off) | https URL prefixes `attachment_urls` may download from, comma-separated, e.g. `https://www.alza.cz/Apps/pdfdoc.asp,https://pdf.alza.cz/Apps/pdfdoc.asp`. Host, port and whole path segments must match, for every redirect too; a bad entry stops the server |
 | `ATTACHMENT_URL_MAX_BYTES` | 10 MiB | Largest file `attachment_urls` downloads (all files of one message together at most 20 MiB) |
-| `ATTACHMENT_URL_CONTENT_TYPES` | `application/pdf` | Types `attachment_urls` accepts, comma-separated; a PDF must also start with `%PDF-` |
+| `ATTACHMENT_URL_CONTENT_TYPES` | `application/pdf` | Types `attachment_urls` accepts (downloads and uploads), comma-separated; PDF, Office, OpenDocument, zip and image files must also start as such a file does |
+| `ALLOW_ATTACHMENT_UPLOADS` | true | Hosted servers: `mail_create_upload_url` and the upload endpoint it points to, so agents can attach files they generated (never read-only or over stdio) |
+| `ATTACHMENT_UPLOAD_TTL_SECONDS` | 3600 | How long an upload URL, and the file sent to it, is kept (at most 20 live at once, 100 MiB together, in `DATA_DIR/uploads`) |
 | `SAVE_SENT_COPY` | true | Copy sent mail to Sent (iCloud doesn't do it itself) |
 | `MAX_BODY_CHARS`, `MAX_ATTACHMENT_BYTES` | 30000, 5 MiB | Result size caps |
 | `MCP_PUBLIC_URL`, `MCP_OWNER_PASSWORD` | required when hosted | Public https address; owner password (12+ characters) |
