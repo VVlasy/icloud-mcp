@@ -1271,8 +1271,9 @@ class MailService:
             return None
         return mailparts.leaf_message(mime, body), len(parts)
 
-    @_retrying
-    def get_attachment(self, folder: str, uid: int, index: int, *, uidvalidity: int | None = None) -> dict[str, Any]:
+    def _attachment_file(self, folder: str, uid: int, index: int, *, uidvalidity: int | None = None) -> email.message.Message:
+        """One attachment of a message as a part of its own, fetched alone where the structure allows; MailError when the index
+        is out of range."""
         found = None
         with self.imap() as c:
             folder = self.resolve_folder(c, folder)
@@ -1287,6 +1288,26 @@ class MailService:
         if part is None:
             raise MailError(f"Attachment index {index} out of range (message has {count}). Indexes come from the 'attachments' list "
                             "of mail_get_message.")
+        return part
+
+    @_retrying
+    def stage_attachment(self, folder: str, uid: int, index: int, *, uidvalidity: int | None = None, filename: str | None = None,
+                         sha256: str | None = None) -> tuple[str, Any]:
+        """Copy a message's attachment into this server's upload store and return its token and record: the file then goes into
+        another message through attachment_urls without its bytes passing through the agent."""
+        if self.uploads is None:
+            raise MailError("This server holds no files for attachment_urls (a local server, or ALLOW_ATTACHMENT_UPLOADS=false): "
+                            "read the file with mail_get_attachment and pass it in 'attachments' instead.")
+        part = self._attachment_file(folder, uid, index, uidvalidity=uidvalidity)
+        try:
+            return self.uploads.put_ready(filename or part.get_filename() or f"part-{index}", part.get_content_type(),
+                                          attachment_bytes(part), sha256=sha256)
+        except urlattach.AttachmentSourceError as e:
+            raise MailError(f"Attachment {index} of message {uid} in '{folder}' cannot be staged: {e}.") from e
+
+    @_retrying
+    def get_attachment(self, folder: str, uid: int, index: int, *, uidvalidity: int | None = None) -> dict[str, Any]:
+        part = self._attachment_file(folder, uid, index, uidvalidity=uidvalidity)
         data = attachment_bytes(part)
         ctype = part.get_content_type()
         meta = {"notice": UNTRUSTED_NOTICE, "filename": part.get_filename() or f"part-{index}", "content_type": ctype, "size": len(data)}

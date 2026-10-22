@@ -3,6 +3,22 @@
 What changed in each release, newest first. The GitHub release notes carry the full detail and the upgrade steps.
 Update the Mac helper before the server whenever its version changes.
 
+## 0.18.0
+
+- **Agents can attach a file that sits in another message, without reading it.** `mail_create_upload_url` with `from_folder`,
+  `from_uid` and `from_index` (and the folder's `from_uidvalidity`) makes the server copy that attachment into its upload store and
+  answer with a URL that is ready at once; passed in `attachment_urls` of `mail_send_message`, `mail_reply_to_message` or
+  `mail_update_draft`, it attaches the copy. The bytes never pass through the model (no `mail_get_attachment`, no base64), so
+  forwarding a 5 MB PDF into a new message costs no context and arrives byte for byte. `filename` renames the copy, `sha256`
+  insists on the bytes expected. A file copied out of the mailbox is not gated by `ATTACHMENT_URL_CONTENT_TYPES` (the mailbox
+  already holds it); the size, count and lifetime limits of uploads apply. The answer of `mail_create_upload_url` now carries
+  `status` (`awaiting_upload` or `ready`) and, once a file is there, its `size` and `sha256`.
+- **One rule for every attachment.** The agent instructions route all three cases by URL: a file the agent generated (an upload
+  URL), one in another message (a copy), one another tool links to (its link: a Fakturoid invoice's `public_html_url` with `.pdf`
+  appended, alza-mcp's `order_document.href`); base64 `attachments` only for a generated file where the agent has no shell. A
+  link that redirects across hosts needs every hop on `ATTACHMENT_URL_ALLOWLIST`; the README and `.env.example` list the three
+  prefixes Fakturoid's PDF passes through.
+
 ## 0.17.0
 
 - **Agents can attach files they generated (`mail_create_upload_url`).** A hosted server now hands an agent a one-time https

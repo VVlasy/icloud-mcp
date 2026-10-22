@@ -108,4 +108,4 @@ def test_instructions_with_maps_stay_short_and_name_only_offered_tools(s, extra)
     offered = {t.name for t in asyncio.run(mcp.list_tools())}
     every = tools(dataclasses.replace(s, enable_reminders=True, enable_notes=True, enable_drive=True))
     named = set(re.findall(r"\b(?:" + "|".join(sorted(every, key=len, reverse=True)) + r")\b", mcp.instructions))
-    assert len(mcp.instructions) <= 10500 and named <= offered, named - offered
+    assert len(mcp.instructions) <= 10600 and named <= offered, named - offered     # the cap of tests/test_instructions.py

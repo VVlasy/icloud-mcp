@@ -12,7 +12,8 @@ from icloud_mcp import instructions as instr_mod
 from icloud_mcp.config import Settings
 from icloud_mcp.server import apply_tool_filter, create_server
 
-CAP = 10500   # 0.12.1: the WHICH TOOL map (about 2,600 characters with every area on) is worth its context
+CAP = 10600   # 0.12.1: the WHICH TOOL map (about 2,600 characters with every area on) is worth its context;
+              # 0.18.0: so is the attachment rule (a generated file, one in another message, a link: all by url)
 
 
 @pytest.fixture

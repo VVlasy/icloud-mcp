@@ -564,3 +564,34 @@ def test_a_sha256_given_with_a_link_must_be_the_files():
         fetch(h, [{"url": INVOICE}, {"url": INVOICE, "sha256": "abc"}])
     for value in ("", None):
         assert urlattach.fetch_all.__doc__ and fetch(lambda req: pdf_response(), [{"url": INVOICE, "sha256": value}])[0]["content"] == PDF
+
+
+def test_a_chain_of_redirects_across_listed_prefixes_is_followed(caplog):
+    """Fakturoid's public invoice PDF (public_html_url + '.pdf') answers 302 to a Rails blob URL on the same host, which answers 302
+    to a signed storage.googleapis.com URL: three allowlist entries, every hop under one of them, the signature never logged."""
+    allow = ("https://app.fakturoid.cz/victorvlasak/p/", "https://app.fakturoid.cz/rails/active_storage/blobs/redirect/",
+             "https://storage.googleapis.com/fakturoid-production/")
+    blob = "https://app.fakturoid.cz/rails/active_storage/blobs/redirect/eyJfcmFpbHMi--d2ddcb/victorvlasak-2026-0005.pdf?disposition=inline"
+    signed = ("https://storage.googleapis.com/fakturoid-production/qjxo8prjs5oq8qmz?GoogleAccessId=svc%40x.iam.gserviceaccount.com"
+              "&Expires=1792713338&Signature=S3CR3TS1GN&response-content-disposition=inline%3B+filename%3D%22victorvlasak-2026-0005.pdf%22")
+    hops = []
+
+    def h(req):                                       # the pinned transport sends to the address; the name is the Host header
+        hops.append((req.headers["host"], req.url.path, b"Signature=S3CR3TS1GN" in req.url.query))
+        if req.url.path.endswith("/2026-0005.pdf"):
+            return httpx.Response(302, headers={"location": blob, "content-type": "application/pdf; charset=utf-8"})
+        if req.headers["host"] == "app.fakturoid.cz":
+            return httpx.Response(302, headers={"location": signed})
+        return pdf_response(**{"content-disposition": 'inline; filename="victorvlasak-2026-0005.pdf"'})
+    with caplog.at_level(logging.INFO, logger="icloud_mcp.urlattach"):
+        got = fetch(h, [{"url": "https://app.fakturoid.cz/victorvlasak/p/FCoT20Bs5Q/2026-0005.pdf"}], allow=allow)
+    assert (got[0]["filename"], got[0]["content"]) == ("victorvlasak-2026-0005.pdf", PDF)
+    assert hops == [("app.fakturoid.cz", "/victorvlasak/p/FCoT20Bs5Q/2026-0005.pdf", False),
+                    ("app.fakturoid.cz", "/rails/active_storage/blobs/redirect/eyJfcmFpbHMi--d2ddcb/victorvlasak-2026-0005.pdf", False),
+                    ("storage.googleapis.com", "/fakturoid-production/qjxo8prjs5oq8qmz", True)]
+    assert "S3CR3TS1GN" not in caplog.text and "2 redirect(s)" in caplog.text
+    # the blob hop alone is not enough: without the storage prefix the chain stops before the signed URL is requested
+    hops.clear()
+    with pytest.raises(urlattach.AttachmentUrlError, match="redirected to https://storage.googleapis.com/fakturoid-production/qjxo8prjs5oq8qmz, which"):
+        fetch(h, [{"url": "https://app.fakturoid.cz/victorvlasak/p/FCoT20Bs5Q/2026-0005.pdf"}], allow=allow[:2])
+    assert len(hops) == 2
