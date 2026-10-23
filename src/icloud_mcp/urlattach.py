@@ -271,7 +271,7 @@ def _fetch_one(client: httpx.Client, url: httpx.URL, *, given: str | None, prefi
 def _uploaded(uploads: Any, token: str, given: str | None, *, budget: int, content_types: tuple[str, ...]) -> dict[str, Any]:
     """A file from this server's own upload store, held to the same type and total-size limits as a downloaded one."""
     got = uploads.get(token)                       # AttachmentSourceError when the URL is unknown, expired or still empty
-    if got["content_type"] not in content_types:
+    if got.get("source", "upload") != "mail" and got["content_type"] not in content_types:   # a mailbox's own file keeps its type
         raise _Fail(f"its type {got['content_type']} is not on ATTACHMENT_URL_CONTENT_TYPES any more")
     if len(got["content"]) > budget:
         raise _Fail(f"the file is {len(got['content'])} bytes, more than the {budget} bytes left of the {MAX_TOTAL_BYTES}-byte limit "

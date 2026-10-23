@@ -844,14 +844,31 @@ def _register_tools(mcp: MCPServer, s: Settings, provider: OwnerOAuthProvider | 
 
                 @mcp.tool(annotations=_WRITE)
                 @_guard
-                def mail_create_upload_url(filename: Annotated[str, _d("The file's name with its extension, which sets its type: 'report.docx'.")],
+                def mail_create_upload_url(filename: Annotated[str | None, _d("The file's name with its extension, which sets its type: 'report.docx'. For a copy out of a message, a new name (default: its own).")] = None,
                                            sha256: Annotated[str | None, _d("The file's sha256 (hex, as sha256sum prints it): other bytes are refused.")] = None,
-                                           content_type: Annotated[str | None, _d("Its media type, when the extension does not say.")] = None) -> dict[str, Any]:
-                    """Get a one-time URL to upload a file you generated, so its bytes never pass through you: from a shell,
-                    curl -T <file> <url> (PUT, the bytes as the body), then pass the same url in 'attachment_urls' of mail_send_message,
-                    mail_reply_to_message or mail_update_draft. One file per URL, of a type the server accepts (the error names them),
-                    within max_bytes, until expires_at; nothing is ever served from it. Use base64 in 'attachments' only without a shell."""
+                                           content_type: Annotated[str | None, _d("Its media type, when the extension does not say.")] = None,
+                                           from_folder: Annotated[str | None, _d("Copy a file out of a message instead of uploading one: that message's folder, with from_uid and from_index.")] = None,
+                                           from_uid: Annotated[int | None, _d("That message's uid (from mail_search_messages).")] = None,
+                                           from_index: Annotated[int | None, _d("The file's index in that message's attachments list (mail_get_message).")] = None,
+                                           from_uidvalidity: UidValidity = None) -> dict[str, Any]:
+                    """Get a one-time URL for 'attachment_urls' that holds a file, so its bytes never pass through you. Either a file you
+                    generated: give filename, then from a shell curl -T <file> <url> (PUT, the bytes as the body); or a file already in a
+                    message in the mailbox: give from_folder, from_uid and from_index, the server copies it and the URL is ready at once
+                    (status 'ready'). Then pass the url in 'attachment_urls' of mail_send_message, mail_reply_to_message or
+                    mail_update_draft. One file per URL, within max_bytes, until expires_at; an upload must be of a type the server
+                    accepts (the error names them); nothing is ever served from it. Base64 in 'attachments' only when you have no shell
+                    and the file is in no message."""
                     try:
+                        if from_folder is not None or from_uid is not None or from_index is not None:
+                            if from_folder is None or from_uid is None or from_index is None:
+                                raise ToolError("To copy a file out of a message give from_folder, from_uid and from_index together.")
+                            token, up = mail.stage_attachment(from_folder, from_uid, from_index, uidvalidity=from_uidvalidity,
+                                                              filename=filename, sha256=sha256)
+                            return {**uploads.describe(token, up),
+                                    "then": "Put this url in attachment_urls on the mail tool call; the server attaches its copy of the file."}
+                        if not filename:
+                            raise ToolError("filename is required for a file you will upload; to copy one out of a message give "
+                                            "from_folder, from_uid and from_index.")
                         token, up = uploads.create(filename, content_type=content_type, sha256=sha256)
                     except UploadError as e:
                         raise ToolError(str(e)) from e

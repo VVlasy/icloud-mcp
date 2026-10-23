@@ -59,7 +59,8 @@ def test_a_url_is_minted_under_the_public_address_and_recognised(tmp_path):
                   f"https://evil.test/{url}", "not a url", ""):
         assert st.match(other) is None, other
     told = st.describe(token, up)
-    assert told == {"url": url, "filename": "Report Q3.docx", "content_type": DOCX_TYPE, "max_bytes": 4096, "expires_at": told["expires_at"]}
+    assert told == {"url": url, "status": "awaiting_upload", "filename": "Report Q3.docx", "content_type": DOCX_TYPE, "max_bytes": 4096,
+                    "expires_at": told["expires_at"]}
     assert told["expires_at"].endswith("+00:00")
 
 
@@ -107,7 +108,7 @@ def test_put_checks_the_url_the_size_the_signature_and_the_hash(tmp_path):
     with pytest.raises(UploadError, match="has its file already") as e:
         st.put(token, DOCX)
     assert e.value.status == 409
-    assert st.get(token) == {"filename": "report.docx", "content_type": DOCX_TYPE, "content": DOCX}
+    assert st.get(token) == {"filename": "report.docx", "content_type": DOCX_TYPE, "content": DOCX, "source": "upload"}
 
 
 def test_get_needs_a_live_url_with_a_file_that_is_still_intact(tmp_path):
@@ -148,6 +149,25 @@ def test_files_are_private_and_the_token_is_not_on_disk(tmp_path):
     assert oct(st.dir.stat().st_mode)[-3:] == "700"
     for p in st.dir.iterdir():
         assert oct(p.stat().st_mode)[-3:] == "600" and token not in p.name and token not in p.read_bytes().decode("latin-1")
+
+
+def test_put_ready_holds_a_file_at_once_under_the_size_limits(tmp_path):
+    st = store(tmp_path)
+    token, up = st.put_ready("../x/Invoice.pdf", "application/PDF; name=x", b"%PDF-1.4 abc")
+    assert (up.filename, up.content_type, up.ready, up.source) == ("Invoice.pdf", "application/pdf", True, "mail")
+    assert st.get(token) == {"filename": "Invoice.pdf", "content_type": "application/pdf", "content": b"%PDF-1.4 abc", "source": "mail"}
+    told = st.describe(token, up)
+    assert (told["status"], told["size"], told["sha256"]) == ("ready", 12, hashlib.sha256(b"%PDF-1.4 abc").hexdigest())
+    with pytest.raises(UploadError, match="empty"):
+        st.put_ready("a.pdf", "application/pdf", b"")
+    with pytest.raises(UploadError, match="larger than 4096"):
+        st.put_ready("a.pdf", "application/pdf", b"x" * 5000)
+    with pytest.raises(UploadError, match="not the 0{64} given"):
+        st.put_ready("a.pdf", "application/pdf", b"abc", sha256="0" * 64)
+    token2, _ = st.put_ready("noext", "", b"abc")
+    assert (st.get(token2)["content_type"], st.get(token2)["filename"]) == ("application/octet-stream", "noext")
+    with pytest.raises(UploadError, match="has its file already"):                   # a ready URL takes no upload
+        st.put(token, b"%PDF-1.4 other")
 
 
 def test_at_most_twenty_urls_are_live_and_the_store_is_capped(tmp_path, monkeypatch):
@@ -375,3 +395,43 @@ def test_inline_base64_is_checked_against_its_sha256(svc):
     assert r["status"] == "sent" and files(sent[0][0]) == [("report.docx", DOCX_TYPE, DOCX)]
     r = send(mcp, attachments=[{"filename": "report.docx", "content_base64": b64}])          # without a hash, as before
     assert r["status"] == "sent" and len(sent) == 2
+
+
+# ------------------------------------------------------------------ a file copied out of a message
+def _message_with_files() -> bytes:
+    m = EmailMessage()
+    m["From"], m["To"], m["Subject"], m["Message-ID"] = "Anna <anna@example.org>", "me@icloud.com", "Invoice", "<m1@x>"
+    m.set_content("See attached.")
+    m.add_attachment(b"PK\x03\x04" + b"z" * 100, maintype="application", subtype="zip", filename="archive.zip")
+    m.add_attachment(DOCX, maintype="application", subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     filename="Report.docx")
+    return m.as_bytes(policy=policy.SMTP)
+
+
+def test_a_file_in_another_message_is_copied_into_the_store_and_attached(svc, monkeypatch):
+    s, mcp, st, client, sent, appended = svc
+    raw = _message_with_files()
+    monkeypatch.setattr(MailService, "_select", lambda self, c, folder, readonly=True, expect=None: 7)
+    monkeypatch.setattr(MailService, "_attachment_part", lambda self, c, folder, uv, uid, index: None)   # the whole-message path
+    monkeypatch.setattr(MailService, "_fetch_raw", lambda self, c, folder, uid, readonly=True, uidvalidity=None: (raw, None, None, 7))
+    got = call(mcp, "mail_create_upload_url", from_folder="INBOX", from_uid=5, from_index=1, from_uidvalidity=7)
+    assert (got["status"], got["filename"], got["content_type"], got["size"], got["sha256"]) == ("ready", "Report.docx", DOCX_TYPE, len(DOCX), SHA)
+    assert "upload_with" not in got and st.match(got["url"])
+    # the zip is not on ATTACHMENT_URL_CONTENT_TYPES, but a file from the owner's own mailbox keeps its type
+    zipped = call(mcp, "mail_create_upload_url", from_folder="INBOX", from_uid=5, from_index=0, filename="Renamed.zip")
+    assert (zipped["status"], zipped["content_type"], zipped["filename"]) == ("ready", "application/zip", "Renamed.zip")
+    r = send(mcp, attachment_urls=[{"url": got["url"]}, {"url": zipped["url"], "sha256": zipped["sha256"]}])
+    assert r["status"] == "sent"
+    (msg, _), = sent
+    assert [f[:2] for f in files(msg)] == [("Report.docx", DOCX_TYPE), ("Renamed.zip", "application/zip")]
+    assert files(msg)[0][2] == DOCX
+    assert client.put(got["url"], content=DOCX).status_code == 409                    # it holds its file already
+    with pytest.raises(Exception, match="out of range"):
+        call(mcp, "mail_create_upload_url", from_folder="INBOX", from_uid=5, from_index=7)
+    with pytest.raises(Exception, match="from_folder, from_uid and from_index together"):
+        call(mcp, "mail_create_upload_url", from_folder="INBOX", from_uid=5)
+    with pytest.raises(Exception, match="filename is required"):
+        call(mcp, "mail_create_upload_url")
+    with pytest.raises(Exception, match=r"sha256 is [0-9a-f]{64}, not the 0{64} given"):
+        call(mcp, "mail_create_upload_url", from_folder="INBOX", from_uid=5, from_index=1, sha256="0" * 64)
+    assert len(sent) == 1

@@ -1,14 +1,18 @@
-"""Files an agent uploads itself, so a document it generated reaches a message without its bytes passing through the model.
+"""Files the server holds for attachment_urls, so a document reaches a message without its bytes passing through the model: one
+the agent generated and uploads itself, or one the server copies out of another message in the mailbox.
 
 mail_create_upload_url mints a one-time https URL on this server (<MCP_PUBLIC_URL>/upload/<token>). The agent sends the file's
 bytes to it from a shell (curl -T report.docx <url>) and then passes the same URL in attachment_urls, which the server answers
-from this store (urlattach.fetch_all) instead of downloading anything. The token, 32 random bytes kept on disk only as a hash,
-is the only credential an upload needs, and only a signed-in MCP client can mint one. A URL takes one file: of the type its
-name says (or the one given), on ATTACHMENT_URL_CONTENT_TYPES, within ATTACHMENT_URL_MAX_BYTES, starting as such a file does
-(urlattach.wrong_signature) and, when the agent gave the file's sha256 when minting, with that hash, so a mistyped or swapped
-upload is refused before it can reach a message. Nothing is ever served back: the URL answers PUT and POST only. A URL and its
-file expire after ATTACHMENT_UPLOAD_TTL_SECONDS; at most MAX_PENDING URLs are live at once and their files together stay under
-MAX_STORE_BYTES, whatever a caller does.
+from this store (urlattach.fetch_all) instead of downloading anything. With from_folder, from_uid and from_index the server
+fetches that attachment itself (MailService.stage_attachment) and files it here ready-made (put_ready, source "mail"): the URL
+takes no upload then, and the type gate below does not apply to it, since the mailbox already holds the file.
+
+The token, 32 random bytes kept on disk only as a hash, is the only credential an upload needs, and only a signed-in MCP client
+can mint one. A URL takes one file: of the type its name says (or the one given), on ATTACHMENT_URL_CONTENT_TYPES, within
+ATTACHMENT_URL_MAX_BYTES, starting as such a file does (urlattach.wrong_signature) and, when the agent gave the file's sha256
+when minting, with that hash, so a mistyped or swapped upload is refused before it can reach a message. Nothing is ever served
+back: the URL answers PUT and POST only. A URL and its file expire after ATTACHMENT_UPLOAD_TTL_SECONDS; at most MAX_PENDING URLs
+are live at once and their files together stay under MAX_STORE_BYTES, whatever a caller does.
 """
 from __future__ import annotations
 
@@ -58,6 +62,7 @@ class Upload:
     expires_at: float
     size: int | None = None            # set once the file has arrived
     sha256: str | None = None
+    source: str = "upload"             # "upload": sent to the URL by the agent; "mail": copied out of a message in the owner's mailbox
 
     @property
     def ready(self) -> bool:
@@ -99,11 +104,13 @@ class UploadStore:
         return token if _TOKEN.fullmatch(token) else None
 
     def describe(self, token: str, up: Upload) -> dict[str, Any]:
-        """What the agent is told about a URL: where to send the file, what it may be, and until when."""
-        out = {"url": self.url(token), "filename": up.filename, "content_type": up.content_type, "max_bytes": self.max_bytes,
-               "expires_at": _iso(up.expires_at)}
-        if up.expected_sha256:
-            out["sha256"] = up.expected_sha256
+        """What the agent is told about a URL: whether it holds its file yet, where to send one, what it may be, and until when."""
+        out = {"url": self.url(token), "status": "ready" if up.ready else "awaiting_upload", "filename": up.filename,
+               "content_type": up.content_type, "max_bytes": self.max_bytes, "expires_at": _iso(up.expires_at)}
+        if up.ready:
+            out["size"] = up.size
+        if up.sha256 or up.expected_sha256:
+            out["sha256"] = up.sha256 or up.expected_sha256
         return out
 
     # -- files -----------------------------------------------------------------
@@ -227,9 +234,43 @@ class UploadStore:
         log.info("upload %s: received %s, %d bytes", _h(token)[:8], up.filename, len(data))
         return up
 
+    def put_ready(self, filename: str, content_type: str, data: bytes, *, sha256: str | None = None) -> tuple[str, Upload]:
+        """A URL that holds `data` at once, for a file the server already has (an attachment copied out of a message): no PUT
+        step. The type is not held to ATTACHMENT_URL_CONTENT_TYPES, the file being in the owner's mailbox already; the size limits
+        are. A sha256 given must be the data's."""
+        name = urlattach.safe_filename(filename) or "attachment"
+        ctype = (content_type or "").split(";", 1)[0].strip().lower() or urlattach.type_of(name) or "application/octet-stream"
+        if not data:
+            raise UploadError("the file is empty")
+        if len(data) > self.max_bytes:
+            raise UploadError(f"the file is {len(data)} bytes, larger than {self.max_bytes} (ATTACHMENT_URL_MAX_BYTES)", 413)
+        digest = hashlib.sha256(data).hexdigest()
+        if sha256:
+            try:
+                want = urlattach.normalize_sha256(sha256)
+            except ValueError as e:
+                raise UploadError(f"sha256: {e}") from None
+            if digest != want:
+                raise UploadError(f"the file's sha256 is {digest}, not the {want} given: it is not the file meant", 422)
+        with self._lock:
+            live = self.prune()
+            if len(live) >= MAX_PENDING:
+                raise UploadError(f"{MAX_PENDING} upload URLs are already live on this server (each lasts {self.ttl} seconds); "
+                                  "use them, or wait for them to expire", 429)
+            if sum(u.size or 0 for _, u in live) + len(data) > MAX_STORE_BYTES:
+                raise UploadError(f"the uploaded files waiting on this server would pass {MAX_STORE_BYTES} bytes together; "
+                                  "attach some first, or wait for them to expire", 413)
+            token = secrets.token_urlsafe(32)
+            now = time.time()
+            up = Upload(filename=name, content_type=ctype, expected_sha256=digest, created_at=now, expires_at=now + self.ttl,
+                        size=len(data), sha256=digest, source="mail")
+            self._write(_h(token), up, data)
+        log.info("upload %s: holds %s copied out of a message, %d bytes", _h(token)[:8], name, len(data))
+        return token, up
+
     def get(self, token: str) -> dict[str, Any]:
-        """{filename, content_type, content} of the file a URL holds, for attachment_urls; UploadError when the URL is unknown or
-        expired, or no file has been sent to it yet."""
+        """{filename, content_type, content, source} of the file a URL holds, for attachment_urls; UploadError when the URL is
+        unknown or expired, or no file has been sent to it yet."""
         key = _h(token)
         up = self._read(key) if _TOKEN.fullmatch(token or "") else None
         if up is None:
@@ -244,7 +285,7 @@ class UploadStore:
         if hashlib.sha256(data).hexdigest() != up.sha256:
             self._remove(key)
             raise UploadError("the uploaded file failed its integrity check on disk; upload it again", 500)
-        return {"filename": up.filename, "content_type": up.content_type, "content": data}
+        return {"filename": up.filename, "content_type": up.content_type, "content": data, "source": up.source}
 
 
 def register_upload_route(mcp: Any, store: UploadStore) -> None:

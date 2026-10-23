@@ -168,7 +168,7 @@ def test_every_error_message_ends_with_a_full_stop():
 
 def test_errors_point_at_the_next_step():
     import inspect
-    for fn, needle in [(MailService._fetch_raw, "Run mail_search_messages again"), (MailService.get_attachment, "of mail_get_message"),
+    for fn, needle in [(MailService._fetch_raw, "Run mail_search_messages again"), (MailService._attachment_file, "of mail_get_message"),
                        (cal_mod.CalendarService._find, "comes from calendar_list_events"),
                        (MailService.resolve_folder, "Call mail_list_folders"), (MailService._select, "Call mail_list_folders"),
                        (MailService._login, "Run icloud_check_health")]:
